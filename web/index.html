@@ -1,0 +1,105 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="description" content="OpenAI 支付长链接生成器">
+    <title>长链接生成器</title>
+    <link rel="stylesheet" href="/styles.css?v=20260502f">
+  </head>
+  <body>
+    <main class="shell">
+      <section class="workspace">
+        <div class="panel form-panel">
+          <div class="panel-head">
+            <div>
+              <h1>长链接生成器</h1>
+              <p class="panel-subtitle">只保留一个功能：生成可直接打开的 OpenAI 支付长链接。</p>
+            </div>
+            <span id="healthBadge" class="badge">检测中</span>
+          </div>
+
+          <form id="checkoutForm" autocomplete="off">
+            <label class="field-block">
+              <span>访问令牌 / Session JSON</span>
+              <textarea id="token" name="token" rows="10" placeholder="粘贴 access token，或整份 /api/auth/session JSON"></textarea>
+              <small class="field-hint">支持直接粘贴 JWT，或整份 <code>/api/auth/session</code> JSON，系统会自动提取 <code>accessToken</code>。</small>
+            </label>
+
+            <details class="section-box">
+              <summary class="section-title">
+                <span>可选浏览器态</span>
+                <small>403 时再填</small>
+              </summary>
+              <label>
+                <span>Cookie</span>
+                <textarea id="checkoutCookie" name="checkout_cookie" rows="4" placeholder="粘贴 chatgpt.com 当前会话 Cookie"></textarea>
+              </label>
+              <label>
+                <span>User-Agent</span>
+                <input id="checkoutUserAgent" name="checkout_user_agent" placeholder="可选，留空使用默认浏览器 UA">
+              </label>
+            </details>
+
+            <input id="planName" name="plan_name" type="hidden" value="chatgptplusplan">
+            <input id="entryPoint" name="entry_point" type="hidden" value="all_plans_pricing_modal">
+            <input id="country" name="country" type="hidden" value="ID">
+            <input id="currency" name="currency" type="hidden" value="IDR">
+            <input id="promoCampaignId" name="promo_campaign_id" type="hidden" value="plus-1-month-free">
+            <input id="customerEmail" name="customer_email" type="hidden">
+            <input id="couponFromQuery" type="checkbox" hidden checked>
+            <select id="checkoutUIMode" aria-label="Checkout UI mode" hidden>
+              <option value="hosted" selected>hosted</option>
+            </select>
+
+            <div class="toolbar">
+              <button id="submitButton" type="submit">生成支付链接</button>
+            </div>
+          </form>
+        </div>
+
+        <div class="panel result-panel">
+          <div class="panel-head">
+            <h2>生成结果</h2>
+            <span id="latency" class="badge neutral">空闲</span>
+          </div>
+
+          <div id="summary" class="summary">
+            <div>
+              <span class="metric-label">状态</span>
+              <strong id="statusText">空闲</strong>
+            </div>
+            <div>
+              <span class="metric-label">Session</span>
+              <strong id="sessionText">-</strong>
+            </div>
+            <div>
+              <span class="metric-label">域名</span>
+              <strong id="hostText">-</strong>
+            </div>
+          </div>
+
+          <div id="finalStatus" class="final-status">
+            <div>
+              <span class="metric-label">结果</span>
+              <strong id="finalTransactionText">-</strong>
+            </div>
+            <div>
+              <span class="metric-label">支付链接</span>
+              <a id="checkoutUrlLink" class="checkout-link" href="#" target="_blank" rel="noreferrer" hidden>打开链接</a>
+              <button id="copyCheckoutLinkButton" class="copy-button" type="button" hidden>复制链接</button>
+            </div>
+            <div>
+              <span class="metric-label">说明</span>
+              <strong id="finalSettlementText">-</strong>
+            </div>
+          </div>
+
+          <pre id="output">{}</pre>
+        </div>
+      </section>
+    </main>
+
+    <script src="/app.js?v=20260502f"></script>
+  </body>
+</html>
