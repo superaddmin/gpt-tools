@@ -220,35 +220,77 @@ async function fetchLatestSessionJSON() {
     throw new Error("无法启动 Chrome 无痕窗口，请确认系统已安装 Chrome 浏览器。");
   }
 
-  let attempt = 0;
-  const maxAttempts = 5;
-  let lastError = null;
+  sessionMonitorAbortController = new AbortController();
+  clearMonitor();
+  if (gopayMonitor) gopayMonitor.hidden = false;
+  if (monitorBadge) { monitorBadge.textContent = "Session 监控中"; monitorBadge.className = "badge"; }
 
-  while (attempt < maxAttempts) {
-    attempt++;
-    try {
-      const resp = await fetch("/api/session/fetch", { method: "POST" });
-      const data = await resp.json();
-      if (resp.ok && data.ok && data.json) {
-        fields.token.value = data.json;
-        return data.json;
+  const response = await fetch("/api/session/fetch", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ stream: true }),
+    signal: sessionMonitorAbortController.signal,
+  });
+
+  if (!response.ok || !response.body) {
+    throw new Error("获取 Session JSON 失败，请确认已在无痕窗口中登录 ChatGPT");
+  }
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let fullOutput = [];
+  let resultJSON = "";
+  let diagnostics = null;
+  let finalError = null;
+
+  while (true) {
+    const chunk = await reader.read();
+    if (chunk.done) break;
+    buffer += decoder.decode(chunk.value, { stream: true });
+    const lines = buffer.split("\n");
+    buffer = lines.pop() || "";
+
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i].trim();
+      if (!line) continue;
+      const msg = JSON.parse(line);
+      fullOutput.push(msg);
+
+      if (monitorOutput) {
+        monitorOutput.hidden = false;
+        monitorOutput.textContent = JSON.stringify(fullOutput, null, 2);
       }
-      if (data.code === "cdp_not_ready") {
-        lastError = data.error;
-      } else {
-        lastError = data.error || "获取失败";
-        break;
+
+      if (msg.type === "started") {
+        appendMonitorEvent({ domain: "Log", method: "session-monitor-started", summary: (msg.targets || []).join(" | "), ts: Date.now() });
+      } else if (msg.type === "event" && msg.event) {
+        appendMonitorEvent(msg.event);
+      } else if (msg.type === "data" || msg.type === "done") {
+        resultJSON = msg.data?.json || resultJSON;
+        diagnostics = msg.data?.diagnostics || diagnostics;
+      } else if (msg.type === "error") {
+        diagnostics = msg.data || diagnostics;
+        finalError = msg.error || "获取 Session JSON 失败";
+        appendMonitorEvent({ domain: "Error", method: "session-fetch-error", summary: finalError, ts: Date.now() });
       }
-    } catch (err) {
-      lastError = err.message;
-      break;
-    }
-    if (attempt < maxAttempts) {
-      await new Promise(function (r) { setTimeout(r, 1500); });
     }
   }
 
-  throw new Error(lastError || "获取 Session JSON 失败，请确认已在无痕窗口中登录 ChatGPT");
+  if (diagnostics && monitorOutput) {
+    monitorOutput.hidden = false;
+    monitorOutput.textContent = JSON.stringify({ stream: fullOutput, diagnostics: diagnostics }, null, 2);
+  }
+
+  if (resultJSON) {
+    fields.token.value = resultJSON;
+    if (sessionText) setText(sessionText, "已提取 Session JSON");
+    if (monitorBadge) { monitorBadge.textContent = "Session 已获取"; monitorBadge.className = "badge"; }
+    return resultJSON;
+  }
+
+  if (monitorBadge) { monitorBadge.textContent = "Session 失败"; monitorBadge.className = "badge error"; }
+  throw new Error(finalError || diagnostics?.session_preview || "获取 Session JSON 失败，请确认已在无痕窗口中登录 ChatGPT");
 }
 
 /**
@@ -559,14 +601,16 @@ async function autoFetchAndGenerate() {
   setText(fetchSessionBtn, "启动窗口...");
 
   try {
-    setText(fetchSessionBtn, "读取 Session...");
+    setText(fetchSessionBtn, "监控并读取 Session...");
     await fetchLatestSessionJSON();
     setText(fetchSessionBtn, "生成链接...");
     form.dispatchEvent(new Event("submit", { cancelable: true, bubbles: true }));
     return;
   } catch (error) {
+    if (monitorBadge) { monitorBadge.textContent = "Session 失败"; monitorBadge.className = "badge error"; }
     alert(error.message || "获取 Session JSON 失败，请确认已在无痕窗口中登录 ChatGPT");
   } finally {
+    sessionMonitorAbortController = null;
     fetchSessionBtn.disabled = false;
     setText(fetchSessionBtn, origText);
   }
@@ -974,6 +1018,7 @@ const monitorErrorCount = document.querySelector("#monitorErrorCount");
 
 let gopayMonitorAbortController = null;
 let gopayMonitorRunning = false;
+let sessionMonitorAbortController = null;
 
 const DOMAIN_ICONS = {
   Network:  "\uD83C\uDF10",
@@ -1109,6 +1154,14 @@ gopayMonitorBtn?.addEventListener("click", async function () {
     gopayMonitorBtn.textContent = "开始流程监控";
     if (monitorBadge) { monitorBadge.textContent = "已停止"; monitorBadge.className = "badge neutral"; }
     appendMonitorEvent({ domain: "Log", method: "monitor-stop", summary: "用户已停止监控", ts: Date.now() });
+    return;
+  }
+
+  if (sessionMonitorAbortController) {
+    sessionMonitorAbortController.abort();
+    sessionMonitorAbortController = null;
+    if (monitorBadge) { monitorBadge.textContent = "Session 监控已停止"; monitorBadge.className = "badge neutral"; }
+    appendMonitorEvent({ domain: "Log", method: "session-monitor-stop", summary: "用户已停止 Session 监控", ts: Date.now() });
     return;
   }
 

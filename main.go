@@ -539,19 +539,91 @@ func executeCDPScript(conn *websocket.Conn, script string) (string, error) {
 }
 
 func fetchSessionJSONViaCDP() (string, error) {
+	sessionJSON, _, err := fetchSessionJSONViaCDPWithDiagnostics(nil)
+	return sessionJSON, err
+}
+
+func fetchSessionJSONViaCDPWithDiagnostics(onEvent func(monitorEvent)) (string, map[string]any, error) {
 	if !isCDPReady(cdpDebuggingPort) {
-		return "", &cdpNotReadyError{message: "CDP 未就绪"}
+		return "", map[string]any{"cdp_ready": false}, &cdpNotReadyError{message: "CDP 未就绪"}
 	}
+	if onEvent != nil {
+		onEvent(monitorEvent{Timestamp: time.Now().UnixMilli(), Domain: "Log", Method: "session-cdp", Summary: "CDP 已就绪，开始查找 chatgpt.com 页面"})
+	}
+	start := time.Now()
 	target, err := findChatGPTTarget(cdpDebuggingPort)
 	if err != nil {
-		return "", err
+		return "", map[string]any{"cdp_ready": true, "target_found": false}, err
+	}
+	if onEvent != nil {
+		onEvent(monitorEvent{Timestamp: time.Now().UnixMilli(), Domain: "Page", Method: "session-target", Summary: truncateURL(target.URL, 160)})
 	}
 	conn, _, err := websocket.DefaultDialer.Dial(target.WebSocketDebuggerURL, nil)
 	if err != nil {
-		return "", fmt.Errorf("WebSocket 连接失败: %w", err)
+		return "", map[string]any{"cdp_ready": true, "target_found": true, "target_url": target.URL}, fmt.Errorf("WebSocket 连接失败: %w", err)
 	}
 	defer conn.Close()
-	return executeCDPScript(conn, `(async () => { const r = await fetch('/api/auth/session'); return await r.text(); })()`)
+	_, _ = sendCDPCommand(conn, "Runtime.enable", nil)
+	_, _ = sendCDPCommand(conn, "Network.enable", map[string]any{"maxTotalBufferSize": 20000000})
+
+	snapshotRaw, snapshotErr := executeCDPScript(conn, `(async () => {
+		const sessionResp = await fetch('/api/auth/session');
+		const sessionText = await sessionResp.text();
+		const loginSelectors = [
+			document.querySelector('button[data-testid="login-button"]'),
+			document.querySelector('a[href*="/auth/login"]'),
+			document.querySelector('input[type="email"]'),
+			document.querySelector('form[action*="login"]')
+		].filter(Boolean).length;
+		let parsed = null;
+		try { parsed = JSON.parse(sessionText); } catch (_err) {}
+		return JSON.stringify({
+			url: location.href,
+			title: document.title,
+			ready_state: document.readyState,
+			login_selector_count: loginSelectors,
+			has_access_token: !!(parsed && parsed.accessToken),
+			session_status: sessionResp.status,
+			session_length: sessionText.length,
+			session_preview: sessionText.slice(0, 240),
+			cookies_enabled: navigator.cookieEnabled,
+			body_text: (document.body?.innerText || '').replace(/\s+/g, ' ').trim().slice(0, 300),
+			session_text: sessionText
+		});
+	})()`)
+	if snapshotErr != nil {
+		return "", map[string]any{"cdp_ready": true, "target_found": true, "target_url": target.URL}, snapshotErr
+	}
+
+	var snapshot map[string]any
+	if err := json.Unmarshal([]byte(snapshotRaw), &snapshot); err != nil {
+		return snapshotRaw, map[string]any{"cdp_ready": true, "target_found": true, "target_url": target.URL, "parse_error": err.Error()}, nil
+	}
+	sessionJSON := stringifyJSONValue(snapshot["session_text"])
+	diagnostics := map[string]any{
+		"cdp_ready":            true,
+		"target_found":         true,
+		"target_url":           stringifyJSONValue(snapshot["url"]),
+		"title":                stringifyJSONValue(snapshot["title"]),
+		"ready_state":          stringifyJSONValue(snapshot["ready_state"]),
+		"login_selector_count": snapshot["login_selector_count"],
+		"has_access_token":     snapshot["has_access_token"],
+		"session_status":       snapshot["session_status"],
+		"session_length":       snapshot["session_length"],
+		"session_preview":      stringifyJSONValue(snapshot["session_preview"]),
+		"cookies_enabled":      snapshot["cookies_enabled"],
+		"body_text":            stringifyJSONValue(snapshot["body_text"]),
+		"elapsed_ms":           time.Since(start).Milliseconds(),
+	}
+	if onEvent != nil {
+		onEvent(monitorEvent{Timestamp: time.Now().UnixMilli(), Domain: "Network", Method: "session-fetch", Summary: fmt.Sprintf("/api/auth/session status=%v len=%v", snapshot["session_status"], snapshot["session_length"])})
+		if hasToken, _ := snapshot["has_access_token"].(bool); hasToken {
+			onEvent(monitorEvent{Timestamp: time.Now().UnixMilli(), Domain: "Log", Method: "session-success", Summary: "已提取 accessToken"})
+		} else {
+			onEvent(monitorEvent{Timestamp: time.Now().UnixMilli(), Domain: "Error", Method: "session-missing-token", Summary: "未在 /api/auth/session 中检测到 accessToken"})
+		}
+	}
+	return sessionJSON, diagnostics, nil
 }
 
 func handleSessionFetch(w http.ResponseWriter, r *http.Request) {
@@ -559,18 +631,54 @@ func handleSessionFetch(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
-	sessionJSON, err := fetchSessionJSONViaCDP()
+	defer r.Body.Close()
+	var req struct {
+		Stream bool `json:"stream"`
+	}
+	_ = json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<17)).Decode(&req)
+
+	if req.Stream {
+		flusher, ok := w.(http.Flusher)
+		if !ok {
+			writeError(w, http.StatusInternalServerError, "streaming not supported")
+			return
+		}
+		w.Header().Set("Content-Type", "application/x-ndjson; charset=utf-8")
+		w.Header().Set("Cache-Control", "no-store")
+		w.WriteHeader(http.StatusOK)
+		encoder := json.NewEncoder(w)
+		_ = encoder.Encode(monitorStreamEnvelope{Type: "started", Targets: []string{"chatgpt.com:/api/auth/session"}})
+		flusher.Flush()
+
+		sessionJSON, diagnostics, err := fetchSessionJSONViaCDPWithDiagnostics(func(evt monitorEvent) {
+			item := evt
+			_ = encoder.Encode(monitorStreamEnvelope{Type: "event", Event: &item})
+			flusher.Flush()
+		})
+		if err != nil {
+			_ = encoder.Encode(monitorStreamEnvelope{Type: "error", Error: err.Error(), Data: diagnostics})
+			flusher.Flush()
+			return
+		}
+		_ = encoder.Encode(monitorStreamEnvelope{Type: "data", Data: map[string]any{"json": sessionJSON, "diagnostics": diagnostics}})
+		flusher.Flush()
+		_ = encoder.Encode(monitorStreamEnvelope{Type: "done", Data: map[string]any{"json": sessionJSON, "diagnostics": diagnostics}})
+		flusher.Flush()
+		return
+	}
+
+	sessionJSON, diagnostics, err := fetchSessionJSONViaCDPWithDiagnostics(nil)
 	if err != nil {
 		var notReady *cdpNotReadyError
 		if errors.As(err, &notReady) {
-			writeJSON(w, http.StatusServiceUnavailable, map[string]any{"ok": false, "error": err.Error(), "code": "cdp_not_ready"})
+			writeJSON(w, http.StatusServiceUnavailable, map[string]any{"ok": false, "error": err.Error(), "code": "cdp_not_ready", "diagnostics": diagnostics})
 			return
 		}
 		log.Printf("fetch session JSON failed: %v", err)
-		writeError(w, http.StatusInternalServerError, "获取失败: "+err.Error())
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"ok": false, "error": "获取失败: " + err.Error(), "diagnostics": diagnostics})
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "json": sessionJSON})
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "json": sessionJSON, "diagnostics": diagnostics})
 }
 
 type gopayForceLinkRequest struct {
