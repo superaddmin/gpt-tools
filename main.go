@@ -318,6 +318,19 @@ func (w *auditResponseWriter) Write(data []byte) (int, error) {
 	return w.ResponseWriter.Write(data)
 }
 
+func (w *auditResponseWriter) Flush() {
+	if w.statusCode == 0 {
+		w.statusCode = http.StatusOK
+	}
+	if flusher, ok := w.ResponseWriter.(http.Flusher); ok {
+		flusher.Flush()
+	}
+}
+
+func (w *auditResponseWriter) Unwrap() http.ResponseWriter {
+	return w.ResponseWriter
+}
+
 func newAuditLogger(baseDir string, archiveAfter time.Duration, maxFileSize int64, queueSize int) *auditLogger {
 	logger := &auditLogger{
 		baseDir:       baseDir,
@@ -1406,6 +1419,26 @@ type auditLogger struct {
 	fileSizes     map[string]int64
 }
 
+func (l *auditLogger) Close() error {
+	if l == nil {
+		return nil
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	var closeErr error
+	for path, fileHandle := range l.fileCache {
+		if err := fileHandle.Close(); err != nil && closeErr == nil {
+			closeErr = err
+		}
+		delete(l.fileCache, path)
+		delete(l.fileOpenedAt, path)
+		delete(l.fileCreatedAt, path)
+		delete(l.fileSizes, path)
+	}
+	return closeErr
+}
+
 var flowAuditLogger = newAuditLogger(filepath.Join(".", "log"), 24*time.Hour, 8<<20, 512)
 
 var operationDisplayNames = map[string]string{
@@ -1479,6 +1512,18 @@ var auditFileNameSanitizer = strings.NewReplacer(
 var auditSafeKeySanitizer = strings.NewReplacer("-", "_", ".", "_", " ", "_")
 
 var usStates = []string{"AL", "AK", "AZ", "AR", "CA", "CO", "CT", "DE", "FL", "GA", "HI", "ID", "IL", "IN", "IA", "KS", "KY", "LA", "ME", "MD", "MA", "MI", "MN", "MS", "MO", "MT", "NE", "NV", "NH", "NJ", "NM", "NY", "NC", "ND", "OH", "OK", "OR", "PA", "RI", "SC", "SD", "TN", "TX", "UT", "VT", "VA", "WA", "WV", "WI", "WY"}
+var usStateNames = map[string]string{
+	"AL": "Alabama", "AK": "Alaska", "AZ": "Arizona", "AR": "Arkansas", "CA": "California",
+	"CO": "Colorado", "CT": "Connecticut", "DE": "Delaware", "FL": "Florida", "GA": "Georgia",
+	"HI": "Hawaii", "ID": "Idaho", "IL": "Illinois", "IN": "Indiana", "IA": "Iowa",
+	"KS": "Kansas", "KY": "Kentucky", "LA": "Louisiana", "ME": "Maine", "MD": "Maryland",
+	"MA": "Massachusetts", "MI": "Michigan", "MN": "Minnesota", "MS": "Mississippi", "MO": "Missouri",
+	"MT": "Montana", "NE": "Nebraska", "NV": "Nevada", "NH": "New Hampshire", "NJ": "New Jersey",
+	"NM": "New Mexico", "NY": "New York", "NC": "North Carolina", "ND": "North Dakota", "OH": "Ohio",
+	"OK": "Oklahoma", "OR": "Oregon", "PA": "Pennsylvania", "RI": "Rhode Island", "SC": "South Carolina",
+	"SD": "South Dakota", "TN": "Tennessee", "TX": "Texas", "UT": "Utah", "VT": "Vermont",
+	"VA": "Virginia", "WA": "Washington", "WV": "West Virginia", "WI": "Wisconsin", "WY": "Wyoming",
+}
 var usFirstNames = []string{"James", "John", "Robert", "Michael", "William", "David", "Richard", "Joseph", "Thomas", "Charles", "Mary", "Patricia", "Jennifer", "Linda", "Barbara", "Elizabeth", "Susan", "Jessica", "Sarah", "Karen", "Emma", "Olivia", "Ava", "Isabella", "Sophia", "Mia", "Charlotte", "Amelia", "Harper", "Evelyn"}
 var usLastNames = []string{"Smith", "Johnson", "Williams", "Brown", "Jones", "Garcia", "Miller", "Davis", "Rodriguez", "Martinez", "Hernandez", "Lopez", "Gonzalez", "Wilson", "Anderson", "Thomas", "Taylor", "Moore", "Jackson", "Martin", "Lee", "Perez", "Thompson", "White", "Harris", "Sanchez", "Clark", "Ramirez", "Lewis"}
 var usStreets = []string{"Main St", "Oak Ave", "Elm St", "Maple Dr", "Cedar Ln", "Pine Rd", "Washington Blvd", "Park Ave", "Broadway", "Lake Dr", "Hill Rd", "River Rd", "Church St", "School St", "Mill Rd", "Valley View Dr", "Sunset Blvd"}
@@ -1500,6 +1545,17 @@ func generateUSAddress() usAddress {
 		ZipCode:   fmt.Sprintf("%05d", 10000+randomInt(90000)),
 		Country:   "US",
 	}
+}
+
+func checkoutStateSelectValue(state string) string {
+	state = strings.TrimSpace(state)
+	if state == "" {
+		return ""
+	}
+	if mapped, ok := usStateNames[strings.ToUpper(state)]; ok {
+		return mapped
+	}
+	return state
 }
 
 func truncateURL(u string, n int) string {
@@ -7062,19 +7118,8 @@ func handleCheckoutAutoFill(w http.ResponseWriter, r *http.Request) {
 			"url":  pageTarget.URL,
 		},
 	}
-	target, canonicalFillURL, err := resolveCheckoutFillTarget(targets, req.ExpectedURL)
-	if err != nil {
-		response["ok"] = false
-		response["error"] = err.Error()
-		writeJSON(w, http.StatusOK, response)
-		return
-	}
-	if canonicalFillURL != canonicalURL {
-		response["ok"] = false
-		response["error"] = "当前支付页与本工具最近一次打开的支付链接不一致，已拒绝自动填写。"
-		writeJSON(w, http.StatusOK, response)
-		return
-	}
+	target := pageTarget
+	canonicalFillURL := canonicalURL
 	response["fill_target"] = map[string]any{
 		"id":   target.ID,
 		"type": target.Type,
@@ -7099,10 +7144,14 @@ func handleCheckoutAutoFill(w http.ResponseWriter, r *http.Request) {
 	if action == "activate_gopay" {
 		clickR, _ := executeCDPScript(conn, `(async () => {
 			const textOf = (el) => ((el?.textContent || '') + ' ' + (el?.getAttribute?.('aria-label') || '')).toLowerCase();
+			const explicitButton = document.querySelector('[data-testid="gopay-accordion-item-button"]');
+			if (explicitButton) { explicitButton.click(); await new Promise(r=>setTimeout(r,1200)); return JSON.stringify({clicked:true, via:'explicit-button'}); }
+			const header = document.querySelector('[data-testid="gopay-accordion-item"] .AccordionItemHeader');
+			if (header) { header.click(); await new Promise(r=>setTimeout(r,1200)); return JSON.stringify({clicked:true, via:'header'}); }
 			const radio = Array.from(document.querySelectorAll('input[type="radio"], [role="radio"]')).find(el => textOf(el.closest('label,div,section') || el).includes('gopay'));
-			if (radio) { radio.click(); await new Promise(r=>setTimeout(r,900)); return JSON.stringify({clicked:true, via:'radio'}); }
+			if (radio) { radio.click(); await new Promise(r=>setTimeout(r,1200)); return JSON.stringify({clicked:true, via:'radio'}); }
 			const label = Array.from(document.querySelectorAll('label, button, div, section, span')).find(el => textOf(el).includes('gopay'));
-			if (label) { label.click(); await new Promise(r=>setTimeout(r,900)); return JSON.stringify({clicked:true, via:'label'}); }
+			if (label) { label.click(); await new Promise(r=>setTimeout(r,1200)); return JSON.stringify({clicked:true, via:'label'}); }
 			return JSON.stringify({clicked:false});
 		})()`)
 		var clickMap map[string]any
@@ -7141,6 +7190,44 @@ func handleCheckoutAutoFill(w http.ResponseWriter, r *http.Request) {
 		action = checkoutAutoFillAction(probe, isStripeFrame)
 	}
 	if action != "fill" {
+		updatedTargets, refreshErr := getCDPTargets(cdpDebuggingPort)
+		if refreshErr == nil {
+			if refreshedTarget, refreshedCanonicalURL, reselectErr := resolveCheckoutFillTarget(updatedTargets, req.ExpectedURL); reselectErr == nil {
+				target = refreshedTarget
+				canonicalFillURL = refreshedCanonicalURL
+				response["fill_target"] = map[string]any{
+					"id":   target.ID,
+					"type": target.Type,
+					"url":  target.URL,
+				}
+				if canonicalFillURL != canonicalURL {
+					response["ok"] = false
+					response["error"] = "当前支付页与本工具最近一次打开的支付链接不一致，已拒绝自动填写。"
+					writeJSON(w, http.StatusOK, response)
+					return
+				}
+				if target.ID != pageTarget.ID {
+					conn.Close()
+					conn, _, err = websocket.DefaultDialer.Dial(target.WebSocketDebuggerURL, nil)
+					if err != nil {
+						writeError(w, http.StatusInternalServerError, "CDP failed: "+err.Error())
+						return
+					}
+					defer conn.Close()
+					sendCDPCommand(conn, "Runtime.enable", nil)
+					isStripeFrame = strings.Contains(target.URL, "elements-inner-payment") || strings.Contains(target.URL, "stripe.com/v3")
+					probeR, _ = executeCDPScript(conn, probeScript)
+					probe = map[string]any{}
+					if probeR != "" {
+						json.Unmarshal([]byte(probeR), &probe)
+					}
+					response["probe_fallback"] = probe
+					action = checkoutAutoFillAction(probe, isStripeFrame)
+				}
+			}
+		}
+	}
+	if action != "fill" {
 		if !isStripeFrame {
 			response["hint"] = "表单在 Stripe iframe 中，或当前还未切到 GoPay 表单。请先确认页面已展开 GoPay 地址区后重试。"
 		}
@@ -7149,7 +7236,7 @@ func handleCheckoutAutoFill(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, response)
 		return
 	}
-	fillR, _ := executeCDPScript(conn, fmt.Sprintf(`(async () => { function snv(el,v){const s=Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value').set;s.call(el,v);el.dispatchEvent(new Event('input',{bubbles:true}));el.dispatchEvent(new Event('change',{bubbles:true}));} function so(sel,v){const o=Array.from(sel.options).find(o=>o.value===v||o.text===v||o.text.includes(v));if(o){sel.value=o.value;sel.dispatchEvent(new Event('change',{bubbles:true}));return true}return false} function mf(el,ks){const s=(el.name+'|'+el.id+'|'+el.autocomplete+'|'+(el.placeholder||'')+'|'+(el.getAttribute('aria-label')||'')).toLowerCase();return ks.some(k=>s.includes(k))} const a={fn:%q,ln:%q,l1:%q,c:%q,s:%q,z:%q};const ins=document.querySelectorAll('input');const sls=document.querySelectorAll('select');let f={}; const fi=Array.from(ins).find(el=>mf(el,['first','given','fname','firstName','first_name','vorname']));if(fi){snv(fi,a.fn);f.first_name=true}else{const ni=Array.from(ins).find(el=>mf(el,['fullname','full_name','name']));if(ni){snv(ni,a.fn+' '+a.ln);f.full_name=true}} const li=Array.from(ins).find(el=>mf(el,['last','family','lname','lastName','surname','nachname']));if(li){snv(li,a.ln);f.last_name=true} const ai=Array.from(ins).find(el=>mf(el,['address-line1','address1','address','street','addr1','line1']));if(ai){snv(ai,a.l1);f.address=true} const ci=Array.from(ins).find(el=>mf(el,['city','town','locality','address-level2']));if(ci){snv(ci,a.c);f.city=true} const si=Array.from(ins).find(el=>mf(el,['state','region','province','address-level1']));const ss=Array.from(sls).find(el=>mf(el,['state','region','province']));if(ss){so(ss,a.s);f.state=true}else if(si){snv(si,a.s);f.state=true} const zi=Array.from(ins).find(el=>mf(el,['zip','postal','postcode','postal_code','zip_code']));if(zi){snv(zi,a.z);f.zip=true} const cs=Array.from(sls).find(el=>mf(el,['country']));if(cs){so(cs,'US');f.country=true} await new Promise(r=>setTimeout(r,600)); return JSON.stringify({url:window.location.href,filled:f,inputCount:ins.length}); })()`, addr.FirstName, addr.LastName, addr.Line1, addr.City, addr.State, addr.ZipCode))
+	fillR, _ := executeCDPScript(conn, fmt.Sprintf(`(async () => { function snv(el,v){const s=Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value').set;s.call(el,v);el.dispatchEvent(new Event('input',{bubbles:true}));el.dispatchEvent(new Event('change',{bubbles:true}));} function so(sel,v){const o=Array.from(sel.options).find(o=>o.value===v||o.text===v||o.text.includes(v));if(o){sel.value=o.value;sel.dispatchEvent(new Event('change',{bubbles:true}));return true}return false} function mf(el,ks){const s=(el.name+'|'+el.id+'|'+el.autocomplete+'|'+(el.placeholder||'')+'|'+(el.getAttribute('aria-label')||'')).toLowerCase();return ks.some(k=>s.includes(k))} const a={fn:%q,ln:%q,l1:%q,c:%q,s:%q,z:%q};const ins=document.querySelectorAll('input');const sls=document.querySelectorAll('select');let f={}; const fi=Array.from(ins).find(el=>mf(el,['first','given','fname','firstName','first_name','vorname']));if(fi){snv(fi,a.fn);f.first_name=true}else{const ni=Array.from(ins).find(el=>mf(el,['fullname','full_name','name']));if(ni){snv(ni,a.fn+' '+a.ln);f.full_name=true}} const li=Array.from(ins).find(el=>mf(el,['last','family','lname','lastName','surname','nachname']));if(li){snv(li,a.ln);f.last_name=true} const ai=Array.from(ins).find(el=>mf(el,['address-line1','address1','address','street','addr1','line1']));if(ai){snv(ai,a.l1);f.address=true} const ci=Array.from(ins).find(el=>mf(el,['city','town','locality','address-level2']));if(ci){snv(ci,a.c);f.city=true} const zi=Array.from(ins).find(el=>mf(el,['zip','postal','postcode','postal_code','zip_code']));if(zi){snv(zi,a.z);f.zip=true} const cs=Array.from(sls).find(el=>mf(el,['country']));if(cs){f.country=so(cs,'US'); await new Promise(r=>setTimeout(r,700));} const si=Array.from(ins).find(el=>mf(el,['state','region','province','address-level1']));const ss=Array.from(sls).find(el=>mf(el,['state','region','province']));if(ss){f.state=so(ss,a.s); if(!f.state){ await new Promise(r=>setTimeout(r,300)); f.state=so(ss,a.s); }}else if(si){snv(si,a.s);f.state=true} await new Promise(r=>setTimeout(r,600)); return JSON.stringify({url:window.location.href,filled:f,inputCount:ins.length}); })()`, addr.FirstName, addr.LastName, addr.Line1, addr.City, addr.State, addr.ZipCode))
 	var fillMap map[string]any
 	if fillR != "" {
 		json.Unmarshal([]byte(fillR), &fillMap)
@@ -7166,9 +7253,6 @@ func handleCheckoutAutoFill(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
-	if anyF {
-		executeCDPScript(conn, `(async () => { await new Promise(r=>setTimeout(r,500)); const btns=document.querySelectorAll('button'); const t=Array.from(btns).find(b=>{const tx=(b.textContent||'').toLowerCase(); return tx.includes('continue')||tx.includes('submit')||tx.includes('save')||tx.includes('next')||tx.includes('confirm');}); if(t&&!t.disabled){t.click();return'clicked'} return'none'; })()`)
-	}
 	if !anyF {
 		response["ok"] = false
 		response["error"] = "地址表单已检测到，但没有任何字段被成功写入。"
@@ -7176,5 +7260,6 @@ func handleCheckoutAutoFill(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	response["ok"] = true
+	response["submitted"] = false
 	writeJSON(w, http.StatusOK, response)
 }

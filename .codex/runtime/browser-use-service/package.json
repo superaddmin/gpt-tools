@@ -1,0 +1,15 @@
+{
+  "name": "browser-use-service",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Local Node + Playwright runtime for the browser-use skill.",
+  "scripts": {
+    "start": "node src/server.js",
+    "cli": "node src/cli.js",
+    "check": "node --check src/cli.js && node --check src/server.js && node --check src/browser-use.js && node --check src/extractor.js && node --check src/logger.js && node --check src/errors.js"
+  },
+  "dependencies": {
+    "playwright": "^1.54.2"
+  }
+}

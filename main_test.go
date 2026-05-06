@@ -159,9 +159,28 @@ func TestBuildAuditLogRecordUsesHeaderEmail(t *testing.T) {
 	}
 }
 
+func TestAuditResponseWriterPreservesFlusher(t *testing.T) {
+	recorder := httptest.NewRecorder()
+	writer := &auditResponseWriter{ResponseWriter: recorder, statusCode: http.StatusOK}
+	flusher, ok := any(writer).(http.Flusher)
+	if !ok {
+		t.Fatal("auditResponseWriter should expose http.Flusher when the wrapped writer supports it")
+	}
+
+	flusher.Flush()
+	if !recorder.Flushed {
+		t.Fatal("Flush was not forwarded to wrapped response writer")
+	}
+}
+
 func TestAuditLoggerWritesFileWithEmailAndTimestamp(t *testing.T) {
 	logDir := t.TempDir()
 	logger := newAuditLogger(logDir, time.Hour, 1<<20, 2)
+	t.Cleanup(func() {
+		if err := logger.Close(); err != nil {
+			t.Fatalf("logger.Close returned error: %v", err)
+		}
+	})
 	timestamp := time.Date(2026, 5, 6, 21, 22, 23, 0, time.UTC)
 	logger.write(auditLogEnvelope{
 		Email:     "user@example.com",
@@ -509,6 +528,15 @@ func TestCheckoutAutoFillActionNeedsManualWhenNoInputsAndNoGopay(t *testing.T) {
 	}
 	if got := checkoutAutoFillAction(probe, false); got != "manual" {
 		t.Fatalf("checkoutAutoFillAction = %q, want manual", got)
+	}
+}
+
+func TestCheckoutStateSelectValueUsesFullStateName(t *testing.T) {
+	if got := checkoutStateSelectValue("NC"); got != "North Carolina" {
+		t.Fatalf("checkoutStateSelectValue = %q, want North Carolina", got)
+	}
+	if got := checkoutStateSelectValue("California"); got != "California" {
+		t.Fatalf("checkoutStateSelectValue passthrough = %q, want California", got)
 	}
 }
 

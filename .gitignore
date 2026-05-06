@@ -8,3 +8,5 @@ chatadd.exe
 chatadd-windows-amd64.exe
 elements-session-response.json
 log/
+.codex/runtime/browser-use-service/node_modules/
+.codex/runtime/browser-use-service/artifacts/

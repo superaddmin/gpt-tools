@@ -480,6 +480,26 @@ function renderSessionConclusion(conclusion) {
   }
 }
 
+function showAutoFillNotice(title, badge, message, hint, kind) {
+  if (!alertBox) {
+    return;
+  }
+  alertBox.hidden = false;
+  alertBox.classList.remove("cookie", "token");
+  if (alertTitle) setText(alertTitle, title || "自动填地址");
+  if (alertBadge) setText(alertBadge, badge || "提示");
+  if (alertMessage) setText(alertMessage, message || "-");
+  if (alertHint) {
+    alertHint.hidden = !hint;
+    setText(alertHint, hint || "-");
+  }
+  if (alertSteps) alertSteps.hidden = true;
+  if (alertStepsList) alertStepsList.innerHTML = "";
+  if (kind === "error") {
+    alertBox.classList.add("token");
+  }
+}
+
 /**
  * 在已有的无痕窗口中打开指定 URL（不创建新窗口）
  * @param {string} url - 要打开的 URL
@@ -487,7 +507,7 @@ function renderSessionConclusion(conclusion) {
 async function openInSameIncognito(url) {
   const ensured = await ensureIncognitoWindow();
   if (!ensured) {
-    alert("无法启动 Chrome 无痕窗口，请确认系统已安装 Chrome 浏览器。");
+    showAutoFillNotice("打开无痕窗口失败", "错误", "无法启动 Chrome 无痕窗口，请确认系统已安装 Chrome 浏览器。", "", "error");
     return false;
   }
   const opened = await openIncognito(url, false);
@@ -795,7 +815,7 @@ async function autoFetchAndGenerate() {
     return;
   } catch (error) {
     if (monitorBadge) { monitorBadge.textContent = "Session 失败"; monitorBadge.className = "badge error"; }
-    alert(error.message || "获取 Session JSON 失败，请确认已在无痕窗口中登录 ChatGPT");
+    showAutoFillNotice("获取 Session 失败", "错误", error.message || "获取 Session JSON 失败，请确认已在无痕窗口中登录 ChatGPT", "", "error");
   } finally {
     sessionMonitorAbortController = null;
     fetchSessionBtn.disabled = false;
@@ -828,11 +848,11 @@ autoFillCheckoutBtn?.addEventListener("click", async () => {
   try {
     var ensured = await ensureIncognitoWindow();
     if (!ensured) {
-      alert("无法启动 Chrome 无痕窗口");
+      showAutoFillNotice("自动填地址失败", "错误", "无法启动 Chrome 无痕窗口", "", "error");
       return;
     }
     if (!latestOpenedCheckoutURL) {
-      alert("未找到本工具最近一次打开的支付链接页面，请先用本工具打开支付链接后再试。");
+      showAutoFillNotice("自动填地址失败", "错误", "未找到本工具最近一次打开的支付链接页面。", "请先用本工具打开支付链接后再试。", "error");
       return;
     }
 
@@ -849,18 +869,18 @@ autoFillCheckoutBtn?.addEventListener("click", async () => {
     if (resp.ok && data.ok) {
       var a = data.address;
       var fields = data.filled || {};
-      var msg = "随机美国地址已填入：\n\n" +
+      var msg = "随机美国地址已填入：" + "\n" +
         "姓名: " + (a.first_name || "") + " " + (a.last_name || "") + "\n" +
         "地址: " + (a.line1 || "") + "\n" +
         "城市: " + (a.city || "") + ", " + (a.state || "") + " " + (a.zip_code || "") + "\n\n" +
         "填入结果: " + JSON.stringify(fields);
-      alert(msg);
+      showAutoFillNotice("自动填地址完成", "成功", msg, data.submitted === false ? "本次只填写表单，没有点击订阅。" : "", "");
       setText(autoFillCheckoutBtn, "已填入 ✓");
     } else {
-      alert((data.error || "自动填地址失败") + "\n\n请先在无痕窗口中手动进入 ChatGPT Plus 升级结账页面。");
+      showAutoFillNotice("自动填地址失败", "错误", data.error || "自动填地址失败", "请先在无痕窗口中手动进入 ChatGPT Plus 升级结账页面。", "error");
     }
   } catch (err) {
-    alert("网络错误: " + (err.message || "未知"));
+    showAutoFillNotice("自动填地址失败", "错误", "网络错误: " + (err.message || "未知"), "", "error");
   } finally {
     autoFillCheckoutBtn.disabled = false;
     setText(autoFillCheckoutBtn, origText);
@@ -1031,7 +1051,7 @@ function startGopayOTPAutoCapture() {
           gopayOTPInput.dispatchEvent(new Event("input", { bubbles: true }));
           gopayOTPInput.dispatchEvent(new Event("change", { bubbles: true }));
         }
-        alert("已自动截取到 WhatsApp OTP 验证码：" + detected + "\n\n系统已自动填入 OTP 输入框。");
+        showAutoFillNotice("OTP 已截取", "成功", "已自动截取到 WhatsApp OTP 验证码：" + detected, "系统已自动填入 OTP 输入框。", "");
         stop = true;
         return;
       }
@@ -1058,7 +1078,10 @@ gopayLinkBtn?.addEventListener("click", async function () {
   var accessToken = extractAccessToken(fields.token?.value || "");
   var useFullLink = true;
 
-  if (!phoneNumber) { alert("请输入手机号"); return; }
+  if (!phoneNumber) {
+    showAutoFillNotice("GoPay 绑定失败", "错误", "请输入手机号。", "", "error");
+    return;
+  }
 
   resetGopaySteps();
   gopayLinkBtn.disabled = true;
@@ -1166,12 +1189,20 @@ gopayLinkBtn?.addEventListener("click", async function () {
       if (gopayBadge) { setText(gopayBadge, badgeText); gopayBadge.className = "badge"; }
     } else if (data.stage === "otp_all_failed") {
       if (gopayBadge) { setText(gopayBadge, "需真实验证码"); gopayBadge.className = "badge error"; }
-      alert("自动尝试沙箱测试码均失败。\n\n请输入从 WhatsApp/SMS 收到的 6 位真实 OTP 验证码后重试。");
+      showAutoFillNotice("需要真实 OTP", "提示", "自动尝试沙箱测试码均失败。", "请输入从 WhatsApp/SMS 收到的 6 位真实 OTP 验证码后重试。", "error");
     } else if (data.stage === "pin_all_failed" || data.stage === "payment_pin_all_failed") {
       if (gopayBadge) { setText(gopayBadge, data.stage === "payment_pin_all_failed" ? "需支付 PIN" : "PIN 未通过"); gopayBadge.className = "badge error"; }
-      alert(data.stage === "payment_pin_all_failed"
-        ? "当前账号已复用到支付阶段，但自动尝试支付 PIN 失败。\n\n请在 GoPay PIN 输入框里填入真实 6 位 PIN 后重试。"
-        : "需要输入真实 GoPay PIN，当前自动尝试的 PIN 均未通过。");
+      showAutoFillNotice(
+        data.stage === "payment_pin_all_failed" ? "需要支付 PIN" : "需要真实 GoPay PIN",
+        "提示",
+        data.stage === "payment_pin_all_failed"
+          ? "当前账号已复用到支付阶段，但自动尝试支付 PIN 失败。"
+          : "需要输入真实 GoPay PIN，当前自动尝试的 PIN 均未通过。",
+        data.stage === "payment_pin_all_failed"
+          ? "请在 GoPay PIN 输入框里填入真实 6 位 PIN 后重试。"
+          : "",
+        "error"
+      );
     } else {
       if (gopayBadge) { setText(gopayBadge, "失败"); gopayBadge.className = "badge error"; }
     }

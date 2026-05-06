@@ -1,0 +1,45 @@
+{
+  "name": "Playwright + AI",
+  "version": 1,
+  "description": "项目专属浏览器自动化与 AI 分析技能组合，聚焦网页操作、表单填写与全量数据提取。",
+  "skills": [
+    {
+      "name": "browser-use",
+      "path": "../skills/browser-use/SKILL.md",
+      "runtime": {
+        "type": "node-playwright-service",
+        "root": "../runtime/browser-use-service",
+        "cli": "node src/cli.js",
+        "server": "node src/server.js",
+        "healthEndpoint": "http://127.0.0.1:38765/health",
+        "runEndpoint": "http://127.0.0.1:38765/run"
+      },
+      "capabilities": [
+        "playwright-browser-automation",
+        "form-filling",
+        "page-analysis",
+        "data-extraction",
+        "structured-output",
+        "error-handling",
+        "detailed-logging"
+      ]
+    }
+  ],
+  "defaults": {
+    "browser": "chromium",
+    "headless": true,
+    "navigationTimeoutMs": 30000,
+    "actionTimeoutMs": 15000,
+    "logLevel": "info",
+    "screenshotOnError": true,
+    "extractStructuredData": true,
+    "extractAttributes": true,
+    "extractText": true
+  },
+  "executionPolicy": {
+    "retryCount": 2,
+    "captureConsole": true,
+    "captureNetworkFailures": true,
+    "strictFormValidation": true
+  }
+}

@@ -4,19 +4,32 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <meta name="description" content="OpenAI 支付长链接生成器">
-    <title>长链接生成器</title>
-    <link rel="stylesheet" href="/styles.css?v=20260502f">
+    <title>Checkout Workbench</title>
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%2308745f'/%3E%3Cpath d='M8 10h16v4H8zM8 18h11v4H8z' fill='white'/%3E%3C/svg%3E">
+    <link rel="stylesheet" href="/styles.css?v=20260507a">
   </head>
   <body>
     <main class="shell">
+      <header class="workbench-header">
+        <div class="workbench-title">
+          <p class="workbench-kicker">本地支付辅助</p>
+          <h1>Checkout Workbench</h1>
+          <p>生成支付链接、打开无痕窗口、获取 Session，并完成 GoPay 辅助操作。</p>
+        </div>
+        <div class="workbench-status">
+          <span class="status-chip">本地服务 <strong id="healthBadge" class="badge">检测中</strong></span>
+          <span class="status-chip muted">布局模式 <strong>三栏工作台</strong></span>
+        </div>
+      </header>
+
       <section class="workspace">
         <div class="panel form-panel">
           <div class="panel-head">
             <div>
-              <h1>长链接生成器</h1>
+              <h2>生成支付链接</h2>
               <p class="panel-subtitle">只保留一个功能：生成可直接打开的 OpenAI 支付长链接。</p>
             </div>
-            <span id="healthBadge" class="badge">检测中</span>
+            <span class="badge neutral">主流程</span>
           </div>
 
           <form id="checkoutForm" autocomplete="off">
@@ -156,7 +169,8 @@
           <pre id="output">{}</pre>
         </div>
 
-        <div class="panel gopay-panel" id="gopayPanel">
+        <div class="tools-column">
+          <div class="panel gopay-panel" id="gopayPanel">
           <div class="panel-head">
             <h2>GoPay 一键绑定</h2>
             <span id="gopayBadge" class="badge neutral">就绪</span>
@@ -284,6 +298,89 @@
             <pre id="monitorOutput" hidden>{}</pre>
           </div>
         </div>
+
+          <div class="panel browser-use-panel" id="browserUsePanel">
+          <div class="panel-head">
+            <h2>Browser Use</h2>
+            <span id="browserUseBadge" class="badge neutral">检测中</span>
+          </div>
+
+          <div class="browser-use-form">
+            <label class="browser-use-field">
+              <span>目标 URL</span>
+              <input id="browserUseUrl" type="url" placeholder="https://example.com" autocomplete="off">
+            </label>
+
+            <label class="browser-use-field">
+              <span>任务说明</span>
+              <textarea id="browserUseTask" rows="3" placeholder="例如：打开页面，填写邮箱并提取全部文本与链接"></textarea>
+            </label>
+
+            <div class="browser-use-row browser-use-two-col">
+              <label class="browser-use-field">
+                <span>等待文本</span>
+                <input id="browserUseWaitText" placeholder="例如：Example Domain" autocomplete="off">
+              </label>
+              <label class="browser-use-field">
+                <span>等待选择器</span>
+                <input id="browserUseWaitSelector" placeholder="例如：form input[name='email']" autocomplete="off">
+              </label>
+            </div>
+
+            <label class="browser-use-field">
+              <span>表单数据 JSON</span>
+              <textarea id="browserUseFormData" rows="5" placeholder='例如：{"email":"demo@example.com","name":"Alice"}'></textarea>
+            </label>
+
+            <label class="browser-use-field">
+              <span>字段提示 JSON</span>
+              <textarea id="browserUseFieldHints" rows="5" placeholder='例如：{"email":{"label":"Email"},"name":{"placeholder":"Your name"}}'></textarea>
+            </label>
+
+            <div class="browser-use-row browser-use-two-col">
+              <label class="browser-use-field">
+                <span>运行模式</span>
+                <select id="browserUseHeadless">
+                  <option value="true" selected>无头</option>
+                  <option value="false">可见浏览器</option>
+                </select>
+              </label>
+              <label class="browser-use-field">
+                <span>提交表单</span>
+                <select id="browserUseSubmit">
+                  <option value="false" selected>仅填写/提取</option>
+                  <option value="true">填写后提交</option>
+                </select>
+              </label>
+            </div>
+
+            <div class="browser-use-toolbar">
+              <button id="browserUseRunBtn" type="button">一键调用 browser-use</button>
+              <button id="browserUsePrefillBtn" type="button">填入示例</button>
+            </div>
+
+            <p class="browser-use-help">默认直连本地服务 <code>http://127.0.0.1:38765/run</code>。如果按钮显示离线，请先在 <code>f:\chatadd\.codex\runtime\browser-use-service</code> 下启动 <code>node src/server.js</code>。</p>
+          </div>
+
+          <div id="browserUseResult" class="browser-use-result" hidden>
+            <div class="browser-use-result-grid">
+              <div>
+                <span class="metric-label">服务状态</span>
+                <strong id="browserUseServiceStatus">-</strong>
+              </div>
+              <div>
+                <span class="metric-label">执行结果</span>
+                <strong id="browserUseRunStatus">-</strong>
+              </div>
+              <div>
+                <span class="metric-label">耗时</span>
+                <strong id="browserUseDuration">-</strong>
+              </div>
+            </div>
+            <pre id="browserUseOutput">{}</pre>
+          </div>
+          </div>
+        </div>
       </section>
     </main>
 
@@ -296,9 +393,8 @@
       <button class="wechat-group-card__preview" id="wechatGroupPreviewBtn" type="button" aria-label="查看微信群二维码大图">
         <img
           class="wechat-group-card__image"
-          src="/wechat-group-qr.png"
+          src="/wechat-group-qr-placeholder.svg"
           alt="微信群二维码"
-          onerror="this.onerror=null;this.src='/wechat-group-qr-placeholder.svg';"
         >
       </button>
     </aside>
@@ -315,13 +411,320 @@
         </div>
         <img
           class="wechat-group-modal__image"
-          src="/wechat-group-qr.png"
+          src="/wechat-group-qr-placeholder.svg"
           alt="微信群二维码大图"
-          onerror="this.onerror=null;this.src='/wechat-group-qr-placeholder.svg';"
         >
       </div>
     </div>
 
-    <script src="/app.js?v=20260502f"></script>
+    <script src="/app.js?v=20260507a"></script>
+    <script>
+      const browserUseUrl = document.querySelector("#browserUseUrl");
+      const browserUseTask = document.querySelector("#browserUseTask");
+      const browserUseWaitText = document.querySelector("#browserUseWaitText");
+      const browserUseWaitSelector = document.querySelector("#browserUseWaitSelector");
+      const browserUseFormData = document.querySelector("#browserUseFormData");
+      const browserUseFieldHints = document.querySelector("#browserUseFieldHints");
+      const browserUseHeadless = document.querySelector("#browserUseHeadless");
+      const browserUseSubmit = document.querySelector("#browserUseSubmit");
+      const browserUseRunBtn = document.querySelector("#browserUseRunBtn");
+      const browserUsePrefillBtn = document.querySelector("#browserUsePrefillBtn");
+      const browserUseBadge = document.querySelector("#browserUseBadge");
+      const browserUseResult = document.querySelector("#browserUseResult");
+      const browserUseServiceStatus = document.querySelector("#browserUseServiceStatus");
+      const browserUseRunStatus = document.querySelector("#browserUseRunStatus");
+      const browserUseDuration = document.querySelector("#browserUseDuration");
+      const browserUseOutput = document.querySelector("#browserUseOutput");
+      const browserUseServiceBaseURL = "http://127.0.0.1:38765";
+
+      /**
+       * 检查 browser-use 本地服务状态。
+       * @returns {Promise<boolean>}
+       */
+      async function checkBrowserUseHealth() {
+        try {
+          const response = await fetch(browserUseServiceBaseURL + "/health");
+          if (!response.ok) {
+            throw new Error("health check failed");
+          }
+          const data = await response.json();
+          if (browserUseBadge) {
+            browserUseBadge.textContent = "在线";
+            browserUseBadge.className = "badge";
+          }
+          if (browserUseServiceStatus) {
+            browserUseServiceStatus.textContent = data.service || "browser-use";
+          }
+          return true;
+        } catch (_error) {
+          if (browserUseBadge) {
+            browserUseBadge.textContent = "离线";
+            browserUseBadge.className = "badge error";
+          }
+          if (browserUseServiceStatus) {
+            browserUseServiceStatus.textContent = "未连接";
+          }
+          return false;
+        }
+      }
+
+      /**
+       * 解析可选 JSON 文本。
+       * @param {HTMLTextAreaElement | null} field
+       * @returns {object}
+       */
+      function parseBrowserUseJSONField(field) {
+        const raw = (field?.value || "").trim();
+        if (!raw) {
+          return {};
+        }
+        return JSON.parse(raw);
+      }
+
+      /**
+       * 构建 browser-use 请求体。
+       * @returns {object}
+       */
+      function buildBrowserUsePayload() {
+        const waitFor = {};
+        if ((browserUseWaitText?.value || "").trim()) {
+          waitFor.text = browserUseWaitText.value.trim();
+        }
+        if ((browserUseWaitSelector?.value || "").trim()) {
+          waitFor.selector = browserUseWaitSelector.value.trim();
+        }
+
+        return {
+          task: (browserUseTask?.value || "").trim() || "browser-use task",
+          url: (browserUseUrl?.value || "").trim(),
+          waitFor: waitFor,
+          formData: parseBrowserUseJSONField(browserUseFormData),
+          fieldHints: parseBrowserUseJSONField(browserUseFieldHints),
+          headless: (browserUseHeadless?.value || "true") === "true",
+          submit: (browserUseSubmit?.value || "false") === "true",
+          logLevel: "info",
+          retryCount: 2,
+          screenshotOnError: true
+        };
+      }
+
+      /**
+       * 渲染 browser-use 执行结果。
+       * @param {object} result
+       * @param {number} durationMs
+       * @returns {void}
+       */
+      function renderBrowserUseResult(result, durationMs) {
+        if (browserUseResult) {
+          browserUseResult.hidden = false;
+        }
+        if (browserUseRunStatus) {
+          browserUseRunStatus.textContent = result?.status || result?.error || "unknown";
+        }
+        if (browserUseDuration) {
+          browserUseDuration.textContent = durationMs + " ms";
+        }
+        if (browserUseOutput) {
+          browserUseOutput.textContent = JSON.stringify(result, null, 2);
+        }
+      }
+
+      /**
+       * 调用 browser-use 本地服务。
+       * @returns {Promise<void>}
+       */
+      async function runBrowserUseFromPage() {
+        if (!browserUseRunBtn) {
+          return;
+        }
+
+        browserUseRunBtn.disabled = true;
+        browserUseRunBtn.textContent = "执行中...";
+        if (browserUseRunStatus) {
+          browserUseRunStatus.textContent = "运行中";
+        }
+
+        const startedAt = performance.now();
+        try {
+          const healthy = await checkBrowserUseHealth();
+          if (!healthy) {
+            throw new Error("browser-use 本地服务未启动，请先运行 node src/server.js");
+          }
+
+          const payload = buildBrowserUsePayload();
+          const response = await fetch(browserUseServiceBaseURL + "/run", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(payload)
+          });
+          const result = await response.json();
+          renderBrowserUseResult(result, Math.round(performance.now() - startedAt));
+        } catch (error) {
+          renderBrowserUseResult({
+            status: "failed",
+            error: error instanceof Error ? error.message : String(error)
+          }, Math.round(performance.now() - startedAt));
+        } finally {
+          browserUseRunBtn.disabled = false;
+          browserUseRunBtn.textContent = "一键调用 browser-use";
+        }
+      }
+
+      /**
+       * 填充 browser-use 示例输入。
+       * @returns {void}
+       */
+      function prefillBrowserUseExample() {
+        if (browserUseUrl) {
+          browserUseUrl.value = latestCheckoutURL || "https://example.com";
+        }
+        if (browserUseTask) {
+          browserUseTask.value = latestCheckoutURL
+            ? "打开当前支付链接页面，分析并提取全部页面数据内容"
+            : "打开示例页面，提取全部文本、链接、结构化数据与表单信息";
+        }
+        if (browserUseWaitText) {
+          browserUseWaitText.value = latestCheckoutURL ? "Checkout" : "Example Domain";
+        }
+        if (browserUseWaitSelector) {
+          browserUseWaitSelector.value = "";
+        }
+        if (browserUseFormData) {
+          browserUseFormData.value = JSON.stringify({}, null, 2);
+        }
+        if (browserUseFieldHints) {
+          browserUseFieldHints.value = JSON.stringify({}, null, 2);
+        }
+        if (browserUseHeadless) {
+          browserUseHeadless.value = "true";
+        }
+        if (browserUseSubmit) {
+          browserUseSubmit.value = "false";
+        }
+      }
+
+      /**
+       * 解析 Session 获取接口错误消息。
+       * @param {string} rawText
+       * @returns {string}
+       */
+      function normalizeSessionFetchErrorMessage(rawText) {
+        const text = String(rawText || "").trim();
+        if (!text) {
+          return "获取 Session JSON 失败，请确认已在无痕窗口中登录 ChatGPT";
+        }
+        try {
+          const parsed = JSON.parse(text);
+          return parsed.error || parsed.message || text;
+        } catch (_error) {
+          return text;
+        }
+      }
+
+      /**
+       * 非流式方式获取 Session JSON。
+       * @param {{ skipEnsureWindow?: boolean, allowRecovery?: boolean, silentConclusion?: boolean }} options
+       * @returns {Promise<string>}
+       */
+      async function fetchLatestSessionJSONWithoutStream(options) {
+        options = options || {};
+        const skipEnsureWindow = !!options.skipEnsureWindow;
+        const allowRecovery = options.allowRecovery !== false;
+        const silentConclusion = !!options.silentConclusion;
+
+        if (!skipEnsureWindow) {
+          const ensured = await ensureIncognitoWindow();
+          if (!ensured) {
+            throw new Error("无法启动 Chrome 无痕窗口，请确认系统已安装 Chrome 浏览器。");
+          }
+        }
+
+        sessionMonitorAbortController = new AbortController();
+        clearMonitor();
+        if (gopayMonitor) gopayMonitor.hidden = false;
+        if (monitorBadge) { monitorBadge.textContent = "Session 回退模式中"; monitorBadge.className = "badge"; }
+        appendMonitorEvent({ domain: "Log", method: "session-fetch-fallback", summary: "检测到流式不可用，自动切换到普通模式", ts: Date.now() });
+
+        const response = await fetch("/api/session/fetch", {
+          method: "POST",
+          headers: buildRequestHeaders(),
+          body: JSON.stringify({ stream: false }),
+          signal: sessionMonitorAbortController.signal,
+        });
+
+        const text = await response.text();
+        let payload = null;
+        try {
+          payload = JSON.parse(text);
+        } catch (_error) {
+          payload = null;
+        }
+
+        if (!response.ok) {
+          throw new Error(normalizeSessionFetchErrorMessage(text));
+        }
+
+        const resultJSON = payload?.json || "";
+        const diagnostics = payload?.diagnostics || null;
+
+        if (diagnostics && monitorOutput) {
+          monitorOutput.hidden = false;
+          monitorOutput.textContent = JSON.stringify({ mode: "fallback", diagnostics: diagnostics }, null, 2);
+        }
+
+        if (diagnostics?.conclusion && !silentConclusion) {
+          renderSessionConclusion(diagnostics.conclusion);
+        }
+
+        if (resultJSON) {
+          fields.token.value = resultJSON;
+          if (sessionText) setText(sessionText, "已提取 Session JSON");
+          if (monitorBadge) { monitorBadge.textContent = "Session 已获取"; monitorBadge.className = "badge"; }
+          sessionMonitorAbortController = null;
+          return resultJSON;
+        }
+
+        if (diagnostics?.conclusion && allowRecovery) {
+          var recovered = await handleSessionAutoAction(diagnostics.conclusion);
+          if (recovered) {
+            sessionMonitorAbortController = null;
+            return recovered;
+          }
+        }
+
+        sessionMonitorAbortController = null;
+        if (monitorBadge) { monitorBadge.textContent = "Session 失败"; monitorBadge.className = "badge error"; }
+        throw new Error(diagnostics?.session_preview || payload?.error || "获取 Session JSON 失败，请确认已在无痕窗口中登录 ChatGPT");
+      }
+
+      if (typeof fetchLatestSessionJSON === "function") {
+        const originalFetchLatestSessionJSON = fetchLatestSessionJSON;
+        fetchLatestSessionJSON = async function (options) {
+          try {
+            return await originalFetchLatestSessionJSON(options);
+          } catch (error) {
+            const message = error instanceof Error ? error.message : String(error || "");
+            if (
+              message.includes("streaming not supported")
+              || message.includes("浏览器未返回可读取的流式响应")
+              || message.includes("{\"error\":\"streaming not supported\"")
+            ) {
+              return await fetchLatestSessionJSONWithoutStream(options);
+            }
+            throw error;
+          }
+        };
+      }
+
+      browserUseRunBtn?.addEventListener("click", function () {
+        void runBrowserUseFromPage();
+      });
+
+      browserUsePrefillBtn?.addEventListener("click", function () {
+        prefillBrowserUseExample();
+      });
+
+      void checkBrowserUseHealth();
+    </script>
   </body>
 </html>
