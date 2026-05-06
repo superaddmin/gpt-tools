@@ -6,7 +6,11 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"math"
 	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -67,6 +71,9 @@ func TestBuildSessionDiagnosticsConclusionReturnsSessionReady(t *testing.T) {
 	if conclusion["status"] != "session_ready" {
 		t.Fatalf("status = %#v", conclusion["status"])
 	}
+	if conclusion["auto_action"] != "continue_checkout" {
+		t.Fatalf("auto_action = %#v", conclusion["auto_action"])
+	}
 }
 
 func TestBuildSessionDiagnosticsConclusionDetectsLoginRequired(t *testing.T) {
@@ -81,6 +88,9 @@ func TestBuildSessionDiagnosticsConclusionDetectsLoginRequired(t *testing.T) {
 	if conclusion["status"] != "login_required" {
 		t.Fatalf("status = %#v", conclusion["status"])
 	}
+	if conclusion["auto_action"] != "wait_for_login" {
+		t.Fatalf("auto_action = %#v", conclusion["auto_action"])
+	}
 }
 
 func TestBuildSessionDiagnosticsConclusionDetectsMissingChatGPTPage(t *testing.T) {
@@ -89,6 +99,126 @@ func TestBuildSessionDiagnosticsConclusionDetectsMissingChatGPTPage(t *testing.T
 		"target_found": false,
 	})
 	if conclusion["status"] != "chatgpt_page_missing" {
+		t.Fatalf("status = %#v", conclusion["status"])
+	}
+	if conclusion["auto_action"] != "open_chatgpt_home" {
+		t.Fatalf("auto_action = %#v", conclusion["auto_action"])
+	}
+}
+
+func TestBuildSessionDiagnosticsConclusionDetectsCDPNotReady(t *testing.T) {
+	conclusion := buildSessionDiagnosticsConclusion(map[string]any{
+		"cdp_ready": false,
+	})
+	if conclusion["status"] != "cdp_not_ready" {
+		t.Fatalf("status = %#v", conclusion["status"])
+	}
+	if conclusion["auto_action"] != "wait_and_retry" {
+		t.Fatalf("auto_action = %#v", conclusion["auto_action"])
+	}
+}
+
+func TestSessionIntValueReturnsZeroForOverflowFloat64(t *testing.T) {
+	diagnostics := map[string]any{"session_status": float64(math.MaxInt) * 2}
+	if got := sessionIntValue(diagnostics, "session_status"); got != 0 {
+		t.Fatalf("got = %d, want 0", got)
+	}
+}
+
+func TestSanitizeAuditBodyMasksSensitiveFields(t *testing.T) {
+	body := []byte(`{"token":"eyJabc.def.ghi","customer_email":"user@example.com","checkout_session":{"cookie":"secret-cookie"},"otp":"123456"}`)
+	detail := sanitizeAuditBody(body)
+	if detail["token"] == "eyJabc.def.ghi" {
+		t.Fatal("token should be masked")
+	}
+	if nested, ok := detail["checkout_session"].(map[string]any); ok {
+		if nested["cookie"] == "secret-cookie" {
+			t.Fatal("cookie should be masked")
+		}
+	} else {
+		t.Fatalf("checkout_session type = %T", detail["checkout_session"])
+	}
+	if detail["customer_email"] != "user@example.com" {
+		t.Fatalf("customer_email = %#v", detail["customer_email"])
+	}
+}
+
+func TestBuildAuditLogRecordUsesHeaderEmail(t *testing.T) {
+	req := httptest.NewRequest(http.MethodPost, "/api/session/fetch", strings.NewReader(`{"stream":true}`))
+	req.Header.Set("X-Account-Email", "Tester@example.com")
+	req.RemoteAddr = "127.0.0.1:56789"
+	record := buildAuditLogRecord(req, []byte(`{"stream":true}`), http.StatusOK, time.Now())
+	if record.AccountEmail != "tester@example.com" {
+		t.Fatalf("AccountEmail = %q", record.AccountEmail)
+	}
+	if record.IPAddress != "127.0.0.1" {
+		t.Fatalf("IPAddress = %q", record.IPAddress)
+	}
+	if record.OperationName != "获取 Session JSON" {
+		t.Fatalf("OperationName = %q", record.OperationName)
+	}
+}
+
+func TestAuditLoggerWritesFileWithEmailAndTimestamp(t *testing.T) {
+	logDir := t.TempDir()
+	logger := newAuditLogger(logDir, time.Hour, 1<<20, 2)
+	timestamp := time.Date(2026, 5, 6, 21, 22, 23, 0, time.UTC)
+	logger.write(auditLogEnvelope{
+		Email:     "user@example.com",
+		Timestamp: timestamp,
+		Record: auditLogRecord{
+			OperationTime:   timestamp.Format(time.RFC3339Nano),
+			OperationType:   "monitor_trace",
+			OperationName:   "流程监控",
+			OperationResult: "success",
+			AccountEmail:    "user@example.com",
+			IPAddress:       "127.0.0.1",
+			RequestPath:     "/api/gopay/monitor",
+			RequestMethod:   http.MethodPost,
+		},
+	})
+	matches, err := filepath.Glob(filepath.Join(logDir, "user@example.com_20260506212223.log"))
+	if err != nil {
+		t.Fatalf("Glob returned error: %v", err)
+	}
+	if len(matches) != 1 {
+		t.Fatalf("matches = %d, want 1", len(matches))
+	}
+	data, err := os.ReadFile(matches[0])
+	if err != nil {
+		t.Fatalf("ReadFile returned error: %v", err)
+	}
+	if !strings.Contains(string(data), `"account_email":"user@example.com"`) {
+		t.Fatalf("log content = %s", string(data))
+	}
+}
+
+func TestExtractResultStringReadsStringValue(t *testing.T) {
+	resp := &cdpResponse{
+		Result: map[string]any{
+			"result": map[string]any{
+				"value": "ok",
+			},
+		},
+	}
+	got, err := extractResultString(resp)
+	if err != nil {
+		t.Fatalf("extractResultString returned error: %v", err)
+	}
+	if got != "ok" {
+		t.Fatalf("got = %q", got)
+	}
+}
+
+func TestWithSessionDiagnosticsConclusionAddsConclusion(t *testing.T) {
+	diagnostics := withSessionDiagnosticsConclusion(map[string]any{
+		"cdp_ready": false,
+	})
+	conclusion, ok := diagnostics["conclusion"].(map[string]any)
+	if !ok {
+		t.Fatalf("conclusion type = %T", diagnostics["conclusion"])
+	}
+	if conclusion["status"] != "cdp_not_ready" {
 		t.Fatalf("status = %#v", conclusion["status"])
 	}
 }

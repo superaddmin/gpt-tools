@@ -287,6 +287,41 @@
       </section>
     </main>
 
+    <aside class="wechat-group-card is-expanded" id="wechatGroupCard" aria-label="微信群二维码">
+      <button class="wechat-group-card__close" id="wechatGroupCloseBtn" type="button" aria-label="关闭微信群二维码">×</button>
+      <button class="wechat-group-card__toggle" id="wechatGroupToggleBtn" type="button" aria-expanded="true">
+        <span class="wechat-group-card__title">微信群</span>
+        <span class="wechat-group-card__name">Super Plus</span>
+      </button>
+      <button class="wechat-group-card__preview" id="wechatGroupPreviewBtn" type="button" aria-label="查看微信群二维码大图">
+        <img
+          class="wechat-group-card__image"
+          src="/wechat-group-qr.png"
+          alt="微信群二维码"
+          onerror="this.onerror=null;this.src='/wechat-group-qr-placeholder.svg';"
+        >
+      </button>
+    </aside>
+
+    <div class="wechat-group-modal" id="wechatGroupModal" hidden>
+      <button class="wechat-group-modal__backdrop" id="wechatGroupBackdrop" type="button" aria-label="关闭二维码预览"></button>
+      <div class="wechat-group-modal__dialog" role="dialog" aria-modal="true" aria-labelledby="wechatGroupModalTitle">
+        <div class="wechat-group-modal__head">
+          <div>
+            <div class="wechat-group-card__title">微信群</div>
+            <div class="wechat-group-card__name" id="wechatGroupModalTitle">Super Plus</div>
+          </div>
+          <button class="wechat-group-modal__close" id="wechatGroupModalCloseBtn" type="button" aria-label="关闭二维码预览">×</button>
+        </div>
+        <img
+          class="wechat-group-modal__image"
+          src="/wechat-group-qr.png"
+          alt="微信群二维码大图"
+          onerror="this.onerror=null;this.src='/wechat-group-qr-placeholder.svg';"
+        >
+      </div>
+    </div>
+
     <script src="/app.js?v=20260502f"></script>
   </body>
 </html>

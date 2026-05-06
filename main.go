@@ -14,6 +14,7 @@ import (
 	"io"
 	"io/fs"
 	"log"
+	"math"
 	"net"
 	"net/http"
 	"net/url"
@@ -21,9 +22,11 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -298,6 +301,392 @@ type stripeSnapAccountFlowResult struct {
 	Attempts         []map[string]any
 }
 
+type auditResponseWriter struct {
+	http.ResponseWriter
+	statusCode int
+}
+
+func (w *auditResponseWriter) WriteHeader(statusCode int) {
+	w.statusCode = statusCode
+	w.ResponseWriter.WriteHeader(statusCode)
+}
+
+func (w *auditResponseWriter) Write(data []byte) (int, error) {
+	if w.statusCode == 0 {
+		w.statusCode = http.StatusOK
+	}
+	return w.ResponseWriter.Write(data)
+}
+
+func newAuditLogger(baseDir string, archiveAfter time.Duration, maxFileSize int64, queueSize int) *auditLogger {
+	logger := &auditLogger{
+		baseDir:       baseDir,
+		archiveAfter:  archiveAfter,
+		maxFileSize:   maxFileSize,
+		queue:         make(chan auditLogEnvelope, queueSize),
+		fileCache:     map[string]*os.File{},
+		fileOpenedAt:  map[string]time.Time{},
+		fileCreatedAt: map[string]time.Time{},
+		fileSizes:     map[string]int64{},
+	}
+	go logger.run()
+	return logger
+}
+
+func (l *auditLogger) run() {
+	for item := range l.queue {
+		l.write(item)
+	}
+}
+
+func (l *auditLogger) Log(record auditLogRecord) {
+	if l == nil {
+		return
+	}
+	timestamp, err := time.Parse(time.RFC3339Nano, record.OperationTime)
+	if err != nil {
+		timestamp = time.Now()
+		record.OperationTime = timestamp.Format(time.RFC3339Nano)
+	}
+	envelope := auditLogEnvelope{
+		Email:     normalizeAuditEmail(record.AccountEmail),
+		Timestamp: timestamp,
+		Record:    record,
+	}
+	select {
+	case l.queue <- envelope:
+	default:
+		go l.write(envelope)
+	}
+}
+
+func (l *auditLogger) write(item auditLogEnvelope) {
+	if err := os.MkdirAll(l.baseDir, 0o755); err != nil {
+		log.Printf("create audit log dir failed: %v", err)
+		return
+	}
+
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	filePath, fileHandle, err := l.fileFor(item)
+	if err != nil {
+		log.Printf("open audit log file failed: %v", err)
+		return
+	}
+
+	payload, err := json.Marshal(item.Record)
+	if err != nil {
+		log.Printf("marshal audit log failed: %v", err)
+		return
+	}
+	payload = append(payload, '\n')
+	written, err := fileHandle.Write(payload)
+	if err != nil {
+		log.Printf("write audit log failed: %v", err)
+		return
+	}
+	l.fileSizes[filePath] += int64(written)
+	l.fileOpenedAt[filePath] = time.Now()
+}
+
+func (l *auditLogger) fileFor(item auditLogEnvelope) (string, *os.File, error) {
+	targetPath := l.targetPath(item.Email, item.Timestamp)
+	if fileHandle, ok := l.fileCache[targetPath]; ok && !l.shouldRotate(targetPath, item.Timestamp) {
+		return targetPath, fileHandle, nil
+	}
+	if err := l.rotateOthers(item.Email, item.Timestamp); err != nil {
+		return "", nil, err
+	}
+	if fileHandle, ok := l.fileCache[targetPath]; ok && !l.shouldRotate(targetPath, item.Timestamp) {
+		return targetPath, fileHandle, nil
+	}
+	fileHandle, err := os.OpenFile(targetPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
+	if err != nil {
+		return "", nil, err
+	}
+	fileInfo, err := fileHandle.Stat()
+	if err != nil {
+		fileHandle.Close()
+		return "", nil, err
+	}
+	l.fileCache[targetPath] = fileHandle
+	l.fileOpenedAt[targetPath] = time.Now()
+	l.fileCreatedAt[targetPath] = item.Timestamp
+	l.fileSizes[targetPath] = fileInfo.Size()
+	return targetPath, fileHandle, nil
+}
+
+func (l *auditLogger) rotateOthers(email string, now time.Time) error {
+	prefix := sanitizeAuditFileName(email) + "_"
+	for path, fileHandle := range l.fileCache {
+		if !strings.Contains(filepath.Base(path), prefix) {
+			continue
+		}
+		if l.shouldRotate(path, now) {
+			if err := fileHandle.Close(); err != nil {
+				return err
+			}
+			delete(l.fileCache, path)
+			delete(l.fileOpenedAt, path)
+			delete(l.fileCreatedAt, path)
+			delete(l.fileSizes, path)
+		}
+	}
+	return nil
+}
+
+func (l *auditLogger) shouldRotate(path string, now time.Time) bool {
+	createdAt, ok := l.fileCreatedAt[path]
+	if ok && l.archiveAfter > 0 && now.Sub(createdAt) >= l.archiveAfter {
+		return true
+	}
+	if l.maxFileSize > 0 && l.fileSizes[path] >= l.maxFileSize {
+		return true
+	}
+	return false
+}
+
+func (l *auditLogger) targetPath(email string, ts time.Time) string {
+	name := fmt.Sprintf("%s_%s.log", sanitizeAuditFileName(email), ts.Format("20060102150405"))
+	return filepath.Join(l.baseDir, name)
+}
+
+func normalizeAuditEmail(email string) string {
+	email = strings.TrimSpace(strings.ToLower(email))
+	if email == "" {
+		return "unknown_account"
+	}
+	return email
+}
+
+func sanitizeAuditFileName(email string) string {
+	safe := normalizeAuditEmail(email)
+	safe = auditFileNameSanitizer.Replace(safe)
+	safe = strings.Trim(safe, "._")
+	if safe == "" {
+		return "unknown_account"
+	}
+	return safe
+}
+
+func auditOperationName(path string) string {
+	if name := operationDisplayNames[path]; name != "" {
+		return name
+	}
+	return path
+}
+
+func auditOperationType(path string) string {
+	if kind := operationTypes[path]; kind != "" {
+		return kind
+	}
+	return "request"
+}
+
+func extractClientIP(r *http.Request) string {
+	forwardedFor := strings.TrimSpace(strings.Split(r.Header.Get("X-Forwarded-For"), ",")[0])
+	if forwardedFor != "" {
+		return forwardedFor
+	}
+	realIP := strings.TrimSpace(r.Header.Get("X-Real-IP"))
+	if realIP != "" {
+		return realIP
+	}
+	host, _, err := net.SplitHostPort(strings.TrimSpace(r.RemoteAddr))
+	if err == nil && host != "" {
+		return host
+	}
+	return strings.TrimSpace(r.RemoteAddr)
+}
+
+func auditLogMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.HasPrefix(r.URL.Path, "/api/") {
+			next.ServeHTTP(w, r)
+			return
+		}
+
+		bodyBytes, readErr := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+		if readErr != nil {
+			writeError(w, http.StatusBadRequest, "invalid request body")
+			return
+		}
+		r.Body.Close()
+		r.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+
+		auditWriter := &auditResponseWriter{ResponseWriter: w, statusCode: http.StatusOK}
+		startedAt := time.Now()
+		next.ServeHTTP(auditWriter, r)
+
+		record := buildAuditLogRecord(r, bodyBytes, auditWriter.statusCode, startedAt)
+		flowAuditLogger.Log(record)
+	})
+}
+
+func buildAuditLogRecord(r *http.Request, body []byte, statusCode int, startedAt time.Time) auditLogRecord {
+	detail := sanitizeAuditBody(body)
+	email := extractAuditEmail(r, detail)
+	result := "success"
+	if statusCode >= 400 {
+		result = "failed"
+	}
+	metadata := map[string]any{
+		"duration_ms": time.Since(startedAt).Milliseconds(),
+	}
+	if len(detail) > 0 {
+		metadata["request_payload"] = detail
+	}
+	record := auditLogRecord{
+		OperationTime:   startedAt.Format(time.RFC3339Nano),
+		OperationType:   auditOperationType(r.URL.Path),
+		OperationName:   auditOperationName(r.URL.Path),
+		OperationDetail: detail,
+		OperationResult: result,
+		StatusCode:      statusCode,
+		AccountEmail:    email,
+		IPAddress:       extractClientIP(r),
+		RequestPath:     r.URL.Path,
+		RequestMethod:   r.Method,
+		Summary:         fmt.Sprintf("%s %s => %d", r.Method, r.URL.Path, statusCode),
+		Metadata:        metadata,
+	}
+	if statusCode >= 400 {
+		record.ErrorMessage = http.StatusText(statusCode)
+	}
+	return record
+}
+
+func sanitizeAuditBody(body []byte) map[string]any {
+	trimmed := bytes.TrimSpace(body)
+	if len(trimmed) == 0 {
+		return nil
+	}
+	var parsed any
+	if err := json.Unmarshal(trimmed, &parsed); err != nil {
+		return map[string]any{"raw": string(trimmed)}
+	}
+	sanitized := sanitizeAuditValue(parsed)
+	if m, ok := sanitized.(map[string]any); ok {
+		return m
+	}
+	return map[string]any{"value": sanitized}
+}
+
+func sanitizeAuditValue(value any) any {
+	switch typed := value.(type) {
+	case map[string]any:
+		keys := make([]string, 0, len(typed))
+		for key := range typed {
+			keys = append(keys, key)
+		}
+		sort.Strings(keys)
+		cleaned := make(map[string]any, len(typed))
+		for _, key := range keys {
+			if _, blocked := sensitiveJSONKeys[key]; blocked {
+				cleaned[key] = maskSensitiveValue(typed[key])
+				continue
+			}
+			cleaned[key] = sanitizeAuditValue(typed[key])
+		}
+		return cleaned
+	case []any:
+		cleaned := make([]any, 0, len(typed))
+		for _, item := range typed {
+			cleaned = append(cleaned, sanitizeAuditValue(item))
+		}
+		return cleaned
+	case string:
+		if looksSensitiveString(typed) {
+			return maskSensitiveString(typed)
+		}
+		return typed
+	default:
+		return typed
+	}
+}
+
+func maskSensitiveValue(value any) any {
+	switch typed := value.(type) {
+	case string:
+		return maskSensitiveString(typed)
+	default:
+		return "***"
+	}
+}
+
+func maskSensitiveString(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return ""
+	}
+	if len(value) <= 8 {
+		return "***"
+	}
+	return value[:4] + "***" + value[len(value)-4:]
+}
+
+func looksSensitiveString(value string) bool {
+	trimmed := strings.TrimSpace(value)
+	if trimmed == "" {
+		return false
+	}
+	if strings.HasPrefix(trimmed, "eyJ") {
+		return true
+	}
+	return len(trimmed) > 40 && strings.Count(trimmed, ".") >= 2
+}
+
+func extractAuditEmail(r *http.Request, detail map[string]any) string {
+	if email := strings.TrimSpace(r.Header.Get("X-Account-Email")); email != "" {
+		return normalizeAuditEmail(email)
+	}
+	if email := auditEmailFromMap(detail); email != "" {
+		return email
+	}
+	return "unknown_account"
+}
+
+func auditEmailFromMap(detail map[string]any) string {
+	if detail == nil {
+		return ""
+	}
+	priorityKeys := []string{"customer_email", "email", "account_email", "user_email"}
+	for _, key := range priorityKeys {
+		if value, ok := detail[key].(string); ok && auditEmailPattern.MatchString(value) {
+			return normalizeAuditEmail(value)
+		}
+	}
+	for _, value := range detail {
+		switch typed := value.(type) {
+		case string:
+			if auditEmailPattern.MatchString(typed) {
+				return normalizeAuditEmail(auditEmailPattern.FindString(typed))
+			}
+		case map[string]any:
+			if nested := auditEmailFromMap(typed); nested != "" {
+				return nested
+			}
+		case []any:
+			for _, item := range typed {
+				if nestedMap, ok := item.(map[string]any); ok {
+					if nested := auditEmailFromMap(nestedMap); nested != "" {
+						return nested
+					}
+				}
+				if text, ok := item.(string); ok && auditEmailPattern.MatchString(text) {
+					return normalizeAuditEmail(auditEmailPattern.FindString(text))
+				}
+			}
+		}
+	}
+	return ""
+}
+
+func withAuditLogging(next http.Handler) http.Handler {
+	return auditLogMiddleware(next)
+}
+
 func main() {
 	config = loadAppConfig()
 
@@ -324,9 +713,11 @@ func main() {
 	mux.HandleFunc("/api/checkout/auto-fill", handleCheckoutAutoFill)
 	mux.Handle("/", noCache(http.FileServer(http.FS(staticFiles))))
 
+	handler := securityHeaders(withAuditLogging(mux))
+
 	server := &http.Server{
 		Addr:              "127.0.0.1:18473",
-		Handler:           securityHeaders(mux),
+		Handler:           handler,
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 
@@ -496,19 +887,28 @@ func findAnyTarget(port int, urlPattern string) (*cdpTarget, error) {
 	return nil, &cdpNotReadyError{message: "未在 CDP 中找到匹配 " + urlPattern + " 的页面"}
 }
 
-func sendCDPCommand(conn *websocket.Conn, method string, params map[string]any) (*cdpResponse, error) {
-	cmd := cdpCommand{ID: 1, Method: method, Params: params}
+func sendCDPCommandWithID(conn *websocket.Conn, id int64, method string, params map[string]any) (*cdpResponse, error) {
+	cmd := cdpCommand{ID: int(id), Method: method, Params: params}
 	if err := conn.WriteJSON(cmd); err != nil {
 		return nil, fmt.Errorf("发送 CDP 命令失败: %w", err)
 	}
-	var resp cdpResponse
-	if err := conn.ReadJSON(&resp); err != nil {
-		return nil, fmt.Errorf("读取 CDP 响应失败: %w", err)
+	for {
+		var resp cdpResponse
+		if err := conn.ReadJSON(&resp); err != nil {
+			return nil, fmt.Errorf("读取 CDP 响应失败: %w", err)
+		}
+		if resp.ID != int(id) {
+			continue
+		}
+		if resp.Error != nil {
+			return nil, fmt.Errorf("CDP 错误: %s (code %d)", resp.Error.Message, resp.Error.Code)
+		}
+		return &resp, nil
 	}
-	if resp.Error != nil {
-		return nil, fmt.Errorf("CDP 错误: %s (code %d)", resp.Error.Message, resp.Error.Code)
-	}
-	return &resp, nil
+}
+
+func sendCDPCommand(conn *websocket.Conn, method string, params map[string]any) (*cdpResponse, error) {
+	return sendCDPCommandWithID(conn, 1, method, params)
 }
 
 func extractResultString(resp *cdpResponse) (string, error) {
@@ -528,8 +928,11 @@ func extractResultString(resp *cdpResponse) (string, error) {
 	}
 }
 
+var cdpCommandCounter int64 = 1
+
 func executeCDPScript(conn *websocket.Conn, script string) (string, error) {
-	resp, err := sendCDPCommand(conn, "Runtime.evaluate", map[string]any{
+	id := atomic.AddInt64(&cdpCommandCounter, 1)
+	resp, err := sendCDPCommandWithID(conn, id, "Runtime.evaluate", map[string]any{
 		"expression": script, "awaitPromise": true, "returnByValue": true,
 	})
 	if err != nil {
@@ -551,10 +954,16 @@ func sessionBoolValue(diagnostics map[string]any, key string) bool {
 func sessionIntValue(diagnostics map[string]any, key string) int {
 	switch value := diagnostics[key].(type) {
 	case float64:
+		if value > float64(math.MaxInt) || value < float64(math.MinInt) {
+			return 0
+		}
 		return int(value)
 	case int:
 		return value
 	case int64:
+		if value > int64(math.MaxInt) || value < int64(math.MinInt) {
+			return 0
+		}
 		return int(value)
 	default:
 		return 0
@@ -564,8 +973,9 @@ func sessionIntValue(diagnostics map[string]any, key string) int {
 func buildSessionDiagnosticsConclusion(diagnostics map[string]any) map[string]any {
 	if diagnostics == nil {
 		return map[string]any{
-			"status":  "unknown",
-			"message": "尚未生成 Session 诊断信息",
+			"status":      "unknown",
+			"message":     "尚未生成 Session 诊断信息",
+			"auto_action": "open_chatgpt_home",
 			"next_steps": []string{
 				"打开 Chrome 无痕窗口",
 				"访问 chatgpt.com 并完成登录",
@@ -576,8 +986,9 @@ func buildSessionDiagnosticsConclusion(diagnostics map[string]any) map[string]an
 
 	if !sessionBoolValue(diagnostics, "cdp_ready") {
 		return map[string]any{
-			"status":  "cdp_not_ready",
-			"message": "Chrome CDP 尚未就绪，本地无痕窗口或远程调试端口不可用",
+			"status":      "cdp_not_ready",
+			"message":     "Chrome CDP 尚未就绪，本地无痕窗口或远程调试端口不可用",
+			"auto_action": "wait_and_retry",
 			"next_steps": []string{
 				"先点击打开无痕窗口",
 				"确认 Chrome 已启动且远程调试端口 9223 可用",
@@ -588,8 +999,9 @@ func buildSessionDiagnosticsConclusion(diagnostics map[string]any) map[string]an
 
 	if !sessionBoolValue(diagnostics, "target_found") {
 		return map[string]any{
-			"status":  "chatgpt_page_missing",
-			"message": "未找到 chatgpt.com 页面，当前无痕窗口可能未打开到目标站点",
+			"status":      "chatgpt_page_missing",
+			"message":     "未找到 chatgpt.com 页面，当前无痕窗口可能未打开到目标站点",
+			"auto_action": "open_chatgpt_home",
 			"next_steps": []string{
 				"确认无痕窗口已打开 chatgpt.com",
 				"若页面被跳转到其他站点，请切回 ChatGPT 首页或登录页",
@@ -607,8 +1019,9 @@ func buildSessionDiagnosticsConclusion(diagnostics map[string]any) map[string]an
 
 	if hasToken {
 		return map[string]any{
-			"status":  "session_ready",
-			"message": "已检测到 accessToken，可以继续后续 checkout 自动化流程",
+			"status":      "session_ready",
+			"message":     "已检测到 accessToken，可以继续后续 checkout 自动化流程",
+			"auto_action": "continue_checkout",
 			"next_steps": []string{
 				"直接生成支付链接",
 				"如需排查支付链路，可保持当前监控面板开启",
@@ -618,8 +1031,9 @@ func buildSessionDiagnosticsConclusion(diagnostics map[string]any) map[string]an
 
 	if sessionStatus == http.StatusUnauthorized || loginSelectorCount > 0 || strings.Contains(targetURL, "/auth/login") || strings.Contains(bodyText, "log in") || strings.Contains(bodyText, "登录") {
 		return map[string]any{
-			"status":  "login_required",
-			"message": "当前页面仍处于未登录态，请先在无痕窗口中完成 ChatGPT 登录",
+			"status":      "login_required",
+			"message":     "当前页面仍处于未登录态，请先在无痕窗口中完成 ChatGPT 登录",
+			"auto_action": "wait_for_login",
 			"next_steps": []string{
 				"在无痕窗口输入账号并完成登录",
 				"确认页面进入聊天页或已登录首页",
@@ -630,8 +1044,9 @@ func buildSessionDiagnosticsConclusion(diagnostics map[string]any) map[string]an
 
 	if sessionStatus >= 500 {
 		return map[string]any{
-			"status":  "session_endpoint_error",
-			"message": "已访问 /api/auth/session，但上游返回 5xx，当前更像是会话接口临时异常",
+			"status":      "session_endpoint_error",
+			"message":     "已访问 /api/auth/session，但上游返回 5xx，当前更像是会话接口临时异常",
+			"auto_action": "retry_session_fetch",
 			"next_steps": []string{
 				"刷新无痕窗口页面后重试",
 				"确认网络代理或浏览器环境未拦截请求",
@@ -646,8 +1061,9 @@ func buildSessionDiagnosticsConclusion(diagnostics map[string]any) map[string]an
 			message = "会话接口已返回响应，但内容表现为异常或未登录态"
 		}
 		return map[string]any{
-			"status":  "session_missing_token",
-			"message": message,
+			"status":      "session_missing_token",
+			"message":     message,
+			"auto_action": "retry_session_fetch",
 			"next_steps": []string{
 				"确认当前账号已完整登录而不是停留在中间页",
 				"检查是否命中了风控、验证页或灰度页面",
@@ -657,8 +1073,9 @@ func buildSessionDiagnosticsConclusion(diagnostics map[string]any) map[string]an
 	}
 
 	return map[string]any{
-		"status":  "session_unknown",
-		"message": "Session 获取流程已执行，但暂时无法自动判定具体卡点",
+		"status":      "session_unknown",
+		"message":     "Session 获取流程已执行，但暂时无法自动判定具体卡点",
+		"auto_action": "manual_review",
 		"next_steps": []string{
 			"查看监控面板中的 session_preview、body_text 和 target_url",
 			"确认页面是否已完成登录并停留在 chatgpt.com",
@@ -667,9 +1084,17 @@ func buildSessionDiagnosticsConclusion(diagnostics map[string]any) map[string]an
 	}
 }
 
+func withSessionDiagnosticsConclusion(diagnostics map[string]any) map[string]any {
+	if diagnostics == nil {
+		diagnostics = map[string]any{}
+	}
+	diagnostics["conclusion"] = buildSessionDiagnosticsConclusion(diagnostics)
+	return diagnostics
+}
+
 func fetchSessionJSONViaCDPWithDiagnostics(onEvent func(monitorEvent)) (string, map[string]any, error) {
 	if !isCDPReady(cdpDebuggingPort) {
-		return "", map[string]any{"cdp_ready": false}, &cdpNotReadyError{message: "CDP 未就绪"}
+		return "", withSessionDiagnosticsConclusion(map[string]any{"cdp_ready": false}), &cdpNotReadyError{message: "CDP 未就绪"}
 	}
 	if onEvent != nil {
 		onEvent(monitorEvent{Timestamp: time.Now().UnixMilli(), Domain: "Log", Method: "session-cdp", Summary: "CDP 已就绪，开始查找 chatgpt.com 页面"})
@@ -677,14 +1102,14 @@ func fetchSessionJSONViaCDPWithDiagnostics(onEvent func(monitorEvent)) (string, 
 	start := time.Now()
 	target, err := findChatGPTTarget(cdpDebuggingPort)
 	if err != nil {
-		return "", map[string]any{"cdp_ready": true, "target_found": false}, err
+		return "", withSessionDiagnosticsConclusion(map[string]any{"cdp_ready": true, "target_found": false}), err
 	}
 	if onEvent != nil {
 		onEvent(monitorEvent{Timestamp: time.Now().UnixMilli(), Domain: "Page", Method: "session-target", Summary: truncateURL(target.URL, 160)})
 	}
 	conn, _, err := websocket.DefaultDialer.Dial(target.WebSocketDebuggerURL, nil)
 	if err != nil {
-		return "", map[string]any{"cdp_ready": true, "target_found": true, "target_url": target.URL}, fmt.Errorf("WebSocket 连接失败: %w", err)
+		return "", withSessionDiagnosticsConclusion(map[string]any{"cdp_ready": true, "target_found": true, "target_url": target.URL}), fmt.Errorf("WebSocket 连接失败: %w", err)
 	}
 	defer conn.Close()
 	_, _ = sendCDPCommand(conn, "Runtime.enable", nil)
@@ -716,12 +1141,12 @@ func fetchSessionJSONViaCDPWithDiagnostics(onEvent func(monitorEvent)) (string, 
 		});
 	})()`)
 	if snapshotErr != nil {
-		return "", map[string]any{"cdp_ready": true, "target_found": true, "target_url": target.URL}, snapshotErr
+		return "", withSessionDiagnosticsConclusion(map[string]any{"cdp_ready": true, "target_found": true, "target_url": target.URL}), snapshotErr
 	}
 
 	var snapshot map[string]any
 	if err := json.Unmarshal([]byte(snapshotRaw), &snapshot); err != nil {
-		return snapshotRaw, map[string]any{"cdp_ready": true, "target_found": true, "target_url": target.URL, "parse_error": err.Error()}, nil
+		return snapshotRaw, withSessionDiagnosticsConclusion(map[string]any{"cdp_ready": true, "target_found": true, "target_url": target.URL, "parse_error": err.Error()}), nil
 	}
 	sessionJSON := stringifyJSONValue(snapshot["session_text"])
 	diagnostics := map[string]any{
@@ -946,6 +1371,112 @@ type monitorTargetDescriptor struct {
 	Label      string
 	URLPattern string
 }
+
+type auditLogRecord struct {
+	OperationTime   string         `json:"operation_time"`
+	OperationType   string         `json:"operation_type"`
+	OperationName   string         `json:"operation_name"`
+	OperationDetail any            `json:"operation_detail,omitempty"`
+	OperationResult string         `json:"operation_result"`
+	StatusCode      int            `json:"status_code,omitempty"`
+	AccountEmail    string         `json:"account_email"`
+	IPAddress       string         `json:"ip_address"`
+	RequestPath     string         `json:"request_path"`
+	RequestMethod   string         `json:"request_method"`
+	ErrorMessage    string         `json:"error_message,omitempty"`
+	Summary         string         `json:"summary,omitempty"`
+	Metadata        map[string]any `json:"metadata,omitempty"`
+}
+
+type auditLogEnvelope struct {
+	Email     string
+	Timestamp time.Time
+	Record    auditLogRecord
+}
+
+type auditLogger struct {
+	baseDir       string
+	archiveAfter  time.Duration
+	maxFileSize   int64
+	queue         chan auditLogEnvelope
+	mu            sync.Mutex
+	fileCache     map[string]*os.File
+	fileOpenedAt  map[string]time.Time
+	fileCreatedAt map[string]time.Time
+	fileSizes     map[string]int64
+}
+
+var flowAuditLogger = newAuditLogger(filepath.Join(".", "log"), 24*time.Hour, 8<<20, 512)
+
+var operationDisplayNames = map[string]string{
+	"/api/health":                  "健康检查",
+	"/api/checkout":                "生成支付链接",
+	"/api/checkout/start":          "生成支付链接",
+	"/api/incognito/open":          "打开无痕窗口",
+	"/api/session/fetch":           "获取 Session JSON",
+	"/api/gopay/force-link":        "GoPay 强制绑定",
+	"/api/gopay/auto-link":         "GoPay 自动绑定",
+	"/api/gopay/cdp-otp":           "CDP OTP 获取",
+	"/api/gopay/smart-link":        "GoPay 智能绑定",
+	"/api/gopay/snap-probe":        "Snap 探测",
+	"/api/gopay/monitor":           "流程监控",
+	"/api/pricing/monitor":         "定价监控",
+	"/api/gopay/full-link":         "GoPay 全流程绑定",
+	"/api/checkout/resolve-target": "Checkout 目标解析",
+	"/api/checkout/auto-fill":      "Checkout 自动填充",
+}
+
+var operationTypes = map[string]string{
+	"/api/health":                  "system_health",
+	"/api/checkout":                "checkout_create",
+	"/api/checkout/start":          "checkout_create",
+	"/api/incognito/open":          "login_open_window",
+	"/api/session/fetch":           "session_query",
+	"/api/gopay/force-link":        "gopay_link",
+	"/api/gopay/auto-link":         "gopay_link",
+	"/api/gopay/cdp-otp":           "otp_query",
+	"/api/gopay/smart-link":        "gopay_link",
+	"/api/gopay/snap-probe":        "data_query",
+	"/api/gopay/monitor":           "monitor_trace",
+	"/api/pricing/monitor":         "monitor_trace",
+	"/api/gopay/full-link":         "gopay_full_flow",
+	"/api/checkout/resolve-target": "data_query",
+	"/api/checkout/auto-fill":      "data_modify",
+}
+
+var sensitiveJSONKeys = map[string]struct{}{
+	"token":             {},
+	"accessToken":       {},
+	"access_token":      {},
+	"cookie":            {},
+	"checkout_cookie":   {},
+	"authorization":     {},
+	"pin":               {},
+	"otp":               {},
+	"challenge_id":      {},
+	"client_secret":     {},
+	"session":           {},
+	"session_json":      {},
+	"gopay_pin_token":   {},
+	"payment_method_id": {},
+}
+
+var auditEmailPattern = regexp.MustCompile(`(?i)[a-z0-9._%+\-]+@[a-z0-9.\-]+\.[a-z]{2,}`)
+
+var auditFileNameSanitizer = strings.NewReplacer(
+	"<", "_",
+	">", "_",
+	":", "_",
+	"\"", "_",
+	"/", "_",
+	"\\", "_",
+	"|", "_",
+	"?", "_",
+	"*", "_",
+	" ", "_",
+)
+
+var auditSafeKeySanitizer = strings.NewReplacer("-", "_", ".", "_", " ", "_")
 
 var usStates = []string{"AL", "AK", "AZ", "AR", "CA", "CO", "CT", "DE", "FL", "GA", "HI", "ID", "IL", "IN", "IA", "KS", "KY", "LA", "ME", "MD", "MA", "MI", "MN", "MS", "MO", "MT", "NE", "NV", "NH", "NJ", "NM", "NY", "NC", "ND", "OH", "OK", "OR", "PA", "RI", "SC", "SD", "TN", "TX", "UT", "VT", "VA", "WA", "WV", "WI", "WY"}
 var usFirstNames = []string{"James", "John", "Robert", "Michael", "William", "David", "Richard", "Joseph", "Thomas", "Charles", "Mary", "Patricia", "Jennifer", "Linda", "Barbara", "Elizabeth", "Susan", "Jessica", "Sarah", "Karen", "Emma", "Olivia", "Ava", "Isabella", "Sophia", "Mia", "Charlotte", "Amelia", "Harper", "Evelyn"}

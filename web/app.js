@@ -27,6 +27,14 @@ const stepCheckoutText = document.querySelector("#stepCheckoutText");
 const stepCookieText = document.querySelector("#stepCookieText");
 const stepLinkText = document.querySelector("#stepLinkText");
 
+const wechatGroupCard = document.querySelector("#wechatGroupCard");
+const wechatGroupToggleBtn = document.querySelector("#wechatGroupToggleBtn");
+const wechatGroupPreviewBtn = document.querySelector("#wechatGroupPreviewBtn");
+const wechatGroupCloseBtn = document.querySelector("#wechatGroupCloseBtn");
+const wechatGroupModal = document.querySelector("#wechatGroupModal");
+const wechatGroupBackdrop = document.querySelector("#wechatGroupBackdrop");
+const wechatGroupModalCloseBtn = document.querySelector("#wechatGroupModalCloseBtn");
+
 let latestCheckoutURL = "";
 let latestOpenedCheckoutURL = "";
 let incognitoWindowOpened = false;
@@ -49,6 +57,73 @@ function setText(node, value) {
   if (node) {
     node.textContent = value;
   }
+}
+
+function setWechatGroupCollapsed(collapsed) {
+  if (!wechatGroupCard || !wechatGroupToggleBtn) {
+    return;
+  }
+  wechatGroupCard.classList.toggle("is-collapsed", collapsed);
+  wechatGroupCard.classList.toggle("is-expanded", !collapsed);
+  wechatGroupToggleBtn.setAttribute("aria-expanded", collapsed ? "false" : "true");
+}
+
+function openWechatGroupModal() {
+  if (!wechatGroupModal) {
+    return;
+  }
+  wechatGroupModal.hidden = false;
+  document.body.style.overflow = "hidden";
+}
+
+function closeWechatGroupModal() {
+  if (!wechatGroupModal) {
+    return;
+  }
+  wechatGroupModal.hidden = true;
+  document.body.style.overflow = "";
+}
+
+function bindWechatGroupCard() {
+  if (wechatGroupToggleBtn) {
+    wechatGroupToggleBtn.addEventListener("click", function () {
+      var collapsed = wechatGroupCard?.classList.contains("is-collapsed");
+      setWechatGroupCollapsed(!collapsed);
+    });
+  }
+
+  if (wechatGroupPreviewBtn) {
+    wechatGroupPreviewBtn.addEventListener("click", function () {
+      openWechatGroupModal();
+    });
+  }
+
+  if (wechatGroupCloseBtn) {
+    wechatGroupCloseBtn.addEventListener("click", function () {
+      if (wechatGroupCard) {
+        wechatGroupCard.classList.add("is-hidden");
+      }
+      closeWechatGroupModal();
+    });
+  }
+
+  if (wechatGroupBackdrop) {
+    wechatGroupBackdrop.addEventListener("click", function () {
+      closeWechatGroupModal();
+    });
+  }
+
+  if (wechatGroupModalCloseBtn) {
+    wechatGroupModalCloseBtn.addEventListener("click", function () {
+      closeWechatGroupModal();
+    });
+  }
+
+  document.addEventListener("keydown", function (event) {
+    if (event.key === "Escape") {
+      closeWechatGroupModal();
+    }
+  });
 }
 
 function extractAccessToken(rawValue) {
@@ -125,10 +200,22 @@ function buildStartPayload() {
   };
 }
 
+function buildRequestHeaders(extraHeaders) {
+  var headers = { "Content-Type": "application/json" };
+  var email = (fields.customerEmail?.value || "").trim();
+  if (email) {
+    headers["X-Account-Email"] = email;
+  }
+  if (extraHeaders && typeof extraHeaders === "object") {
+    Object.assign(headers, extraHeaders);
+  }
+  return headers;
+}
+
 async function postJSON(url, payload) {
   const response = await fetch(url, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: buildRequestHeaders(),
     body: JSON.stringify(payload),
   });
   const data = await response.json();
@@ -179,7 +266,7 @@ async function openIncognito(url, newWindow) {
   try {
     const response = await fetch("/api/incognito/open", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: buildRequestHeaders(),
       body: JSON.stringify({ url: url, new_window: newWindow }),
     });
     const data = await response.json();
@@ -210,14 +297,73 @@ async function ensureIncognitoWindow() {
   return true;
 }
 
+async function openChatGPTInSameIncognito() {
+  return await openIncognito("https://chatgpt.com/", false);
+}
+
+async function waitForSessionLoginCompletion(maxWaitMs) {
+  var startedAt = Date.now();
+  while (Date.now() - startedAt < maxWaitMs) {
+    await new Promise(function (r) { setTimeout(r, 2500); });
+    try {
+      var result = await fetchLatestSessionJSON({ skipEnsureWindow: true, allowRecovery: false, silentConclusion: true });
+      if (result) {
+        return result;
+      }
+    } catch (_err) {
+    }
+  }
+  throw new Error("等待登录超时，请在无痕窗口中完成 ChatGPT 登录后重试。");
+}
+
+async function handleSessionAutoAction(conclusion) {
+  if (!conclusion) return null;
+  var action = conclusion.auto_action || "";
+
+  if (action === "continue_checkout" || action === "manual_review") {
+    return null;
+  }
+
+  if (action === "open_chatgpt_home") {
+    appendMonitorEvent({ domain: "Log", method: "session-auto-action", summary: "自动恢复：打开 chatgpt.com", ts: Date.now() });
+    var opened = await openChatGPTInSameIncognito();
+    if (!opened) {
+      throw new Error("自动打开 chatgpt.com 失败，请手动检查无痕窗口。");
+    }
+    await new Promise(function (r) { setTimeout(r, 1800); });
+    return await fetchLatestSessionJSON({ skipEnsureWindow: true, allowRecovery: false, silentConclusion: true });
+  }
+
+  if (action === "wait_and_retry" || action === "retry_session_fetch") {
+    appendMonitorEvent({ domain: "Log", method: "session-auto-action", summary: "自动恢复：等待后重试 Session 获取", ts: Date.now() });
+    await new Promise(function (r) { setTimeout(r, 2000); });
+    return await fetchLatestSessionJSON({ skipEnsureWindow: true, allowRecovery: false, silentConclusion: true });
+  }
+
+  if (action === "wait_for_login") {
+    appendMonitorEvent({ domain: "Log", method: "session-auto-action", summary: "自动恢复：等待你在无痕窗口完成登录", ts: Date.now() });
+    if (monitorBadge) { monitorBadge.textContent = "等待登录中"; monitorBadge.className = "badge"; }
+    return await waitForSessionLoginCompletion(120000);
+  }
+
+  return null;
+}
+
 /**
  * 自动从当前无痕 Chrome 会话提取最新 Session JSON，并回填到左侧输入框
  * @returns {Promise<string>} 最新 Session JSON 文本
  */
-async function fetchLatestSessionJSON() {
-  const ensured = await ensureIncognitoWindow();
-  if (!ensured) {
-    throw new Error("无法启动 Chrome 无痕窗口，请确认系统已安装 Chrome 浏览器。");
+async function fetchLatestSessionJSON(options) {
+  options = options || {};
+  const skipEnsureWindow = !!options.skipEnsureWindow;
+  const allowRecovery = options.allowRecovery !== false;
+  const silentConclusion = !!options.silentConclusion;
+
+  if (!skipEnsureWindow) {
+    const ensured = await ensureIncognitoWindow();
+    if (!ensured) {
+      throw new Error("无法启动 Chrome 无痕窗口，请确认系统已安装 Chrome 浏览器。");
+    }
   }
 
   sessionMonitorAbortController = new AbortController();
@@ -227,13 +373,22 @@ async function fetchLatestSessionJSON() {
 
   const response = await fetch("/api/session/fetch", {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: buildRequestHeaders(),
     body: JSON.stringify({ stream: true }),
     signal: sessionMonitorAbortController.signal,
   });
 
-  if (!response.ok || !response.body) {
-    throw new Error("获取 Session JSON 失败，请确认已在无痕窗口中登录 ChatGPT");
+  if (!response.ok) {
+    var errorText = "";
+    try {
+      errorText = await response.text();
+    } catch (_err) {
+    }
+    throw new Error(errorText || "获取 Session JSON 失败，请确认已在无痕窗口中登录 ChatGPT");
+  }
+
+  if (!response.body) {
+    throw new Error("浏览器未返回可读取的流式响应，请刷新页面后重试。");
   }
 
   const reader = response.body.getReader();
@@ -277,12 +432,14 @@ async function fetchLatestSessionJSON() {
     }
   }
 
+  sessionMonitorAbortController = null;
+
   if (diagnostics && monitorOutput) {
     monitorOutput.hidden = false;
     monitorOutput.textContent = JSON.stringify({ stream: fullOutput, diagnostics: diagnostics }, null, 2);
   }
 
-  if (diagnostics?.conclusion) {
+  if (diagnostics?.conclusion && !silentConclusion) {
     renderSessionConclusion(diagnostics.conclusion);
   }
 
@@ -291,6 +448,13 @@ async function fetchLatestSessionJSON() {
     if (sessionText) setText(sessionText, "已提取 Session JSON");
     if (monitorBadge) { monitorBadge.textContent = "Session 已获取"; monitorBadge.className = "badge"; }
     return resultJSON;
+  }
+
+  if (diagnostics?.conclusion && allowRecovery) {
+    var recovered = await handleSessionAutoAction(diagnostics.conclusion);
+    if (recovered) {
+      return recovered;
+    }
   }
 
   if (monitorBadge) { monitorBadge.textContent = "Session 失败"; monitorBadge.className = "badge error"; }
@@ -335,7 +499,7 @@ async function openInSameIncognito(url) {
     await new Promise(function (r) { setTimeout(r, 1800); });
     const resp = await fetch("/api/checkout/resolve-target", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: buildRequestHeaders(),
       body: JSON.stringify({ opened_url: url }),
     });
     const data = await resp.json();
@@ -677,7 +841,7 @@ autoFillCheckoutBtn?.addEventListener("click", async () => {
 
     var resp = await fetch("/api/checkout/auto-fill", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: buildRequestHeaders(),
       body: JSON.stringify({ expected_url: latestOpenedCheckoutURL }),
     });
     var data = await resp.json();
@@ -853,7 +1017,7 @@ function startGopayOTPAutoCapture() {
     try {
       var resp = await fetch("/api/gopay/cdp-otp", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: buildRequestHeaders(),
         body: JSON.stringify({ otp: (gopayOTPInput?.value || "").trim() }),
       });
       var data = await resp.json();
@@ -929,7 +1093,7 @@ gopayLinkBtn?.addEventListener("click", async function () {
 
     var resp = await fetch("/api/gopay/full-link", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: buildRequestHeaders(),
       body: JSON.stringify(payload),
     });
     var data = await resp.json();
@@ -1090,7 +1254,7 @@ async function startGopayMonitorStream(durationS) {
 
   var resp = await fetch("/api/gopay/monitor", {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: buildRequestHeaders(),
     body: JSON.stringify({ duration_s: durationS, stream: true }),
     signal: gopayMonitorAbortController.signal,
   });
@@ -1214,4 +1378,5 @@ gopayMonitorBtn?.addEventListener("click", async function () {
   }
 });
 
+bindWechatGroupCard();
 void checkHealth();
