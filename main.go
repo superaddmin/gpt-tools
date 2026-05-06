@@ -18,9 +18,15 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/exec"
+	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
+
+	"github.com/gorilla/websocket"
 )
 
 type appConfig struct {
@@ -235,6 +241,63 @@ type gopayRedirectResult struct {
 	GUID        string `json:"guid,omitempty"`
 }
 
+type gopayLinkingResolution struct {
+	LinkResult        map[string]any
+	ReusedExisting    bool
+	AccountResult     map[string]any
+	ConflictReason    string
+	LinkError         string
+	LinkHTTPStatus    int
+	LinkErrorMessage  []string
+	TokenNotFound     bool
+	AccountSource     string
+	AccountOriginURL  string
+	AccountSourceNote string
+}
+
+type gopayPaymentResolution struct {
+	Charge             map[string]any
+	PaymentReferenceID string
+	PaymentValidate    map[string]any
+	PaymentConfirm     map[string]any
+	PaymentChallengeID string
+	PaymentClientID    string
+	PaymentPINToken    map[string]any
+	PaymentProcess     map[string]any
+	TransactionID      string
+	MidtransStatus     map[string]any
+	PinUsed            string
+	PinTried           []string
+}
+
+type stripeSnapAccountFlowDeps struct {
+	init                func(context.Context, *http.Client, any) stripeInitResult
+	update              func(context.Context, *http.Client, any, string, string, taxRegion, string, stripeClientContext) stripeInitResult
+	createPaymentMethod func(context.Context, *http.Client, any, string, string, taxRegion, string, stripeClientContext) stripeInitResult
+	confirm             func(context.Context, *http.Client, any, string, string, string, stripeClientContext) stripeInitResult
+	approve             func(context.Context, *http.Client, string, checkoutSession, checkoutApproveRequest) (map[string]any, error)
+	waitForRedirect     func(context.Context, int, time.Duration, func() stripeInitResult) (stripeInitResult, stripeRedirectCheck, []map[string]any)
+	redirect            func(context.Context, *http.Client, string) gopayRedirectResult
+}
+
+type stripeSnapAccountFlowResult struct {
+	AccountID        string
+	AccountSource    string
+	AccountOriginURL string
+	Init             stripeInitResult
+	InitCheck        stripeInitBodyCheck
+	Update           stripeInitResult
+	PaymentMethod    stripeInitResult
+	Confirm          stripeInitResult
+	Approval         map[string]any
+	TermsInteraction map[string]any
+	ConfirmCheck     stripeConfirmCheck
+	Details          stripeInitResult
+	RedirectCheck    stripeRedirectCheck
+	Redirect         gopayRedirectResult
+	Attempts         []map[string]any
+}
+
 func main() {
 	config = loadAppConfig()
 
@@ -247,6 +310,18 @@ func main() {
 	mux.HandleFunc("/api/health", handleHealth)
 	mux.HandleFunc("/api/checkout", handleCheckout)
 	mux.HandleFunc("/api/checkout/start", handleCheckout)
+	mux.HandleFunc("/api/incognito/open", handleIncognitoOpen)
+	mux.HandleFunc("/api/session/fetch", handleSessionFetch)
+	mux.HandleFunc("/api/gopay/force-link", handleGopayForceLink)
+	mux.HandleFunc("/api/gopay/auto-link", handleGopayAutoLink)
+	mux.HandleFunc("/api/gopay/cdp-otp", handleGopayCDPOTP)
+	mux.HandleFunc("/api/gopay/smart-link", handleGopaySmartLink)
+	mux.HandleFunc("/api/gopay/snap-probe", handleGopaySnapProbe)
+	mux.HandleFunc("/api/gopay/monitor", handleGopayMonitor)
+	mux.HandleFunc("/api/pricing/monitor", handlePricingMonitor)
+	mux.HandleFunc("/api/gopay/full-link", handleGopayFullLink)
+	mux.HandleFunc("/api/checkout/resolve-target", handleCheckoutResolveTarget)
+	mux.HandleFunc("/api/checkout/auto-fill", handleCheckoutAutoFill)
 	mux.Handle("/", noCache(http.FileServer(http.FS(staticFiles))))
 
 	server := &http.Server{
@@ -280,6 +355,454 @@ func handleHealth(w http.ResponseWriter, r *http.Request) {
 		"status": "ok",
 		"time":   time.Now().Format(time.RFC3339),
 	})
+}
+
+type incognitoOpenRequest struct {
+	URL       string `json:"url"`
+	NewWindow bool   `json:"new_window"`
+}
+
+const cdpDebuggingPort = 9223
+
+func incognitoUserDataDir() string {
+	return filepath.Join(os.TempDir(), "chatadd-chrome-incognito")
+}
+
+func buildChromeArgs(targetURL string, newWindow bool) []string {
+	args := []string{"/c", "start", ""}
+	baseArgs := []string{
+		"chrome",
+		"--incognito",
+		"--remote-debugging-port=" + strconv.Itoa(cdpDebuggingPort),
+		"--user-data-dir=" + incognitoUserDataDir(),
+	}
+	if newWindow {
+		baseArgs = append(baseArgs, "--new-window")
+	}
+	baseArgs = append(baseArgs, targetURL)
+	return append(args, baseArgs...)
+}
+
+func handleIncognitoOpen(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	defer r.Body.Close()
+	var req incognitoOpenRequest
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<18)).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json body")
+		return
+	}
+	req.URL = strings.TrimSpace(req.URL)
+	if req.URL == "" {
+		writeError(w, http.StatusBadRequest, "url is required")
+		return
+	}
+	parsed, err := url.Parse(req.URL)
+	if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") {
+		writeError(w, http.StatusBadRequest, "url must be http or https")
+		return
+	}
+	args := buildChromeArgs(req.URL, req.NewWindow)
+	cmd := exec.Command("cmd", args...)
+	cmd.Stdout = io.Discard
+	cmd.Stderr = io.Discard
+	if err := cmd.Start(); err != nil {
+		log.Printf("launch chrome incognito failed: %v", err)
+		writeError(w, http.StatusInternalServerError, "无法启动 Chrome 无痕窗口: "+err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok": true, "url": req.URL, "new_window": req.NewWindow,
+	})
+}
+
+type cdpCommand struct {
+	ID     int            `json:"id"`
+	Method string         `json:"method"`
+	Params map[string]any `json:"params,omitempty"`
+}
+
+type cdpResponse struct {
+	ID     int            `json:"id"`
+	Result map[string]any `json:"result,omitempty"`
+	Error  *cdpErrorBody  `json:"error,omitempty"`
+}
+
+type cdpErrorBody struct {
+	Code    int    `json:"code"`
+	Message string `json:"message"`
+}
+
+type cdpTarget struct {
+	ID                   string `json:"id"`
+	Type                 string `json:"type"`
+	URL                  string `json:"url"`
+	Title                string `json:"title,omitempty"`
+	WebSocketDebuggerURL string `json:"webSocketDebuggerUrl"`
+}
+
+type cdpNotReadyError struct{ message string }
+
+func (e *cdpNotReadyError) Error() string { return e.message }
+
+func isCDPReady(port int) bool {
+	resp, err := http.Get(fmt.Sprintf("http://127.0.0.1:%d/json/version", port))
+	if err != nil {
+		return false
+	}
+	resp.Body.Close()
+	return resp.StatusCode == http.StatusOK
+}
+
+func getCDPTargets(port int) ([]cdpTarget, error) {
+	resp, err := http.Get(fmt.Sprintf("http://127.0.0.1:%d/json", port))
+	if err != nil {
+		return nil, fmt.Errorf("无法连接 CDP: %w", err)
+	}
+	defer resp.Body.Close()
+	var targets []cdpTarget
+	if err := json.NewDecoder(resp.Body).Decode(&targets); err != nil {
+		return nil, fmt.Errorf("解析 CDP 目标列表失败: %w", err)
+	}
+	return targets, nil
+}
+
+func findChatGPTTarget(port int) (*cdpTarget, error) {
+	targets, err := getCDPTargets(port)
+	if err != nil {
+		return nil, err
+	}
+	for i := range targets {
+		if targets[i].Type == "page" && strings.Contains(targets[i].URL, "chatgpt.com") {
+			return &targets[i], nil
+		}
+	}
+	return nil, &cdpNotReadyError{message: "未找到 chatgpt.com 页面"}
+}
+
+func findAnyTarget(port int, urlPattern string) (*cdpTarget, error) {
+	targets, err := getCDPTargets(port)
+	if err != nil {
+		return nil, err
+	}
+	for i := range targets {
+		t := &targets[i]
+		if (t.Type == "page" || t.Type == "iframe") && strings.Contains(t.URL, urlPattern) {
+			return t, nil
+		}
+	}
+	return nil, &cdpNotReadyError{message: "未在 CDP 中找到匹配 " + urlPattern + " 的页面"}
+}
+
+func sendCDPCommand(conn *websocket.Conn, method string, params map[string]any) (*cdpResponse, error) {
+	cmd := cdpCommand{ID: 1, Method: method, Params: params}
+	if err := conn.WriteJSON(cmd); err != nil {
+		return nil, fmt.Errorf("发送 CDP 命令失败: %w", err)
+	}
+	var resp cdpResponse
+	if err := conn.ReadJSON(&resp); err != nil {
+		return nil, fmt.Errorf("读取 CDP 响应失败: %w", err)
+	}
+	if resp.Error != nil {
+		return nil, fmt.Errorf("CDP 错误: %s (code %d)", resp.Error.Message, resp.Error.Code)
+	}
+	return &resp, nil
+}
+
+func extractResultString(resp *cdpResponse) (string, error) {
+	resultObj, ok := resp.Result["result"].(map[string]any)
+	if !ok {
+		return "", fmt.Errorf("CDP 返回结构异常: result 字段缺失")
+	}
+	val, ok := resultObj["value"]
+	if !ok {
+		return "", fmt.Errorf("CDP 返回结构异常: value 字段缺失")
+	}
+	switch v := val.(type) {
+	case string:
+		return v, nil
+	default:
+		return fmt.Sprint(v), nil
+	}
+}
+
+func executeCDPScript(conn *websocket.Conn, script string) (string, error) {
+	resp, err := sendCDPCommand(conn, "Runtime.evaluate", map[string]any{
+		"expression": script, "awaitPromise": true, "returnByValue": true,
+	})
+	if err != nil {
+		return "", err
+	}
+	return extractResultString(resp)
+}
+
+func fetchSessionJSONViaCDP() (string, error) {
+	if !isCDPReady(cdpDebuggingPort) {
+		return "", &cdpNotReadyError{message: "CDP 未就绪"}
+	}
+	target, err := findChatGPTTarget(cdpDebuggingPort)
+	if err != nil {
+		return "", err
+	}
+	conn, _, err := websocket.DefaultDialer.Dial(target.WebSocketDebuggerURL, nil)
+	if err != nil {
+		return "", fmt.Errorf("WebSocket 连接失败: %w", err)
+	}
+	defer conn.Close()
+	return executeCDPScript(conn, `(async () => { const r = await fetch('/api/auth/session'); return await r.text(); })()`)
+}
+
+func handleSessionFetch(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	sessionJSON, err := fetchSessionJSONViaCDP()
+	if err != nil {
+		var notReady *cdpNotReadyError
+		if errors.As(err, &notReady) {
+			writeJSON(w, http.StatusServiceUnavailable, map[string]any{"ok": false, "error": err.Error(), "code": "cdp_not_ready"})
+			return
+		}
+		log.Printf("fetch session JSON failed: %v", err)
+		writeError(w, http.StatusInternalServerError, "获取失败: "+err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "json": sessionJSON})
+}
+
+type gopayForceLinkRequest struct {
+	AccountID   string `json:"account_id"`
+	CountryCode string `json:"country_code"`
+	PhoneNumber string `json:"phone_number"`
+}
+
+func injectIntoGoPayIframeDirect(countryCode, phoneNumber string) (map[string]any, error) {
+	return injectIntoGoPayIframeDirectWithFilter(countryCode, phoneNumber, "")
+}
+
+func injectIntoGoPayIframeDirectWithFilter(countryCode, phoneNumber, urlFilter string) (map[string]any, error) {
+	targets, err := getCDPTargets(cdpDebuggingPort)
+	if err != nil {
+		return nil, fmt.Errorf("获取 CDP 目标失败: %w", err)
+	}
+	var iframeTarget *cdpTarget
+	for i := len(targets) - 1; i >= 0; i-- {
+		t := &targets[i]
+		if (t.Type == "page" || t.Type == "iframe") && strings.Contains(t.URL, "merchants-gws-app.gopayapi.com") && strings.Contains(t.URL, "user-creation") {
+			if urlFilter == "" || strings.Contains(t.URL, urlFilter) {
+				iframeTarget = t
+				if urlFilter != "" {
+					break
+				}
+			}
+		}
+	}
+	if iframeTarget == nil {
+		return nil, fmt.Errorf("未找到 GoPay iframe")
+	}
+	conn, _, err := websocket.DefaultDialer.Dial(iframeTarget.WebSocketDebuggerURL, nil)
+	if err != nil {
+		return nil, fmt.Errorf("GoPay iframe 连接失败: %w", err)
+	}
+	defer conn.Close()
+	script := fmt.Sprintf(`
+		(async () => {
+			function setNV(el, v) { const s = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set; s.call(el, v); el.dispatchEvent(new Event('input', {bubbles: true})); el.dispatchEvent(new Event('change', {bubbles: true})); }
+			let r = {page: window.location.href, title: document.title, found: {phone: false, country: false, button: false}};
+			const all = document.querySelectorAll('input');
+			r.totalInputs = all.length;
+			r.inputInfo = Array.from(all).map(el => ({type: el.type, mode: el.inputMode, ph: (el.placeholder||'').slice(0,20), nm: el.name||''}));
+			const pe = document.querySelector('input[type="tel"], input[type="number"], input[inputmode="numeric"]') || Array.from(all).find(el => (el.placeholder||'').includes('phone') || (el.name||'').includes('phone'));
+			if (pe) { setNV(pe, '%s'); r.found.phone = true; r.phoneType = pe.type; }
+			const cs = document.querySelector('select');
+			if (cs) { r.selectOptionCount = cs.options.length; r.selectOptions = Array.from(cs.options).slice(0,20).map(o => ({val: o.value, txt: o.text}));
+				const o = Array.from(cs.options).find(o => o.value === '86' || o.value === '%s' || o.text.includes('+86'));
+				if (o) { cs.value = o.value; cs.dispatchEvent(new Event('change', {bubbles: true})); r.found.country = true; r.selectedOption = {val: o.value, txt: o.text}; } }
+			await new Promise(rs => setTimeout(rs, 800));
+			const bt = document.querySelectorAll('button'); r.buttonTexts = Array.from(bt).slice(0,5).map(b => b.textContent.trim().slice(0,30));
+			const sb = document.querySelector('button[type="submit"]') || Array.from(bt).find(b => { const t = (b.textContent||'').toLowerCase(); return t.includes('continue')||t.includes('submit')||t.includes('lanjut')||t.includes('kirim')||t.includes('next')||t.includes('verify'); });
+			if (sb && !sb.disabled) { r.found.button = true; r.buttonText = sb.textContent.trim(); sb.click(); r.clicked = true; }
+			else if (sb) { r.found.button = true; r.buttonText = sb.textContent.trim(); r.buttonDisabled = sb.disabled; }
+			return JSON.stringify(r);
+		})()`, phoneNumber, countryCode)
+	resultJSON, err := executeCDPScript(conn, script)
+	if err != nil {
+		return nil, fmt.Errorf("iframe 注入失败: %w", err)
+	}
+	var result map[string]any
+	if json.Unmarshal([]byte(resultJSON), &result) != nil {
+		result = map[string]any{"raw": resultJSON}
+	}
+	stateJSON, _ := executeCDPScript(conn, `(async () => { await new Promise(r => setTimeout(r, 3000)); const e = document.querySelector('[class*="error" i]'); const inps = document.querySelectorAll('input'); return JSON.stringify({title: document.title, url: window.location.href, bodySnippet: (document.body?.textContent||'').trim().slice(0,200), errorText: e?.textContent?.trim()||'', inputCount: inps.length}); })()`)
+	var stateResult map[string]any
+	if json.Unmarshal([]byte(stateJSON), &stateResult) == nil {
+		result["after_submit"] = stateResult
+	}
+	return result, nil
+}
+
+type gopayAutoLinkRequest struct {
+	AccountID   string `json:"account_id"`
+	CountryCode string `json:"country_code"`
+	PhoneNumber string `json:"phone_number"`
+	OTPChannel  string `json:"otp_channel,omitempty"`
+	OTP         string `json:"otp,omitempty"`
+	PIN         string `json:"pin,omitempty"`
+}
+
+type gopaySmartLinkRequest struct {
+	AccountID   string `json:"account_id"`
+	CountryCode string `json:"country_code"`
+	PhoneNumber string `json:"phone_number"`
+	OTPChannel  string `json:"otp_channel,omitempty"`
+	OTP         string `json:"otp,omitempty"`
+	PIN         string `json:"pin,omitempty"`
+}
+
+type usAddress struct {
+	FirstName string `json:"first_name"`
+	LastName  string `json:"last_name"`
+	Line1     string `json:"line1"`
+	City      string `json:"city"`
+	State     string `json:"state"`
+	ZipCode   string `json:"zip_code"`
+	Country   string `json:"country"`
+}
+
+type monitorEvent struct {
+	Timestamp int64  `json:"ts"`
+	Domain    string `json:"domain"`
+	Method    string `json:"method"`
+	Summary   string `json:"summary"`
+	Detail    any    `json:"detail,omitempty"`
+}
+
+type monitorSummaryStats struct {
+	TotalEvents     int `json:"total_events"`
+	NetworkCalls    int `json:"network_calls"`
+	PageNavigations int `json:"page_navigations"`
+	Errors          int `json:"errors"`
+	ConsoleCalls    int `json:"console_calls"`
+	OpenAIAPICalls  int `json:"openai_api_calls"`
+	StripeAPICalls  int `json:"stripe_api_calls"`
+	SnapAPICalls    int `json:"snap_api_calls"`
+	GopayAPICalls   int `json:"gopay_api_calls"`
+	DurationS       int `json:"duration_s"`
+}
+
+type monitorStreamEnvelope struct {
+	Type    string               `json:"type"`
+	Event   *monitorEvent        `json:"event,omitempty"`
+	Summary *monitorSummaryStats `json:"summary,omitempty"`
+	Targets []string             `json:"targets,omitempty"`
+	Data    any                  `json:"data,omitempty"`
+	Error   string               `json:"error,omitempty"`
+}
+
+type monitorTargetDescriptor struct {
+	Label      string
+	URLPattern string
+}
+
+var usStates = []string{"AL", "AK", "AZ", "AR", "CA", "CO", "CT", "DE", "FL", "GA", "HI", "ID", "IL", "IN", "IA", "KS", "KY", "LA", "ME", "MD", "MA", "MI", "MN", "MS", "MO", "MT", "NE", "NV", "NH", "NJ", "NM", "NY", "NC", "ND", "OH", "OK", "OR", "PA", "RI", "SC", "SD", "TN", "TX", "UT", "VT", "VA", "WA", "WV", "WI", "WY"}
+var usFirstNames = []string{"James", "John", "Robert", "Michael", "William", "David", "Richard", "Joseph", "Thomas", "Charles", "Mary", "Patricia", "Jennifer", "Linda", "Barbara", "Elizabeth", "Susan", "Jessica", "Sarah", "Karen", "Emma", "Olivia", "Ava", "Isabella", "Sophia", "Mia", "Charlotte", "Amelia", "Harper", "Evelyn"}
+var usLastNames = []string{"Smith", "Johnson", "Williams", "Brown", "Jones", "Garcia", "Miller", "Davis", "Rodriguez", "Martinez", "Hernandez", "Lopez", "Gonzalez", "Wilson", "Anderson", "Thomas", "Taylor", "Moore", "Jackson", "Martin", "Lee", "Perez", "Thompson", "White", "Harris", "Sanchez", "Clark", "Ramirez", "Lewis"}
+var usStreets = []string{"Main St", "Oak Ave", "Elm St", "Maple Dr", "Cedar Ln", "Pine Rd", "Washington Blvd", "Park Ave", "Broadway", "Lake Dr", "Hill Rd", "River Rd", "Church St", "School St", "Mill Rd", "Valley View Dr", "Sunset Blvd"}
+var usCities = []string{"New York", "Los Angeles", "Chicago", "Houston", "Phoenix", "Philadelphia", "San Antonio", "San Diego", "Dallas", "Austin", "Jacksonville", "Fort Worth", "Columbus", "Charlotte", "Indianapolis", "San Francisco", "Seattle", "Denver", "Nashville", "Portland", "Memphis", "Baltimore", "Milwaukee", "Albuquerque"}
+
+func randomInt(n int) int {
+	b := make([]byte, 8)
+	rand.Read(b)
+	return int(binary.BigEndian.Uint64(b) % uint64(n))
+}
+
+func generateUSAddress() usAddress {
+	return usAddress{
+		FirstName: usFirstNames[randomInt(len(usFirstNames))],
+		LastName:  usLastNames[randomInt(len(usLastNames))],
+		Line1:     fmt.Sprintf("%d %s", 100+randomInt(9900), usStreets[randomInt(len(usStreets))]),
+		City:      usCities[randomInt(len(usCities))],
+		State:     usStates[randomInt(len(usStates))],
+		ZipCode:   fmt.Sprintf("%05d", 10000+randomInt(90000)),
+		Country:   "US",
+	}
+}
+
+func truncateURL(u string, n int) string {
+	if len(u) <= n {
+		return u
+	}
+	return u[:n] + "..."
+}
+
+func monitorTargets() []monitorTargetDescriptor {
+	return []monitorTargetDescriptor{
+		{Label: "OpenAI", URLPattern: "chatgpt.com"},
+		{Label: "OpenAI", URLPattern: "pay.openai.com"},
+		{Label: "Stripe", URLPattern: "checkout.stripe.com"},
+		{Label: "Stripe", URLPattern: "pm-redirects.stripe.com"},
+		{Label: "Snap", URLPattern: "midtrans.com"},
+		{Label: "GoPay", URLPattern: "merchants-gws-app.gopayapi.com"},
+	}
+}
+
+func classifyMonitorURL(rawURL string) string {
+	u := strings.ToLower(strings.TrimSpace(rawURL))
+	switch {
+	case strings.Contains(u, "chatgpt.com") || strings.Contains(u, "pay.openai.com"):
+		return "openai"
+	case strings.Contains(u, "stripe.com"):
+		return "stripe"
+	case strings.Contains(u, "midtrans.com"):
+		return "snap"
+	case strings.Contains(u, "gopayapi.com"):
+		return "gopay"
+	default:
+		return "other"
+	}
+}
+
+func summarizeMonitorEvents(events []monitorEvent, durationS int) monitorSummaryStats {
+	summary := monitorSummaryStats{DurationS: durationS, TotalEvents: len(events)}
+	for _, e := range events {
+		switch e.Domain {
+		case "Network":
+			summary.NetworkCalls++
+			classification := classifyMonitorURL(e.Summary)
+			switch classification {
+			case "openai":
+				summary.OpenAIAPICalls++
+			case "stripe":
+				summary.StripeAPICalls++
+			case "snap":
+				summary.SnapAPICalls++
+			case "gopay":
+				summary.GopayAPICalls++
+			}
+		case "Page":
+			summary.PageNavigations++
+		case "Error":
+			summary.Errors++
+		case "Console":
+			summary.ConsoleCalls++
+		}
+	}
+	return summary
+}
+
+func toFloat(v any) (float64, bool) {
+	switch n := v.(type) {
+	case float64:
+		return n, true
+	case int:
+		return float64(n), true
+	case int64:
+		return float64(n), true
+	}
+	return 0, false
 }
 
 func handleLocalCheckoutApprove(w http.ResponseWriter, r *http.Request) {
@@ -1269,6 +1792,65 @@ func getGopayRedirect(ctx context.Context, client *http.Client, redirectURL stri
 	return result
 }
 
+func gopayRequestDiagnostics(countryCode string, phoneNumber string, otpChannel string) map[string]any {
+	countryCode = strings.TrimSpace(countryCode)
+	phoneNumber = strings.TrimSpace(phoneNumber)
+	otpChannel = strings.TrimSpace(otpChannel)
+	normalizedChannel, channelErr := normalizeOTPChannel(otpChannel)
+	digitsOnly := strings.Map(func(r rune) rune {
+		if r >= '0' && r <= '9' {
+			return r
+		}
+		return -1
+	}, phoneNumber)
+	return map[string]any{
+		"country_code":           countryCode,
+		"phone_number":           phoneNumber,
+		"otp_channel":            otpChannel,
+		"normalized_otp_channel": normalizedChannel,
+		"otp_channel_error": func() string {
+			if channelErr != nil {
+				return channelErr.Error()
+			}
+			return ""
+		}(),
+		"country_has_plus":         strings.HasPrefix(countryCode, "+"),
+		"country_digits_only":      strings.TrimPrefix(countryCode, "+"),
+		"phone_digits_only":        digitsOnly,
+		"phone_has_plus":           strings.HasPrefix(phoneNumber, "+"),
+		"phone_has_country_prefix": strings.HasPrefix(digitsOnly, strings.TrimPrefix(countryCode, "+")) && strings.TrimPrefix(countryCode, "+") != "",
+	}
+}
+
+func gopayLinkingDiagnostics(resolution gopayLinkingResolution) map[string]any {
+	return map[string]any{
+		"reused_existing":     resolution.ReusedExisting,
+		"conflict_reason":     resolution.ConflictReason,
+		"link_http_status":    resolution.LinkHTTPStatus,
+		"link_error":          resolution.LinkError,
+		"link_error_messages": resolution.LinkErrorMessage,
+		"token_not_found":     resolution.TokenNotFound,
+		"account_source":      resolution.AccountSource,
+		"account_origin_url":  resolution.AccountOriginURL,
+		"account_source_note": resolution.AccountSourceNote,
+		"account_status":      stringifyJSONValue(resolution.AccountResult["account_status"]),
+		"reference_id":        stringifyJSONValue(resolution.LinkResult["reference_id"]),
+	}
+}
+
+func gopayTokenNotFound(result map[string]any, reqErr error) bool {
+	candidates := gopayLinkingErrorMessages(result)
+	if reqErr != nil {
+		candidates = append(candidates, reqErr.Error())
+	}
+	for _, candidate := range candidates {
+		if strings.Contains(strings.ToLower(candidate), "token not found") {
+			return true
+		}
+	}
+	return false
+}
+
 func validateGopayReferenceViaLocalMock(ctx context.Context, referenceID string) (map[string]any, error) {
 	referenceID = strings.TrimSpace(referenceID)
 	if referenceID == "" {
@@ -1390,6 +1972,232 @@ func createGopayLinkingViaLocalMock(ctx context.Context, accountID string, link 
 	}
 	result["reference_id"] = referenceID
 	return result, nil
+}
+
+func gopayLinkingErrorMessages(result map[string]any) []string {
+	if len(result) == 0 {
+		return nil
+	}
+	raw, ok := result["error_messages"]
+	if !ok || raw == nil {
+		return nil
+	}
+	switch typed := raw.(type) {
+	case []string:
+		out := make([]string, 0, len(typed))
+		for _, item := range typed {
+			item = strings.TrimSpace(item)
+			if item != "" {
+				out = append(out, item)
+			}
+		}
+		return out
+	case []any:
+		out := make([]string, 0, len(typed))
+		for _, item := range typed {
+			text := strings.TrimSpace(stringifyJSONValue(item))
+			if text != "" {
+				out = append(out, text)
+			}
+		}
+		return out
+	case string:
+		text := strings.TrimSpace(typed)
+		if text != "" {
+			return []string{text}
+		}
+	}
+	return nil
+}
+
+func gopayLinkingAlreadyLinked(result map[string]any, reqErr error) bool {
+	candidates := gopayLinkingErrorMessages(result)
+	if reqErr != nil {
+		candidates = append(candidates, reqErr.Error())
+	}
+	for _, candidate := range candidates {
+		if strings.Contains(strings.ToLower(candidate), "account already linked") {
+			return true
+		}
+	}
+	return false
+}
+
+func validateReusableGopayAccount(result map[string]any) error {
+	if stringifyJSONValue(result["account_status"]) != "ENABLED" {
+		return errors.New("gopay reusable account_status is not ENABLED")
+	}
+	return nil
+}
+
+func createOrReuseGopayLinkingViaLocalMock(ctx context.Context, accountID string, link gopayLink) (gopayLinkingResolution, error) {
+	linkResult, linkErr := createGopayLinkingViaLocalMock(ctx, accountID, link)
+	resolution := gopayLinkingResolution{LinkResult: linkResult}
+	if linkErr != nil {
+		resolution.LinkError = linkErr.Error()
+		if status, ok := jsonNumberToInt(linkResult["status"]); ok {
+			resolution.LinkHTTPStatus = int(status)
+		}
+		resolution.LinkErrorMessage = gopayLinkingErrorMessages(linkResult)
+		resolution.TokenNotFound = gopayTokenNotFound(linkResult, linkErr)
+	}
+	if linkErr == nil {
+		return resolution, nil
+	}
+	if !gopayLinkingAlreadyLinked(linkResult, linkErr) {
+		return resolution, linkErr
+	}
+
+	accountResult, accountErr := getGopayAccountDetailsViaLocalMock(ctx, accountID)
+	resolution.AccountResult = accountResult
+	resolution.ReusedExisting = true
+	resolution.ConflictReason = "account already linked"
+	if accountErr != nil {
+		return resolution, fmt.Errorf("gopay linking conflict detected but account lookup failed: %w", accountErr)
+	}
+	if err := validateReusableGopayAccount(accountResult); err != nil {
+		return resolution, fmt.Errorf("gopay linking conflict detected but current account cannot be reused: %w", err)
+	}
+	return resolution, nil
+}
+
+func gopayReuseStages(accountResult map[string]any) []map[string]any {
+	status := firstNonEmpty(stringifyJSONValue(accountResult["account_status"]), "ENABLED")
+	return []map[string]any{
+		{"name": "force-link-api", "ok": true, "message": "Midtrans 返回 account already linked，改为复用已绑定账号"},
+		{"name": "validate-reference", "ok": true, "message": "已绑定账号，跳过 reference 校验"},
+		{"name": "user-consent", "ok": true, "message": "已绑定账号，跳过用户授权"},
+		{"name": "otp-enum", "ok": true, "message": "已绑定账号，跳过 OTP 验证"},
+		{"name": "pin-enum", "ok": true, "message": "已绑定账号，跳过 PIN 验证"},
+		{"name": "validate-pin", "ok": true, "message": "复用成功，当前账号状态 " + status},
+	}
+}
+
+func gopayPaymentPINCandidates(preferred string) []string {
+	defaults := []string{"123456", "111111", "000000", "654321", "145236"}
+	seen := map[string]bool{}
+	candidates := make([]string, 0, len(defaults)+1)
+	add := func(value string) {
+		value = strings.TrimSpace(value)
+		if value == "" || seen[value] {
+			return
+		}
+		seen[value] = true
+		candidates = append(candidates, value)
+	}
+	add(preferred)
+	for _, value := range defaults {
+		add(value)
+	}
+	return candidates
+}
+
+func completeGopayPaymentViaLocalMock(ctx context.Context, gopayGUID string, preferredPIN string) (gopayPaymentResolution, error) {
+	result := gopayPaymentResolution{}
+
+	gopayCharge, err := chargeMidtransGopayViaLocalMock(ctx, gopayGUID)
+	result.Charge = gopayCharge
+	if err != nil {
+		return result, err
+	}
+
+	verificationLink := stringifyJSONValue(gopayCharge["gopay_verification_link_url"])
+	if verificationLink == "" {
+		return result, errors.New("midtrans charge did not return gopay_verification_link_url")
+	}
+
+	paymentReferenceID, err := referenceFromGopayVerificationLink(verificationLink)
+	if err != nil {
+		return result, err
+	}
+	result.PaymentReferenceID = paymentReferenceID
+
+	gopayPaymentValidate, err := validateGopayPaymentViaLocalMock(ctx, paymentReferenceID)
+	result.PaymentValidate = gopayPaymentValidate
+	if err != nil {
+		return result, err
+	}
+
+	gopayPaymentConfirm, err := confirmGopayPaymentViaLocalMock(ctx, paymentReferenceID)
+	result.PaymentConfirm = gopayPaymentConfirm
+	if err != nil {
+		return result, err
+	}
+
+	result.PaymentChallengeID = gopayPaymentChallengeID(gopayPaymentConfirm)
+	result.PaymentClientID = gopayPaymentClientID(gopayPaymentConfirm)
+	for _, candidate := range gopayPaymentPINCandidates(preferredPIN) {
+		result.PinTried = append(result.PinTried, candidate)
+		paymentPINTokenResult, pinErr := requestGopayPaymentPINTokenViaLocalMock(ctx, result.PaymentChallengeID, result.PaymentClientID, candidate)
+		if pinErr != nil {
+			continue
+		}
+		pinToken := gopayPINToken(paymentPINTokenResult)
+		if pinToken == "" {
+			continue
+		}
+		result.PaymentPINToken = paymentPINTokenResult
+		result.PinUsed = candidate
+
+		gopayPaymentProcess, processErr := processGopayPaymentViaLocalMock(ctx, paymentReferenceID, pinToken)
+		result.PaymentProcess = gopayPaymentProcess
+		if processErr != nil {
+			return result, processErr
+		}
+
+		transactionID, txErr := transactionIDFromRedirectURL(findStringField(gopayPaymentProcess, "redirect_url"))
+		if txErr != nil {
+			return result, txErr
+		}
+		result.TransactionID = transactionID
+
+		midtransStatus, statusErr := getMidtransTransactionStatusViaLocalMock(ctx, transactionID)
+		result.MidtransStatus = midtransStatus
+		if statusErr != nil {
+			return result, statusErr
+		}
+		return result, nil
+	}
+
+	return result, errors.New("所有支付 PIN 候选码均失败")
+}
+
+func gopayReuseStagesWithPayment(accountResult map[string]any, payment gopayPaymentResolution) []map[string]any {
+	status := firstNonEmpty(stringifyJSONValue(accountResult["account_status"]), "ENABLED")
+	pinLabel := firstNonEmpty(payment.PinUsed, "已校验")
+	return []map[string]any{
+		{"name": "force-link-api", "ok": true, "message": "Midtrans 返回 account already linked，改为复用已绑定账号"},
+		{"name": "validate-reference", "ok": true, "message": "已绑定账号，跳过 reference 校验"},
+		{"name": "user-consent", "ok": true, "message": "已绑定账号，直接进入支付阶段"},
+		{"name": "otp-enum", "ok": true, "message": "已绑定账号，跳过 OTP 验证"},
+		{"name": "pin-enum", "ok": true, "message": "支付 PIN 通过 (" + pinLabel + ")"},
+		{"name": "validate-pin", "ok": true, "message": "支付完成，当前账号状态 " + status},
+	}
+}
+
+func gopayReuseStagesWithPaymentFailure(accountResult map[string]any, payment gopayPaymentResolution, err error) []map[string]any {
+	stages := gopayReuseStages(accountResult)
+	for _, stage := range stages {
+		name := stringifyJSONValue(stage["name"])
+		switch name {
+		case "user-consent":
+			stage["message"] = "已绑定账号，直接进入支付阶段"
+		case "pin-enum":
+			if payment.PinUsed != "" {
+				stage["ok"] = true
+				stage["message"] = "支付 PIN 通过 (" + payment.PinUsed + ")"
+			} else {
+				stage["ok"] = false
+				stage["tried"] = payment.PinTried
+				stage["error"] = err.Error()
+				delete(stage, "message")
+			}
+		case "validate-pin":
+			stage["ok"] = false
+			stage["message"] = "支付阶段失败: " + err.Error()
+		}
+	}
+	return stages
 }
 
 func requestGopayUserConsentViaLocalMock(ctx context.Context, referenceID string, otpChannel string) (map[string]any, error) {
@@ -1725,7 +2533,10 @@ func gopayPINToken(result map[string]any) string {
 	if token := stringifyJSONValue(result["token"]); token != "" {
 		return token
 	}
-	if token := findStringField(result, "token"); token != "" {
+	if token := stringifyJSONValue(result["pin_token"]); token != "" {
+		return token
+	}
+	if token := findStringField(result, "token", "pin_token"); token != "" {
 		return token
 	}
 	return ""
@@ -2360,6 +3171,32 @@ func stripeOriginalError(value any) any {
 		}
 	}
 	return nil
+}
+
+func stripeOriginalErrorCode(value any) string {
+	original := stripeOriginalError(value)
+	if original == nil {
+		return ""
+	}
+	return findStringField(original, "code", "type")
+}
+
+func stripeOriginalErrorMessage(value any) string {
+	original := stripeOriginalError(value)
+	if original == nil {
+		return ""
+	}
+	if message := findStringField(original, "message", "error", "detail"); message != "" {
+		return message
+	}
+	if text := stringifyJSONValue(original); text != "" {
+		return text
+	}
+	body, err := json.Marshal(original)
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(body))
 }
 
 func nestedMap(root map[string]any, keys ...string) map[string]any {
@@ -3127,6 +3964,11 @@ func checkoutUpstreamNonJSONPayload(status int, contentType string, endpoint str
 		"error":        errorMessage,
 		"body_excerpt": trimForDisplay(bodyText, 600),
 	}
+	if status == http.StatusUnauthorized && (strings.Contains(lowerBody, "token_invalidated") || strings.Contains(lowerBody, "authentication token has been invalidated")) {
+		payload["token_invalidated"] = true
+		payload["error"] = "checkout upstream rejected the access token because it has been invalidated"
+		payload["hint"] = "请重新获取有效的 access token 或重新登录 ChatGPT 后再试。"
+	}
 	if requiresCookie {
 		payload["requires_cookie"] = true
 		payload["hint"] = "在“ChatGPT 会话”里填入当前 chatgpt.com 会话 Cookie 后再初始化；本工具不会自动读取浏览器 Cookie。"
@@ -3153,6 +3995,108 @@ func checkoutLongURL(checkoutData any) string {
 		}
 	}
 	return ""
+}
+
+func extractSnapAccountIDViaStripeFlow(ctx context.Context, client *http.Client, checkoutData any, token string, session checkoutSession) stripeSnapAccountFlowResult {
+	return extractSnapAccountIDViaStripeFlowWithDeps(ctx, client, checkoutData, token, session, stripeSnapAccountFlowDeps{
+		init:                initStripePaymentPage,
+		update:              updateStripePaymentPage,
+		createPaymentMethod: createStripePaymentMethod,
+		confirm:             confirmStripePaymentPage,
+		approve:             approveCheckoutViaExternalHTTP,
+		waitForRedirect:     waitForStripeRedirectNextAction,
+		redirect:            getGopayRedirect,
+	})
+}
+
+func extractSnapAccountIDViaStripeFlowWithDeps(ctx context.Context, client *http.Client, checkoutData any, token string, session checkoutSession, deps stripeSnapAccountFlowDeps) stripeSnapAccountFlowResult {
+	result := stripeSnapAccountFlowResult{}
+	expectedCheckoutURL := checkoutLongURL(checkoutData)
+	sessionID := findStringField(checkoutData, "checkout_session_id", "checkoutSessionId", "id")
+	publishableKey := findStringField(checkoutData, "publishable_key", "publishableKey", "key")
+	if sessionID == "" || publishableKey == "" {
+		result.Init = stripeInitResult{OK: false, Skipped: true, Error: "checkout response missing checkout_session_id or publishable_key"}
+		return result
+	}
+
+	result.Init = deps.init(ctx, client, checkoutData)
+	if !result.Init.OK {
+		return result
+	}
+	result.InitCheck = checkStripeInitTotal(result.Init.Body)
+	if !result.InitCheck.OK {
+		return result
+	}
+
+	clientCtx := newStripeClientContext(result.Init.Body)
+	result.Update = deps.update(ctx, client, result.Init.Body, sessionID, publishableKey, defaultTaxRegion(), "", clientCtx)
+	pageBody := result.Init.Body
+	if result.Update.OK && result.Update.Body != nil {
+		pageBody = result.Update.Body
+	}
+	if !result.Update.OK {
+		return result
+	}
+
+	result.PaymentMethod = deps.createPaymentMethod(ctx, client, pageBody, sessionID, publishableKey, defaultTaxRegion(), "", clientCtx)
+	if !result.PaymentMethod.OK {
+		return result
+	}
+	paymentMethodID := findStringField(result.PaymentMethod.Body, "id", "payment_method")
+	if paymentMethodID == "" {
+		result.PaymentMethod.OK = false
+		result.PaymentMethod.Error = "stripe payment method response missing id"
+		return result
+	}
+
+	result.Confirm = deps.confirm(ctx, client, pageBody, sessionID, publishableKey, paymentMethodID, clientCtx)
+	if !result.Confirm.OK {
+		if strings.Contains(strings.ToLower(stripeOriginalErrorMessage(result.Confirm.Body)), "terms of service") && expectedCheckoutURL != "" {
+			interaction, interactionErr := acceptCheckoutTermsViaCDP(ctx, expectedCheckoutURL)
+			if interactionErr == nil {
+				result.TermsInteraction = interaction
+				result.Confirm = deps.confirm(ctx, client, pageBody, sessionID, publishableKey, paymentMethodID, clientCtx)
+			}
+		}
+		if !result.Confirm.OK {
+			return result
+		}
+	}
+	result.ConfirmCheck = checkStripeConfirm(result.Confirm.Body, sessionID)
+	if !result.ConfirmCheck.OK {
+		result.Confirm.OK = false
+		result.Confirm.Error = result.ConfirmCheck.Error
+		return result
+	}
+
+	approvalReq := checkoutApproveRequest{
+		CheckoutSessionID:   sessionID,
+		ProcessorEntity:     checkoutProcessorEntity(checkoutData),
+		PaymentMethodID:     paymentMethodID,
+		SubmissionAttemptID: checkoutSubmissionAttemptID(result.Confirm.Body),
+	}
+	if deps.approve != nil {
+		result.Approval, _ = deps.approve(ctx, client, token, session, approvalReq)
+	}
+
+	fetchDetails := func() stripeInitResult {
+		return getStripePaymentPageDetails(ctx, client, sessionID, publishableKey, clientCtx, pageBody)
+	}
+	result.Details, result.RedirectCheck, result.Attempts = deps.waitForRedirect(ctx, 4, 1500*time.Millisecond, fetchDetails)
+	if !result.RedirectCheck.OK {
+		return result
+	}
+
+	result.Redirect = deps.redirect(ctx, client, result.RedirectCheck.RedirectURL)
+	if !result.Redirect.OK {
+		return result
+	}
+	result.AccountID = strings.TrimSpace(result.Redirect.GUID)
+	if result.AccountID != "" {
+		result.AccountSource = "stripe_redirect_guid"
+		result.AccountOriginURL = result.Redirect.Location
+	}
+	return result
 }
 
 func openAIHostedCheckoutURL(checkoutData any) string {
@@ -3228,6 +4172,259 @@ func isSupportedCheckoutURL(rawURL string) bool {
 	return strings.HasPrefix(parsed.Path, "/c/pay/") || strings.HasPrefix(parsed.Path, "/pay/")
 }
 
+func isManagedCheckoutPageURL(rawURL string) bool {
+	rawURL = strings.TrimSpace(rawURL)
+	if rawURL == "" {
+		return false
+	}
+	if isSupportedCheckoutURL(rawURL) {
+		return true
+	}
+	parsed, err := url.Parse(rawURL)
+	if err != nil {
+		return false
+	}
+	return parsed.Scheme == "https" && strings.EqualFold(parsed.Host, "chatgpt.com") && strings.HasPrefix(parsed.Path, "/checkout/")
+}
+
+func normalizeManagedCheckoutURL(rawURL string) string {
+	rawURL = strings.TrimSpace(rawURL)
+	if rawURL == "" {
+		return ""
+	}
+	parsed, err := url.Parse(rawURL)
+	if err != nil {
+		return ""
+	}
+	if !isManagedCheckoutPageURL(parsed.String()) {
+		return ""
+	}
+	return parsed.String()
+}
+
+func checkoutOwnerURLFromTargetURL(targetURL string) string {
+	if normalized := normalizeManagedCheckoutURL(targetURL); normalized != "" {
+		return normalized
+	}
+	parsed, err := url.Parse(strings.TrimSpace(targetURL))
+	if err != nil {
+		return ""
+	}
+	tryCandidate := func(candidate string) string {
+		if normalized := normalizeManagedCheckoutURL(candidate); normalized != "" {
+			return normalized
+		}
+		return ""
+	}
+	for _, key := range []string{"url", "referrer"} {
+		if value := tryCandidate(parsed.Query().Get(key)); value != "" {
+			return value
+		}
+	}
+	if fragment := strings.TrimSpace(parsed.Fragment); fragment != "" {
+		if values, err := url.ParseQuery(fragment); err == nil {
+			for _, key := range []string{"url", "referrer"} {
+				if value := tryCandidate(values.Get(key)); value != "" {
+					return value
+				}
+			}
+		}
+	}
+	return ""
+}
+
+func checkoutTargetMatchesExpected(targetURL string, expectedURL string) bool {
+	expected := normalizeManagedCheckoutURL(expectedURL)
+	if expected == "" {
+		return false
+	}
+	if normalized := normalizeManagedCheckoutURL(targetURL); normalized == expected {
+		return true
+	}
+	if owner := checkoutOwnerURLFromTargetURL(targetURL); owner == expected {
+		return true
+	}
+	expectedSessionID := sessionIDFromCheckoutURL(expected)
+	if expectedSessionID == "" {
+		return false
+	}
+	for _, candidate := range []string{normalizeManagedCheckoutURL(targetURL), checkoutOwnerURLFromTargetURL(targetURL)} {
+		if candidate != "" && sessionIDFromCheckoutURL(candidate) == expectedSessionID {
+			return true
+		}
+	}
+	return false
+}
+
+func resolveCheckoutPageTarget(targets []cdpTarget, expectedURL string) (*cdpTarget, string, error) {
+	expected := normalizeManagedCheckoutURL(expectedURL)
+	if expected == "" {
+		return nil, "", errors.New("expected_url is required")
+	}
+	for i := len(targets) - 1; i >= 0; i-- {
+		target := &targets[i]
+		if target.Type != "page" {
+			continue
+		}
+		if normalized := normalizeManagedCheckoutURL(target.URL); normalized == expected {
+			return target, normalized, nil
+		}
+	}
+	for i := len(targets) - 1; i >= 0; i-- {
+		target := &targets[i]
+		if target.Type != "page" {
+			continue
+		}
+		if checkoutTargetMatchesExpected(target.URL, expected) {
+			return target, normalizeManagedCheckoutURL(target.URL), nil
+		}
+	}
+	return nil, "", errors.New("未找到本工具最近一次打开的支付链接页面，请重新打开支付链接后再试。")
+}
+
+func resolveCheckoutFillTarget(targets []cdpTarget, expectedURL string) (*cdpTarget, string, error) {
+	pageTarget, canonicalURL, err := resolveCheckoutPageTarget(targets, expectedURL)
+	if err != nil {
+		return nil, "", err
+	}
+	for i := len(targets) - 1; i >= 0; i-- {
+		target := &targets[i]
+		if target.Type != "page" && target.Type != "iframe" {
+			continue
+		}
+		urlText := strings.TrimSpace(target.URL)
+		if !(strings.Contains(urlText, "elements-inner-payment") || strings.Contains(urlText, "stripe.com/v3") || strings.Contains(urlText, "m.stripe.network")) {
+			continue
+		}
+		if checkoutTargetMatchesExpected(urlText, canonicalURL) {
+			return target, canonicalURL, nil
+		}
+	}
+	return pageTarget, canonicalURL, nil
+}
+
+var acceptCheckoutTermsViaCDP = func(ctx context.Context, expectedURL string) (map[string]any, error) {
+	if !isCDPReady(cdpDebuggingPort) {
+		return nil, &cdpNotReadyError{message: "CDP not ready"}
+	}
+	targets, err := getCDPTargets(cdpDebuggingPort)
+	if err != nil {
+		return nil, err
+	}
+	candidateTargets := make([]cdpTarget, 0)
+	for i := len(targets) - 1; i >= 0; i-- {
+		target := targets[i]
+		if target.Type != "page" && target.Type != "iframe" {
+			continue
+		}
+		urlText := strings.TrimSpace(target.URL)
+		if checkoutTargetMatchesExpected(urlText, expectedURL) || strings.Contains(urlText, "elements-inner-payment") || strings.Contains(urlText, "stripe.com/v3") || strings.Contains(urlText, "m.stripe.network") {
+			candidateTargets = append(candidateTargets, target)
+		}
+	}
+	if len(candidateTargets) == 0 {
+		return nil, errors.New("未找到与当前 checkout 对应的 page/iframe target")
+	}
+	response := map[string]any{
+		"ok":           false,
+		"expected_url": expectedURL,
+		"candidates":   []map[string]any{},
+	}
+	appendCandidate := func(item map[string]any) {
+		list, _ := response["candidates"].([]map[string]any)
+		response["candidates"] = append(list, item)
+	}
+	for _, target := range candidateTargets {
+		candidate := map[string]any{
+			"id":    target.ID,
+			"type":  target.Type,
+			"url":   target.URL,
+			"title": target.Title,
+		}
+		conn, _, err := websocket.DefaultDialer.Dial(target.WebSocketDebuggerURL, nil)
+		if err != nil {
+			candidate["error"] = err.Error()
+			appendCandidate(candidate)
+			continue
+		}
+		_, _ = sendCDPCommand(conn, "Runtime.enable", nil)
+		resultJSON, scriptErr := executeCDPScript(conn, `(async () => {
+			const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+			const norm = (text) => String(text || '').replace(/\s+/g, ' ').trim();
+			const lower = (text) => norm(text).toLowerCase();
+			const checkboxNodes = Array.from(document.querySelectorAll('input[type="checkbox"]'));
+			const checkboxInfo = checkboxNodes.map((el, index) => ({
+				index,
+				checked: !!el.checked,
+				text: norm(el.closest('label')?.innerText || el.parentElement?.innerText || el.getAttribute('aria-label') || ''),
+				name: el.name || '',
+				id: el.id || ''
+			}));
+			const buttons = Array.from(document.querySelectorAll('button')).map((btn, index) => ({
+				index,
+				text: norm(btn.textContent),
+				disabled: !!btn.disabled,
+			}));
+			const pickCheckbox = () => checkboxNodes.find((el) => {
+				const text = lower(el.closest('label')?.innerText || el.parentElement?.innerText || '') + ' ' + lower(el.getAttribute('aria-label')) + ' ' + lower(el.name) + ' ' + lower(el.id);
+				return text.includes('terms') || text.includes('service') || text.includes('agree') || text.includes('merchant');
+			});
+			const submitButton = Array.from(document.querySelectorAll('button')).find((btn) => {
+				const text = lower(btn.textContent);
+				return text.includes('subscribe') || text.includes('pay') || text.includes('continue') || text.includes('confirm') || text.includes('submit');
+			});
+			const result = {
+				title: document.title,
+				url: window.location.href,
+				page_snippet: norm(document.body?.innerText || '').slice(0, 1600),
+				checkboxes: checkboxInfo,
+				buttons,
+				has_terms_text: lower(document.body?.innerText || '').includes('terms of service') || lower(document.body?.innerText || '').includes('agree to the terms'),
+				clicked_checkbox: false,
+				clicked_submit: false,
+			};
+			const checkbox = pickCheckbox();
+			if (checkbox && !checkbox.checked) {
+				checkbox.click();
+				result.clicked_checkbox = true;
+				await sleep(300);
+			}
+			if (checkbox) {
+				result.checkbox_checked = !!checkbox.checked;
+			}
+			if (submitButton && !submitButton.disabled && (!checkbox || checkbox.checked)) {
+				submitButton.click();
+				result.clicked_submit = true;
+				await sleep(1200);
+			}
+			result.after_url = window.location.href;
+			result.after_snippet = norm(document.body?.innerText || '').slice(0, 1600);
+			return JSON.stringify(result);
+		})()`)
+		conn.Close()
+		if scriptErr != nil {
+			candidate["error"] = scriptErr.Error()
+			appendCandidate(candidate)
+			continue
+		}
+		if resultJSON != "" {
+			var parsed map[string]any
+			if err := json.Unmarshal([]byte(resultJSON), &parsed); err == nil {
+				candidate["interaction"] = parsed
+				if clicked, _ := parsed["clicked_checkbox"].(bool); clicked {
+					response["ok"] = true
+					response["target"] = map[string]any{"id": target.ID, "type": target.Type, "url": target.URL, "title": target.Title}
+					response["interaction"] = parsed
+				}
+			} else {
+				candidate["raw"] = resultJSON
+			}
+		}
+		appendCandidate(candidate)
+	}
+	return response, nil
+}
+
 func summarizeCheckoutApproval(approval map[string]any) map[string]any {
 	if approval == nil {
 		return nil
@@ -3257,7 +4454,7 @@ func checkoutSubmissionAttemptID(confirmBody any) string {
 }
 
 func summarizeStripeResult(result stripeInitResult) map[string]any {
-	return map[string]any{
+	summary := map[string]any{
 		"ok":           result.OK,
 		"stage":        result.Stage,
 		"status":       result.Status,
@@ -3265,6 +4462,17 @@ func summarizeStripeResult(result stripeInitResult) map[string]any {
 		"elapsed_ms":   result.ElapsedMS,
 		"error":        result.Error,
 	}
+	if originalError := stripeOriginalError(result.Body); originalError != nil {
+		summary["original_error"] = originalError
+	}
+	if !result.OK {
+		if result.Body != nil {
+			summary["body"] = result.Body
+		} else if trimmed := trimForDisplay(result.RawBody, 800); trimmed != "" {
+			summary["raw_body"] = trimmed
+		}
+	}
+	return summary
 }
 
 func trimForDisplay(value string, limit int) string {
@@ -3526,4 +4734,1608 @@ func writeError(w http.ResponseWriter, status int, message string) {
 		"error":  message,
 		"status": status,
 	})
+}
+
+func handleGopayForceLink(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	defer r.Body.Close()
+	var req gopayForceLinkRequest
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<18)).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json")
+		return
+	}
+	req.AccountID = strings.TrimSpace(req.AccountID)
+	req.CountryCode = strings.TrimSpace(req.CountryCode)
+	req.PhoneNumber = strings.TrimSpace(req.PhoneNumber)
+	if req.AccountID == "" {
+		writeError(w, http.StatusBadRequest, "account_id required")
+		return
+	}
+	if req.CountryCode == "" {
+		req.CountryCode = "86"
+	}
+	if req.PhoneNumber == "" {
+		writeError(w, http.StatusBadRequest, "phone_number required")
+		return
+	}
+	response := map[string]any{
+		"request":     map[string]any{"account_id": req.AccountID, "country_code": req.CountryCode, "phone_number": req.PhoneNumber},
+		"diagnostics": gopayRequestDiagnostics(req.CountryCode, req.PhoneNumber, ""),
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+	defer cancel()
+	resolution := gopayLinkingResolution{AccountSource: "manual_input", AccountSourceNote: "account_id provided by request"}
+	apiResolution, apiErr := createOrReuseGopayLinkingViaLocalMock(ctx, req.AccountID, gopayLink{Type: "gopay", CountryCode: req.CountryCode, PhoneNumber: req.PhoneNumber})
+	resolution = apiResolution
+	resolution.AccountSource = firstNonEmpty(resolution.AccountSource, "manual_input")
+	resolution.AccountSourceNote = firstNonEmpty(resolution.AccountSourceNote, "account_id provided by request")
+	response["linking_diagnostics"] = gopayLinkingDiagnostics(resolution)
+	if apiErr != nil {
+		response["api"] = map[string]any{"ok": false, "error": apiErr.Error()}
+	} else {
+		response["api"] = map[string]any{
+			"ok":              true,
+			"result":          resolution.LinkResult,
+			"reused_existing": resolution.ReusedExisting,
+			"conflict_reason": resolution.ConflictReason,
+			"account":         resolution.AccountResult,
+		}
+		response["reused_existing"] = resolution.ReusedExisting
+		response["reference_id"] = stringifyJSONValue(resolution.LinkResult["reference_id"])
+	}
+	writeJSON(w, http.StatusOK, response)
+}
+
+func handleGopayAutoLink(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	defer r.Body.Close()
+	var req gopayAutoLinkRequest
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<18)).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json")
+		return
+	}
+	req.AccountID = strings.TrimSpace(req.AccountID)
+	req.CountryCode = strings.TrimSpace(req.CountryCode)
+	req.PhoneNumber = strings.TrimSpace(req.PhoneNumber)
+	req.OTPChannel = strings.TrimSpace(req.OTPChannel)
+	req.PIN = strings.TrimSpace(req.PIN)
+	if req.AccountID == "" {
+		writeError(w, http.StatusBadRequest, "account_id required")
+		return
+	}
+	if req.CountryCode == "" {
+		req.CountryCode = "86"
+	}
+	if req.PhoneNumber == "" {
+		writeError(w, http.StatusBadRequest, "phone_number required")
+		return
+	}
+	if req.OTPChannel == "" {
+		req.OTPChannel = "whatsapp"
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
+	defer cancel()
+	response := map[string]any{
+		"request":     map[string]any{"account_id": req.AccountID, "country_code": req.CountryCode, "phone_number": req.PhoneNumber, "otp_channel": req.OTPChannel},
+		"diagnostics": gopayRequestDiagnostics(req.CountryCode, req.PhoneNumber, req.OTPChannel),
+	}
+	resolution, linkErr := createOrReuseGopayLinkingViaLocalMock(ctx, req.AccountID, gopayLink{Type: "gopay", CountryCode: req.CountryCode, PhoneNumber: req.PhoneNumber})
+	response["linking_diagnostics"] = gopayLinkingDiagnostics(resolution)
+	if linkErr != nil {
+		response["stage"] = "linking"
+		response["ok"] = false
+		response["error"] = linkErr.Error()
+		writeJSON(w, http.StatusOK, response)
+		return
+	}
+	if resolution.ReusedExisting {
+		response["stage"] = "linking_success"
+		response["ok"] = true
+		response["reused_existing"] = true
+		response["account"] = resolution.AccountResult
+		response["summary"] = map[string]any{
+			"reference_id":    "",
+			"gopay_linked":    true,
+			"reused_existing": true,
+			"account_id":      req.AccountID,
+			"country_code":    req.CountryCode,
+			"phone_number":    req.PhoneNumber,
+			"account_status":  stringifyJSONValue(resolution.AccountResult["account_status"]),
+			"conflict_reason": resolution.ConflictReason,
+		}
+		writeJSON(w, http.StatusOK, response)
+		return
+	}
+	linkResult := resolution.LinkResult
+	referenceID := stringifyJSONValue(linkResult["reference_id"])
+	response["stage"] = "linking"
+	response["reference_id"] = referenceID
+	refResult, refErr := validateGopayReferenceViaLocalMock(ctx, referenceID)
+	if refErr != nil || validateGopayReferenceResult(refResult) != nil {
+		response["stage"] = "validate_reference"
+		response["ok"] = false
+		response["error"] = "reference validation failed"
+		writeJSON(w, http.StatusOK, response)
+		return
+	}
+	consentResult, consentErr := requestGopayUserConsentViaLocalMock(ctx, referenceID, req.OTPChannel)
+	if consentErr != nil || validateGopayUserConsentResult(consentResult) != nil {
+		response["stage"] = "user_consent"
+		response["ok"] = false
+		response["error"] = "consent failed"
+		writeJSON(w, http.StatusOK, response)
+		return
+	}
+	response["stage"] = "user_consent"
+	sandboxOTPs := []string{"111111", "123456", "000000", "654321", "888888", "999999", "222222", "333333"}
+	candidates := make([]string, 0, len(sandboxOTPs)+1)
+	if req.OTP != "" {
+		candidates = append(candidates, req.OTP)
+	}
+	candidates = append(candidates, sandboxOTPs...)
+	var otpResult map[string]any
+	var validOTP string
+	otpOK := false
+	for _, ot := range candidates {
+		otpCtx, oc := context.WithTimeout(ctx, 8*time.Second)
+		r, er := validateGopayOTPViaLocalMock(otpCtx, referenceID, ot)
+		oc()
+		if er == nil && validateGopayOTPResult(r) == nil {
+			otpResult = r
+			validOTP = ot
+			otpOK = true
+			break
+		}
+	}
+	if !otpOK {
+		response["stage"] = "validate_otp"
+		response["ok"] = false
+		response["error"] = "所有 OTP 候选码均失败"
+		writeJSON(w, http.StatusOK, response)
+		return
+	}
+	response["stage"] = "validate_otp"
+	response["otp_used"] = validOTP
+	challengeID := gopayOTPChallengeID(otpResult)
+	sandboxPINs := []string{"123456", "111111", "000000", "654321", "145236"}
+	pinCands := make([]string, 0, len(sandboxPINs)+1)
+	if req.PIN != "" {
+		pinCands = append(pinCands, req.PIN)
+	}
+	pinCands = append(pinCands, sandboxPINs...)
+	var validPIN string
+	pinOK := false
+	pinTok := ""
+	for _, p := range pinCands {
+		pinCtx, pc := context.WithTimeout(ctx, 8*time.Second)
+		r, er := requestGopayPINTokenViaLocalMock(pinCtx, challengeID, p)
+		pc()
+		if er == nil && r["success"] == true {
+			pinTok = gopayPINToken(r)
+			if pinTok != "" {
+				validPIN = p
+				pinOK = true
+				break
+			}
+		}
+	}
+	if !pinOK {
+		response["stage"] = "pin_token"
+		response["ok"] = false
+		response["error"] = "所有 PIN 候选码均失败"
+		writeJSON(w, http.StatusOK, response)
+		return
+	}
+	response["stage"] = "pin_token"
+	response["pin_used"] = validPIN
+	pinValidate, pvErr := validateGopayPINViaLocalMock(ctx, referenceID, pinTok)
+	if pvErr != nil || validateGopayPINResult(pinValidate) != nil {
+		response["stage"] = "validate_pin"
+		response["ok"] = false
+		response["error"] = "PIN validation failed"
+		writeJSON(w, http.StatusOK, response)
+		return
+	}
+	response["stage"] = "linking_success"
+	response["ok"] = true
+	response["summary"] = map[string]any{"otp": validOTP, "pin": validPIN, "reference_id": referenceID, "gopay_linked": true}
+	writeJSON(w, http.StatusOK, response)
+}
+
+func handleGopaySmartLink(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	defer r.Body.Close()
+	var req gopaySmartLinkRequest
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<18)).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json")
+		return
+	}
+	req.AccountID = strings.TrimSpace(req.AccountID)
+	req.CountryCode = strings.TrimSpace(req.CountryCode)
+	req.PhoneNumber = strings.TrimSpace(req.PhoneNumber)
+	req.OTPChannel = strings.TrimSpace(req.OTPChannel)
+	req.PIN = strings.TrimSpace(req.PIN)
+	if req.AccountID == "" {
+		writeError(w, http.StatusBadRequest, "account_id required")
+		return
+	}
+	if req.CountryCode == "" {
+		req.CountryCode = "86"
+	}
+	if req.PhoneNumber == "" {
+		writeError(w, http.StatusBadRequest, "phone_number required")
+		return
+	}
+	if req.OTPChannel == "" {
+		req.OTPChannel = "whatsapp"
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 90*time.Second)
+	defer cancel()
+	response := map[string]any{
+		"ok":          false,
+		"strategy":    "dual-channel",
+		"request":     map[string]any{"account_id": req.AccountID, "country_code": req.CountryCode, "phone_number": req.PhoneNumber, "otp_channel": req.OTPChannel},
+		"diagnostics": gopayRequestDiagnostics(req.CountryCode, req.PhoneNumber, req.OTPChannel),
+		"stages":      []map[string]any{},
+	}
+	addStage := func(name string, data map[string]any) {
+		data["name"] = name
+		ss, _ := response["stages"].([]map[string]any)
+		response["stages"] = append(ss, data)
+	}
+	resolution, linkErr := createOrReuseGopayLinkingViaLocalMock(ctx, req.AccountID, gopayLink{Type: "gopay", CountryCode: req.CountryCode, PhoneNumber: req.PhoneNumber})
+	response["linking_diagnostics"] = gopayLinkingDiagnostics(resolution)
+	if linkErr != nil {
+		response["stage"] = "force_link_failed"
+		response["error"] = linkErr.Error()
+		addStage("force-link-api", map[string]any{"ok": false, "error": linkErr.Error()})
+		writeJSON(w, http.StatusOK, response)
+		return
+	}
+	if resolution.ReusedExisting {
+		paymentResult, paymentErr := completeGopayPaymentViaLocalMock(ctx, req.AccountID, req.PIN)
+		if paymentErr != nil {
+			response["ok"] = false
+			response["stage"] = "gopay_payment_failed"
+			if paymentResult.PinUsed == "" && len(paymentResult.PinTried) > 0 {
+				response["stage"] = "payment_pin_all_failed"
+			}
+			response["error"] = paymentErr.Error()
+			response["reused_existing"] = true
+			response["conflict_reason"] = resolution.ConflictReason
+			response["account"] = resolution.AccountResult
+			response["stages"] = gopayReuseStagesWithPaymentFailure(resolution.AccountResult, paymentResult, paymentErr)
+			response["gopay_charge"] = paymentResult.Charge
+			response["gopay_payment_reference_id"] = paymentResult.PaymentReferenceID
+			response["gopay_payment_validate"] = paymentResult.PaymentValidate
+			response["gopay_payment_confirm"] = paymentResult.PaymentConfirm
+			response["gopay_payment_challenge_id"] = paymentResult.PaymentChallengeID
+			response["gopay_payment_client_id"] = paymentResult.PaymentClientID
+			response["gopay_payment_pin_token"] = paymentResult.PaymentPINToken
+			response["gopay_payment_process"] = paymentResult.PaymentProcess
+			response["midtrans_status"] = paymentResult.MidtransStatus
+			writeJSON(w, http.StatusOK, response)
+			return
+		}
+		response["ok"] = true
+		response["stage"] = "gopay_complete"
+		response["reused_existing"] = true
+		response["conflict_reason"] = resolution.ConflictReason
+		response["account"] = resolution.AccountResult
+		response["reference_id"] = paymentResult.PaymentReferenceID
+		response["stages"] = gopayReuseStagesWithPayment(resolution.AccountResult, paymentResult)
+		response["gopay_charge"] = paymentResult.Charge
+		response["gopay_payment_reference_id"] = paymentResult.PaymentReferenceID
+		response["gopay_payment_validate"] = paymentResult.PaymentValidate
+		response["gopay_payment_confirm"] = paymentResult.PaymentConfirm
+		response["gopay_payment_challenge_id"] = paymentResult.PaymentChallengeID
+		response["gopay_payment_client_id"] = paymentResult.PaymentClientID
+		response["gopay_payment_pin_token"] = paymentResult.PaymentPINToken
+		response["gopay_payment_process"] = paymentResult.PaymentProcess
+		response["midtrans_status"] = paymentResult.MidtransStatus
+		response["summary"] = map[string]any{
+			"reference_id":         paymentResult.PaymentReferenceID,
+			"payment_reference_id": paymentResult.PaymentReferenceID,
+			"transaction_id":       paymentResult.TransactionID,
+			"payment_pin":          paymentResult.PinUsed,
+			"gopay_linked":         true,
+			"reused_existing":      true,
+			"account_id":           req.AccountID,
+			"country_code":         req.CountryCode,
+			"phone_number":         req.PhoneNumber,
+			"account_status":       stringifyJSONValue(resolution.AccountResult["account_status"]),
+			"conflict_reason":      resolution.ConflictReason,
+		}
+		writeJSON(w, http.StatusOK, response)
+		return
+	}
+	linkResult := resolution.LinkResult
+	referenceID := stringifyJSONValue(linkResult["reference_id"])
+	response["reference_id"] = referenceID
+	addStage("force-link-api", map[string]any{"ok": true, "reference_id": referenceID})
+	refResult, refErr := validateGopayReferenceViaLocalMock(ctx, referenceID)
+	if refErr != nil || validateGopayReferenceResult(refResult) != nil {
+		response["stage"] = "validate_reference_failed"
+		response["error"] = "ref validation failed"
+		addStage("validate-reference", map[string]any{"ok": false})
+		writeJSON(w, http.StatusOK, response)
+		return
+	}
+	addStage("validate-reference", map[string]any{"ok": true})
+	consentResult, consentErr := requestGopayUserConsentViaLocalMock(ctx, referenceID, req.OTPChannel)
+	if consentErr != nil || validateGopayUserConsentResult(consentResult) != nil {
+		response["stage"] = "user_consent_failed"
+		response["error"] = "consent failed"
+		addStage("user-consent", map[string]any{"ok": false})
+		writeJSON(w, http.StatusOK, response)
+		return
+	}
+	addStage("user-consent", map[string]any{"ok": true})
+	sandboxOTPs := []string{"111111", "123456", "000000", "654321", "888888", "999999", "222222", "333333"}
+	otpCands := make([]string, 0, len(sandboxOTPs)+1)
+	if req.OTP != "" {
+		otpCands = append(otpCands, req.OTP)
+	}
+	otpCands = append(otpCands, sandboxOTPs...)
+	var otpR map[string]any
+	var vOTP string
+	otpOk := false
+	otpTried := make([]string, 0, len(otpCands))
+	for _, o := range otpCands {
+		otpCtx, oc := context.WithTimeout(ctx, 8*time.Second)
+		r, er := validateGopayOTPViaLocalMock(otpCtx, referenceID, o)
+		oc()
+		otpTried = append(otpTried, o)
+		if er == nil && validateGopayOTPResult(r) == nil {
+			otpR = r
+			vOTP = o
+			otpOk = true
+			break
+		}
+	}
+	if !otpOk {
+		response["stage"] = "otp_all_failed"
+		response["error"] = "所有 OTP 候选码均失败"
+		addStage("otp-enum", map[string]any{"ok": false, "tried": otpTried})
+		writeJSON(w, http.StatusOK, response)
+		return
+	}
+	challengeID := gopayOTPChallengeID(otpR)
+	addStage("otp-enum", map[string]any{"ok": true, "otp": vOTP, "challenge_id": challengeID})
+	sandboxPINs := []string{"123456", "111111", "000000", "654321", "145236"}
+	pinCands := make([]string, 0, len(sandboxPINs)+1)
+	if req.PIN != "" {
+		pinCands = append(pinCands, req.PIN)
+	}
+	pinCands = append(pinCands, sandboxPINs...)
+	var vPIN string
+	pinOk := false
+	pinT := ""
+	pinTried := make([]string, 0, len(pinCands))
+	for _, p := range pinCands {
+		pinCtx, pc := context.WithTimeout(ctx, 8*time.Second)
+		r, er := requestGopayPINTokenViaLocalMock(pinCtx, challengeID, p)
+		pc()
+		pinTried = append(pinTried, p)
+		if er == nil && r["success"] == true {
+			pinT = gopayPINToken(r)
+			if pinT != "" {
+				vPIN = p
+				pinOk = true
+				break
+			}
+		}
+	}
+	if !pinOk {
+		response["stage"] = "pin_all_failed"
+		response["error"] = "所有 PIN 候选码均失败"
+		addStage("pin-enum", map[string]any{"ok": false, "tried": pinTried})
+		writeJSON(w, http.StatusOK, response)
+		return
+	}
+	addStage("pin-enum", map[string]any{"ok": true, "pin": vPIN})
+	pvR, pvErr := validateGopayPINViaLocalMock(ctx, referenceID, pinT)
+	if pvErr != nil || validateGopayPINResult(pvR) != nil {
+		response["stage"] = "validate_pin_failed"
+		response["error"] = "PIN validation failed"
+		addStage("validate-pin", map[string]any{"ok": false})
+		writeJSON(w, http.StatusOK, response)
+		return
+	}
+	addStage("validate-pin", map[string]any{"ok": true, "next_action": "linking-success"})
+	response["ok"] = true
+	response["stage"] = "linking_success"
+	response["summary"] = map[string]any{"otp": vOTP, "pin": vPIN, "reference_id": referenceID, "gopay_linked": true}
+	writeJSON(w, http.StatusOK, response)
+}
+
+func handleGopayCDPOTP(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	defer r.Body.Close()
+	var req struct {
+		OTP string `json:"otp,omitempty"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<17)).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json")
+		return
+	}
+	if !isCDPReady(cdpDebuggingPort) {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"ok": false, "error": "CDP not ready"})
+		return
+	}
+
+	findOTPInText := func(text string) string {
+		text = strings.TrimSpace(text)
+		if text == "" {
+			return ""
+		}
+		matches := regexp.MustCompile(`\b(\d{6})\b`).FindStringSubmatch(text)
+		if len(matches) > 1 {
+			return matches[1]
+		}
+		return ""
+	}
+
+	target, err := findAnyTarget(cdpDebuggingPort, "merchants-gws-app.gopayapi.com")
+	if err != nil {
+		target, err = findAnyTarget(cdpDebuggingPort, "midtrans.com")
+	}
+	if err != nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"ok": false, "error": err.Error()})
+		return
+	}
+	conn, _, err := websocket.DefaultDialer.Dial(target.WebSocketDebuggerURL, nil)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "CDP failed")
+		return
+	}
+	defer conn.Close()
+
+	otp := strings.TrimSpace(req.OTP)
+	escapedOTP := strconv.Quote(otp)
+	resultJSON, _ := executeCDPScript(conn, fmt.Sprintf(`(async () => {
+		const fallbackOtp = %s;
+		const pageText = ((document.body && document.body.innerText) || document.documentElement.innerText || '').replace(/\s+/g, ' ').trim();
+		const htmlText = ((document.body && document.body.textContent) || '').replace(/\s+/g, ' ').trim();
+		const inputs = Array.from(document.querySelectorAll('input'));
+		const otpInput = inputs.find(el => el.type === 'number' || el.inputMode === 'numeric' || /otp|kode|code/i.test((el.placeholder || '') + ' ' + (el.name || '') + ' ' + (el.id || '')));
+		const findOtp = (text) => {
+			const match = String(text || '').match(/\b(\d{6})\b/);
+			return match ? match[1] : '';
+		};
+		const detected = findOtp(pageText) || findOtp(htmlText) || findOtp(inputs.map(el => el.value || '').join(' '));
+		let autoFilled = false;
+		let submitted = false;
+		let usedOtp = detected || fallbackOtp;
+		if (otpInput && usedOtp) {
+			const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set;
+			setter.call(otpInput, usedOtp);
+			otpInput.dispatchEvent(new Event('input', { bubbles: true }));
+			otpInput.dispatchEvent(new Event('change', { bubbles: true }));
+			autoFilled = true;
+			const btns = Array.from(document.querySelectorAll('button'));
+			const submitBtn = btns.find(b => {
+				const t = (b.textContent || '').toLowerCase();
+				return t.includes('verify') || t.includes('submit') || t.includes('kirim') || t.includes('lanjut') || t.includes('continue');
+			});
+			if (submitBtn && !submitBtn.disabled && detected) {
+				submitBtn.click();
+				submitted = true;
+			}
+		}
+		return JSON.stringify({
+			hasOTPField: !!otpInput,
+			detected_otp: detected,
+			used_otp: usedOtp,
+			auto_filled: autoFilled,
+			auto_submitted: submitted,
+			url: window.location.href,
+			page_text_snippet: pageText.slice(0, 1000)
+		});
+	})()`, escapedOTP))
+	var result map[string]any
+	if resultJSON != "" {
+		json.Unmarshal([]byte(resultJSON), &result)
+	} else {
+		result = map[string]any{"error": "empty result"}
+	}
+	if detected := findOTPInText(stringifyJSONValue(result["page_text_snippet"])); detected != "" {
+		if stringifyJSONValue(result["detected_otp"]) == "" {
+			result["detected_otp"] = detected
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "result": result})
+}
+
+func handleGopaySnapProbe(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	defer r.Body.Close()
+	var req struct{ SnapToken, CountryCode, PhoneNumber, OTP string }
+	json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<17)).Decode(&req)
+	if req.CountryCode == "" {
+		req.CountryCode = "86"
+	}
+	if req.PhoneNumber == "" {
+		req.PhoneNumber = "18120322232"
+	}
+	if !isCDPReady(cdpDebuggingPort) {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"ok": false, "error": "CDP not ready"})
+		return
+	}
+	snapTarget, _ := findAnyTarget(cdpDebuggingPort, "midtrans.com")
+	if snapTarget == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"ok": false, "error": "no snap page"})
+		return
+	}
+	snapConn, _, err := websocket.DefaultDialer.Dial(snapTarget.WebSocketDebuggerURL, nil)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	defer snapConn.Close()
+	response := map[string]any{"ok": true, "probe_steps": []map[string]any{}}
+	addStep := func(n string, d map[string]any) {
+		d["name"] = n
+		ss, _ := response["probe_steps"].([]map[string]any)
+		response["probe_steps"] = append(ss, d)
+	}
+	probeResult, _ := executeCDPScript(snapConn, `(async () => { const ifs=document.querySelectorAll('iframe'); const btns=Array.from(document.querySelectorAll('button')).map(b=>b.textContent.trim().slice(0,40)); return JSON.stringify({title:document.title,url:window.location.href,iframeCount:ifs.length,iframeSources:Array.from(ifs).map(i=>i.src.slice(0,120)),buttonCount:btns.length,buttons:btns.slice(0,8),pageText:(document.body?.textContent||'').trim().slice(0,500)}); })()`)
+	var p map[string]any
+	if probeResult != "" {
+		json.Unmarshal([]byte(probeResult), &p)
+	}
+	addStep("probe-page", p)
+	executeCDPScript(snapConn, `(async () => { const btns=document.querySelectorAll('button'); const t=Array.from(btns).find(b=>{const tx=(b.textContent||'').toLowerCase(); return tx.includes('link')||tx.includes('hubung')||tx.includes('gopay')||tx.includes('continue')||tx.includes('lanjut')||tx.includes('agree')}); if(t&&!t.disabled){t.click();return'clicked'} return'none'; })()`)
+	time.Sleep(3 * time.Second)
+	iframeProbe, _ := executeCDPScript(snapConn, `(async () => { const ifs=document.querySelectorAll('iframe'); return JSON.stringify({iframeCount:ifs.length,sources:Array.from(ifs).map(i=>i.src)}); })()`)
+	var ip map[string]any
+	if iframeProbe != "" {
+		json.Unmarshal([]byte(iframeProbe), &ip)
+	}
+	addStep("after-click", ip)
+	var iframeRef string
+	if ss, ok := ip["sources"].([]any); ok {
+		for _, s := range ss {
+			if str, ok := s.(string); ok && strings.Contains(str, "merchants-gws-app") && strings.Contains(str, "reference=") {
+				parts := strings.Split(str, "reference=")
+				if len(parts) > 1 {
+					iframeRef = strings.Split(parts[1], "&")[0]
+				}
+				break
+			}
+		}
+	}
+	var iframeResult map[string]any
+	var iframeErr error
+	if iframeRef != "" {
+		iframeResult, iframeErr = injectIntoGoPayIframeDirectWithFilter(req.CountryCode, req.PhoneNumber, iframeRef)
+	} else {
+		iframeResult, iframeErr = injectIntoGoPayIframeDirect(req.CountryCode, req.PhoneNumber)
+	}
+	if iframeErr != nil {
+		addStep("iframe-inject", map[string]any{"ok": false, "error": iframeErr.Error()})
+	} else {
+		addStep("iframe-inject", map[string]any{"ok": true, "result": iframeResult})
+		if a, ok := iframeResult["after_submit"].(map[string]any); ok {
+			response["otp_page_reached"] = true
+			response["otp_info"] = a
+		}
+	}
+	if response["otp_page_reached"] == true {
+		ot := req.OTP
+		if ot == "" {
+			ot = "111111"
+		}
+		iframeTarget, _ := findAnyTarget(cdpDebuggingPort, "merchants-gws-app.gopayapi.com")
+		if iframeTarget != nil {
+			ifc, _, ie := websocket.DefaultDialer.Dial(iframeTarget.WebSocketDebuggerURL, nil)
+			if ie == nil {
+				defer ifc.Close()
+				otpR, _ := executeCDPScript(ifc, fmt.Sprintf(`(async () => { const inputs=document.querySelectorAll('input'); const oi=Array.from(inputs).find(el=>el.type==='number'||el.inputMode==='numeric'); if(!oi) return JSON.stringify({ok:false,error:'no input'}); const st=Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value').set; st.call(oi,'%s'); oi.dispatchEvent(new Event('input',{bubbles:true})); oi.dispatchEvent(new Event('change',{bubbles:true})); await new Promise(r=>setTimeout(r,500)); const btns=document.querySelectorAll('button'); const sb=Array.from(btns).find(b=>{const t=(b.textContent||'').toLowerCase(); return t.includes('verify')||t.includes('kirim')||t.includes('lanjut');}); if(sb&&!sb.disabled){sb.click();await new Promise(r=>setTimeout(r,2000))} return JSON.stringify({ok:true,otpTried:'%s',clicked:!!sb}); })()`, ot, ot))
+				var om map[string]any
+				if otpR != "" {
+					json.Unmarshal([]byte(otpR), &om)
+				}
+				addStep("otp-inject", map[string]any{"ok": true, "otp": ot, "result": om})
+			}
+		}
+	}
+	writeJSON(w, http.StatusOK, response)
+}
+
+func handleGopayMonitor(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	defer r.Body.Close()
+	var req struct {
+		DurationS int  `json:"duration_s"`
+		Stream    bool `json:"stream"`
+	}
+	_ = json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<17)).Decode(&req)
+	if req.DurationS <= 0 || req.DurationS > 120 {
+		req.DurationS = 30
+	}
+	if !isCDPReady(cdpDebuggingPort) {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"ok": false, "error": "CDP not ready"})
+		return
+	}
+
+	targets := monitorTargets()
+	activeTargets := make([]string, 0, len(targets))
+	for _, descriptor := range targets {
+		activeTargets = append(activeTargets, descriptor.Label+":"+descriptor.URLPattern)
+	}
+
+	if req.Stream {
+		flusher, ok := w.(http.Flusher)
+		if !ok {
+			writeError(w, http.StatusInternalServerError, "streaming not supported")
+			return
+		}
+		w.Header().Set("Content-Type", "application/x-ndjson; charset=utf-8")
+		w.Header().Set("Cache-Control", "no-store")
+		w.WriteHeader(http.StatusOK)
+		encoder := json.NewEncoder(w)
+		_ = encoder.Encode(monitorStreamEnvelope{Type: "started", Targets: activeTargets})
+		flusher.Flush()
+
+		events, summary, runErr := runGopayMonitorSession(r.Context(), req.DurationS, func(evt monitorEvent) {
+			item := evt
+			_ = encoder.Encode(monitorStreamEnvelope{Type: "event", Event: &item})
+			flusher.Flush()
+		})
+		if runErr != nil {
+			_ = encoder.Encode(monitorStreamEnvelope{Type: "error", Error: runErr.Error()})
+			flusher.Flush()
+			return
+		}
+		_ = events
+		_ = encoder.Encode(monitorStreamEnvelope{Type: "summary", Summary: &summary})
+		flusher.Flush()
+		_ = encoder.Encode(monitorStreamEnvelope{Type: "done", Summary: &summary})
+		flusher.Flush()
+		return
+	}
+
+	events, summary, err := runGopayMonitorSession(r.Context(), req.DurationS, nil)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"ok": false, "error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":      true,
+		"targets": activeTargets,
+		"events":  events,
+		"summary": summary,
+	})
+}
+
+func runGopayMonitorSession(ctx context.Context, durationS int, onEvent func(monitorEvent)) ([]monitorEvent, monitorSummaryStats, error) {
+	type monitorConn struct {
+		Label string
+		Conn  *websocket.Conn
+	}
+
+	targets := monitorTargets()
+	connections := make([]monitorConn, 0, len(targets))
+	for _, descriptor := range targets {
+		target, err := findAnyTarget(cdpDebuggingPort, descriptor.URLPattern)
+		if err != nil || target == nil {
+			continue
+		}
+		conn, _, err := websocket.DefaultDialer.Dial(target.WebSocketDebuggerURL, nil)
+		if err != nil {
+			continue
+		}
+		connections = append(connections, monitorConn{Label: descriptor.Label, Conn: conn})
+	}
+	if len(connections) == 0 {
+		return nil, monitorSummaryStats{}, errors.New("未找到可监控的 OpenAI / Stripe / Midtrans / GoPay 页面")
+	}
+	defer func() {
+		for _, item := range connections {
+			item.Conn.Close()
+		}
+	}()
+
+	events := make([]monitorEvent, 0, 256)
+	var mu sync.Mutex
+	addEvent := func(domain, method, summary string) {
+		evt := monitorEvent{Timestamp: time.Now().UnixMilli(), Domain: domain, Method: method, Summary: summary}
+		mu.Lock()
+		events = append(events, evt)
+		mu.Unlock()
+		if onEvent != nil {
+			onEvent(evt)
+		}
+	}
+
+	for _, item := range connections {
+		_, _ = sendCDPCommand(item.Conn, "Network.enable", map[string]any{"maxTotalBufferSize": 20000000})
+		_, _ = sendCDPCommand(item.Conn, "Page.enable", nil)
+		_, _ = sendCDPCommand(item.Conn, "Runtime.enable", nil)
+		_, _ = sendCDPCommand(item.Conn, "Log.enable", nil)
+		_, _ = sendCDPCommand(item.Conn, "Console.enable", nil)
+	}
+
+	readEvents := func(conn *websocket.Conn, label string, done <-chan struct{}) {
+		if conn == nil {
+			return
+		}
+		_ = conn.SetReadDeadline(time.Now().Add(time.Duration(durationS+5) * time.Second))
+		for {
+			select {
+			case <-done:
+				return
+			default:
+			}
+			_, msg, er := conn.ReadMessage()
+			if er != nil {
+				return
+			}
+			var raw map[string]any
+			if json.Unmarshal(msg, &raw) != nil {
+				continue
+			}
+			method, _ := raw["method"].(string)
+			if method == "" {
+				continue
+			}
+			params, _ := raw["params"].(map[string]any)
+			switch {
+			case strings.HasPrefix(method, "Network.requestWillBeSent"):
+				if rq, ok := params["request"].(map[string]any); ok {
+					url := stringifyJSONValue(rq["url"])
+					httpMethod := stringifyJSONValue(rq["method"])
+					if url != "" && !strings.Contains(url, "favicon") {
+						addEvent("Network", label+"-req", httpMethod+" "+truncateURL(url, 160))
+					}
+				}
+			case strings.HasPrefix(method, "Network.responseReceived"):
+				if rsp, ok := params["response"].(map[string]any); ok {
+					url := stringifyJSONValue(rsp["url"])
+					status, _ := toFloat(rsp["status"])
+					if url != "" {
+						addEvent("Network", label+"-resp", fmt.Sprintf("%.0f %s", status, truncateURL(url, 120)))
+					}
+				}
+			case strings.HasPrefix(method, "Page.frameNavigated"):
+				if fr, ok := params["frame"].(map[string]any); ok {
+					addEvent("Page", label+"-nav", truncateURL(stringifyJSONValue(fr["url"]), 160))
+				}
+			case strings.HasPrefix(method, "Runtime.exceptionThrown"):
+				if exc, ok := params["exceptionDetails"].(map[string]any); ok {
+					text := stringifyJSONValue(exc["text"])
+					if text != "" {
+						addEvent("Error", label+"-exc", truncateURL(text, 200))
+					}
+				}
+			case strings.HasPrefix(method, "Runtime.consoleAPICalled"):
+				typeName := stringifyJSONValue(params["type"])
+				addEvent("Console", label+"-console", firstNonEmpty(typeName, "console"))
+			case strings.HasPrefix(method, "Log.entryAdded"):
+				if entry, ok := params["entry"].(map[string]any); ok {
+					level := stringifyJSONValue(entry["level"])
+					text := stringifyJSONValue(entry["text"])
+					addEvent("Console", label+"-log", strings.TrimSpace(firstNonEmpty(level, "log")+" "+truncateURL(text, 180)))
+				}
+			}
+		}
+	}
+
+	ctx2, cancel2 := context.WithTimeout(ctx, time.Duration(durationS+15)*time.Second)
+	defer cancel2()
+	done := ctx2.Done()
+	var wg sync.WaitGroup
+	for _, item := range connections {
+		wg.Add(1)
+		go func(label string, conn *websocket.Conn) {
+			defer wg.Done()
+			readEvents(conn, label, done)
+		}(item.Label, item.Conn)
+	}
+
+	select {
+	case <-time.After(time.Duration(durationS) * time.Second):
+	case <-ctx.Done():
+	}
+	cancel2()
+	wg.Wait()
+
+	mu.Lock()
+	deferredEvents := append([]monitorEvent(nil), events...)
+	mu.Unlock()
+	summary := summarizeMonitorEvents(deferredEvents, durationS)
+	return deferredEvents, summary, nil
+}
+
+func handlePricingMonitor(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	defer r.Body.Close()
+	var req struct {
+		DurationS  int      `json:"duration_s"`
+		URLFilters []string `json:"url_filters"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<18)).Decode(&req); err != nil && !errors.Is(err, io.EOF) {
+		writeError(w, http.StatusBadRequest, "invalid json")
+		return
+	}
+	if req.DurationS <= 0 || req.DurationS > 180 {
+		req.DurationS = 12
+	}
+	if !isCDPReady(cdpDebuggingPort) {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"ok": false, "error": "CDP not ready"})
+		return
+	}
+
+	target, err := findChatGPTTarget(cdpDebuggingPort)
+	if err != nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"ok": false, "error": err.Error()})
+		return
+	}
+	conn, _, err := websocket.DefaultDialer.Dial(target.WebSocketDebuggerURL, nil)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "连接 CDP 失败: "+err.Error())
+		return
+	}
+	defer conn.Close()
+
+	filters := req.URLFilters
+	if len(filters) == 0 {
+		filters = []string{"pricing", "subscription", "checkout", "payments", "stripe", "offer", "promo", "trial", "eligible", "eligibility", "experiment", "feature", "plan"}
+	}
+	lowerFilters := make([]string, 0, len(filters))
+	for _, f := range filters {
+		f = strings.ToLower(strings.TrimSpace(f))
+		if f != "" {
+			lowerFilters = append(lowerFilters, f)
+		}
+	}
+
+	time.Sleep(time.Duration(req.DurationS) * time.Second)
+
+	script := fmt.Sprintf(`(async () => {
+		const filters = %s;
+		const match = (value) => {
+			const text = String(value || '').toLowerCase();
+			return filters.length === 0 || filters.some(f => text.includes(f));
+		};
+		const resources = performance.getEntriesByType('resource').map(r => ({
+			name: r.name,
+			initiatorType: r.initiatorType || '',
+			transferSize: r.transferSize || 0,
+			duration: Math.round(r.duration || 0)
+		})).filter(r => match(r.name)).slice(0, 200);
+		const nav = performance.getEntriesByType('navigation').map(r => ({
+			name: r.name,
+			type: r.type || '',
+			duration: Math.round(r.duration || 0)
+		}));
+		const cards = Array.from(document.querySelectorAll('button, a, div, section')).map(el => ({
+			text: (el.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 220),
+			tag: el.tagName,
+			role: el.getAttribute('role') || '',
+			aria: el.getAttribute('aria-label') || '',
+			dataTestid: el.getAttribute('data-testid') || ''
+		})).filter(x => x.text && /(plus|pro|go|free|免费版|升级至|¥0|0元|trial|free trial|3000|16800|1400)/i.test(x.text)).slice(0, 80);
+		const html = document.documentElement ? document.documentElement.outerHTML : '';
+		const promoHints = [];
+		['trial','promo','eligib','discount','coupon','free','plus-1-month-free','pricing'].forEach(k => {
+			const idx = html.toLowerCase().indexOf(k);
+			if (idx >= 0) {
+				promoHints.push({keyword:k, snippet: html.slice(Math.max(0, idx - 180), Math.min(html.length, idx + 420))});
+			}
+		});
+		const storageDump = {
+			local: Object.keys(localStorage).slice(0, 80).map(k => ({key:k, value:String(localStorage.getItem(k) || '').slice(0, 300)})).filter(x => match(x.key + ' ' + x.value)),
+			session: Object.keys(sessionStorage).slice(0, 80).map(k => ({key:k, value:String(sessionStorage.getItem(k) || '').slice(0, 300)})).filter(x => match(x.key + ' ' + x.value)),
+		};
+		return JSON.stringify({
+			title: document.title,
+			url: location.href,
+			cards,
+			resources,
+			navigation: nav,
+			promo_hints: promoHints.slice(0, 40),
+			storage: storageDump,
+			body_text: (document.body?.innerText || '').replace(/\s+/g, ' ').trim().slice(0, 5000)
+		});
+	})()`, mustJSON(filters))
+
+	raw, err := executeCDPScript(conn, script)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "pricing inspect failed: "+err.Error())
+		return
+	}
+	var snapshot map[string]any
+	if raw != "" {
+		_ = json.Unmarshal([]byte(raw), &snapshot)
+	}
+	resources, _ := snapshot["resources"].([]any)
+	cards, _ := snapshot["cards"].([]any)
+	promoHints, _ := snapshot["promo_hints"].([]any)
+	storage, _ := snapshot["storage"].(map[string]any)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok": true,
+		"summary": map[string]any{
+			"duration_s":       req.DurationS,
+			"resource_count":   len(resources),
+			"card_count":       len(cards),
+			"promo_hint_count": len(promoHints),
+			"filters":          lowerFilters,
+		},
+		"snapshot": snapshot,
+		"storage":  storage,
+	})
+}
+
+func mustJSON(value any) string {
+	b, _ := json.Marshal(value)
+	return string(b)
+}
+
+func buildHostedCheckoutPayload() map[string]any {
+	return map[string]any{
+		"entry_point":      "all_plans_pricing_modal",
+		"plan_name":        "chatgptplusplan",
+		"checkout_ui_mode": "hosted",
+		"billing_details":  map[string]string{"country": "ID", "currency": "IDR"},
+		"promo_campaign":   map[string]any{"promo_campaign_id": "plus-1-month-free", "is_coupon_from_query_param": true},
+	}
+}
+
+func requestHostedCheckout(ctx context.Context, client *http.Client, accessToken string) (map[string]any, int, error) {
+	payloadBytes, err := json.Marshal(buildHostedCheckoutPayload())
+	if err != nil {
+		return nil, 0, err
+	}
+	upstreamReq, err := http.NewRequestWithContext(ctx, http.MethodPost, checkoutEndpoint(), bytes.NewReader(payloadBytes))
+	if err != nil {
+		return nil, 0, err
+	}
+	setCheckoutBackendHeaders(upstreamReq, accessToken, checkoutSession{})
+	resp, err := doHTTPRequestWithRetry(ctx, client, upstreamReq)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 2<<20))
+	if err != nil {
+		return nil, resp.StatusCode, err
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, resp.StatusCode, fmt.Errorf("checkout API returned %d: %s", resp.StatusCode, trimForDisplay(string(body), 500))
+	}
+	var checkoutData map[string]any
+	if err := json.Unmarshal(body, &checkoutData); err != nil {
+		return nil, resp.StatusCode, err
+	}
+	return checkoutData, resp.StatusCode, nil
+}
+
+func shouldRetryCheckoutFlow(flow stripeSnapAccountFlowResult) bool {
+	if !strings.EqualFold(stripeOriginalErrorCode(flow.Init.Body), "checkout_not_active_session") {
+		return false
+	}
+	if flow.AccountID != "" {
+		return false
+	}
+	return true
+}
+
+func buildExtractAccountFailureStage(flow stripeSnapAccountFlowResult, checkoutData map[string]any) map[string]any {
+	stage := map[string]any{
+		"ok":                    false,
+		"checkout_data_keys":    mapKeys(checkoutData),
+		"account_source":        flow.AccountSource,
+		"account_origin_url":    flow.AccountOriginURL,
+		"stripe_init":           summarizeStripeResult(flow.Init),
+		"stripe_update":         summarizeStripeResult(flow.Update),
+		"stripe_payment_method": summarizeStripeResult(flow.PaymentMethod),
+		"stripe_confirm":        summarizeStripeResult(flow.Confirm),
+		"terms_interaction":     flow.TermsInteraction,
+		"checkout_approval":     summarizeCheckoutApproval(flow.Approval),
+		"redirect_check": map[string]any{
+			"ok":    flow.RedirectCheck.OK,
+			"error": flow.RedirectCheck.Error,
+		},
+		"redirect": map[string]any{
+			"ok":       flow.Redirect.OK,
+			"error":    flow.Redirect.Error,
+			"location": flow.Redirect.Location,
+		},
+		"attempts": flow.Attempts,
+	}
+	if flow.InitCheck.Error != "" {
+		stage["stripe_init_total_error"] = flow.InitCheck.Error
+	}
+	return stage
+}
+
+func extractAccountIDWithFreshCheckoutRetry(ctx context.Context, client *http.Client, accessToken string, checkoutData map[string]any) (string, string, string, stripeSnapAccountFlowResult, map[string]any, bool, error) {
+	flow := extractSnapAccountIDViaStripeFlow(ctx, client, checkoutData, accessToken, checkoutSession{})
+	if flow.AccountID != "" {
+		return flow.AccountID, flow.AccountSource, flow.AccountOriginURL, flow, checkoutData, false, nil
+	}
+	if !shouldRetryCheckoutFlow(flow) {
+		fallback, source, origin := extractSnapAccountIDFromBodyWithSource(checkoutData)
+		if fallback != "" {
+			return fallback, source, origin, flow, checkoutData, false, nil
+		}
+		return "", "", "", flow, checkoutData, false, nil
+	}
+	refreshedCheckoutData, _, err := requestHostedCheckout(ctx, client, accessToken)
+	if err != nil {
+		return "", "", "", flow, checkoutData, true, err
+	}
+	refreshedFlow := extractSnapAccountIDViaStripeFlow(ctx, client, refreshedCheckoutData, accessToken, checkoutSession{})
+	if refreshedFlow.AccountID != "" {
+		return refreshedFlow.AccountID, refreshedFlow.AccountSource, refreshedFlow.AccountOriginURL, refreshedFlow, refreshedCheckoutData, true, nil
+	}
+	if fallback, source, origin := extractSnapAccountIDFromBodyWithSource(refreshedCheckoutData); fallback != "" {
+		return fallback, source, origin, refreshedFlow, refreshedCheckoutData, true, nil
+	}
+	return "", "", "", refreshedFlow, refreshedCheckoutData, true, nil
+}
+
+func handleGopayFullLink(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	defer r.Body.Close()
+	var req struct {
+		AccessToken string `json:"access_token"`
+		CountryCode string `json:"country_code"`
+		PhoneNumber string `json:"phone_number"`
+		OTPChannel  string `json:"otp_channel,omitempty"`
+		OTP         string `json:"otp,omitempty"`
+		PIN         string `json:"pin,omitempty"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<19)).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json")
+		return
+	}
+	req.AccessToken = strings.TrimSpace(req.AccessToken)
+	req.CountryCode = strings.TrimSpace(req.CountryCode)
+	req.PhoneNumber = strings.TrimSpace(req.PhoneNumber)
+	req.OTPChannel = strings.TrimSpace(req.OTPChannel)
+	req.PIN = strings.TrimSpace(req.PIN)
+	if req.AccessToken == "" {
+		writeError(w, http.StatusBadRequest, "access_token required")
+		return
+	}
+	if req.CountryCode == "" {
+		req.CountryCode = "86"
+	}
+	if req.PhoneNumber == "" {
+		writeError(w, http.StatusBadRequest, "phone_number required")
+		return
+	}
+	if req.OTPChannel == "" {
+		req.OTPChannel = "whatsapp"
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 90*time.Second)
+	defer cancel()
+	response := map[string]any{
+		"ok":          false,
+		"strategy":    "full-link",
+		"diagnostics": gopayRequestDiagnostics(req.CountryCode, req.PhoneNumber, req.OTPChannel),
+		"stages":      []map[string]any{},
+	}
+	addStage := func(name string, data map[string]any) {
+		data["name"] = name
+		ss, _ := response["stages"].([]map[string]any)
+		response["stages"] = append(ss, data)
+	}
+
+	// ========================
+	// Stage 0: 生成全新支付链接
+	// ========================
+	client, _ := newHTTPClient(proxySettings{}, false)
+	checkoutData, checkoutStatus, err := requestHostedCheckout(ctx, client, req.AccessToken)
+	if err != nil {
+		response["stage"] = "checkout_api_failed"
+		response["error"] = err.Error()
+		addStage("generate-checkout", map[string]any{"ok": false, "error": err.Error()})
+		writeJSON(w, http.StatusOK, response)
+		return
+	}
+	addStage("generate-checkout", map[string]any{"ok": true, "status": checkoutStatus})
+
+	// ========================
+	// Stage 0.5: 从 checkout 响应中提取 account_id
+	// ========================
+	var accountID string
+	var accountSource string
+	var accountOriginURL string
+	if urlVal := stringifyJSONValue(checkoutData["url"]); urlVal != "" {
+		accountID = extractSnapAccountID(urlVal)
+		if accountID != "" {
+			accountSource = "checkout_url_direct"
+			accountOriginURL = urlVal
+		}
+	}
+	if accountID == "" {
+		var flow stripeSnapAccountFlowResult
+		var usedCheckoutData map[string]any
+		var retriedFreshCheckout bool
+		var extractErr error
+		accountID, accountSource, accountOriginURL, flow, usedCheckoutData, retriedFreshCheckout, extractErr = extractAccountIDWithFreshCheckoutRetry(ctx, client, req.AccessToken, checkoutData)
+		checkoutData = usedCheckoutData
+		if extractErr != nil {
+			response["stage"] = "checkout_retry_failed"
+			response["error"] = extractErr.Error()
+			addStage("extract-account", map[string]any{
+				"ok":                     false,
+				"error":                  extractErr.Error(),
+				"retried_fresh_checkout": retriedFreshCheckout,
+			})
+			writeJSON(w, http.StatusOK, response)
+			return
+		}
+		if accountID == "" {
+			extractStage := buildExtractAccountFailureStage(flow, checkoutData)
+			extractStage["retried_fresh_checkout"] = retriedFreshCheckout
+			addStage("extract-account", extractStage)
+			response["stage"] = "no_account_id"
+			response["error"] = "无法从 checkout 响应中提取 Snap account_id"
+			writeJSON(w, http.StatusOK, response)
+			return
+		}
+	}
+	response["account_id"] = accountID
+	response["account_source"] = accountSource
+	response["account_origin_url"] = accountOriginURL
+	response["linking_diagnostics"] = gopayLinkingDiagnostics(gopayLinkingResolution{
+		AccountSource:    accountSource,
+		AccountOriginURL: accountOriginURL,
+		AccountSourceNote: func() string {
+			if accountSource == "checkout_url_direct" {
+				return "account_id extracted directly from checkout url"
+			}
+			if accountSource == "stripe_redirect_guid" {
+				return "account_id extracted from stripe redirect to Midtrans"
+			}
+			if accountSource == "checkout_body_fallback" {
+				return "account_id extracted from checkout response body fallback"
+			}
+			return ""
+		}(),
+	})
+	addStage("extract-account", map[string]any{"ok": true, "account_id": accountID, "account_source": accountSource, "account_origin_url": accountOriginURL})
+
+	// ========================
+	// Stage 1-6: GoPay 绑定管道（使用全新 account_id）
+	// ========================
+	resolution, linkErr := createOrReuseGopayLinkingViaLocalMock(ctx, accountID, gopayLink{Type: "gopay", CountryCode: req.CountryCode, PhoneNumber: req.PhoneNumber})
+	response["linking_diagnostics"] = gopayLinkingDiagnostics(resolution)
+	if linkErr != nil {
+		response["stage"] = "force_link_failed"
+		response["error"] = linkErr.Error()
+		addStage("force-link-api", map[string]any{"ok": false, "error": linkErr.Error()})
+		writeJSON(w, http.StatusOK, response)
+		return
+	}
+	if resolution.ReusedExisting {
+		paymentResult, paymentErr := completeGopayPaymentViaLocalMock(ctx, accountID, req.PIN)
+		if paymentErr != nil {
+			response["ok"] = false
+			response["stage"] = "gopay_payment_failed"
+			if paymentResult.PinUsed == "" && len(paymentResult.PinTried) > 0 {
+				response["stage"] = "payment_pin_all_failed"
+			}
+			response["error"] = paymentErr.Error()
+			response["reused_existing"] = true
+			response["account_id"] = accountID
+			response["conflict_reason"] = resolution.ConflictReason
+			response["account"] = resolution.AccountResult
+			response["stages"] = gopayReuseStagesWithPaymentFailure(resolution.AccountResult, paymentResult, paymentErr)
+			response["gopay_charge"] = paymentResult.Charge
+			response["gopay_payment_reference_id"] = paymentResult.PaymentReferenceID
+			response["gopay_payment_validate"] = paymentResult.PaymentValidate
+			response["gopay_payment_confirm"] = paymentResult.PaymentConfirm
+			response["gopay_payment_challenge_id"] = paymentResult.PaymentChallengeID
+			response["gopay_payment_client_id"] = paymentResult.PaymentClientID
+			response["gopay_payment_pin_token"] = paymentResult.PaymentPINToken
+			response["gopay_payment_process"] = paymentResult.PaymentProcess
+			response["midtrans_status"] = paymentResult.MidtransStatus
+			writeJSON(w, http.StatusOK, response)
+			return
+		}
+		response["ok"] = true
+		response["stage"] = "gopay_complete"
+		response["reused_existing"] = true
+		response["account_id"] = accountID
+		response["conflict_reason"] = resolution.ConflictReason
+		response["account"] = resolution.AccountResult
+		response["reference_id"] = paymentResult.PaymentReferenceID
+		response["stages"] = gopayReuseStagesWithPayment(resolution.AccountResult, paymentResult)
+		response["gopay_charge"] = paymentResult.Charge
+		response["gopay_payment_reference_id"] = paymentResult.PaymentReferenceID
+		response["gopay_payment_validate"] = paymentResult.PaymentValidate
+		response["gopay_payment_confirm"] = paymentResult.PaymentConfirm
+		response["gopay_payment_challenge_id"] = paymentResult.PaymentChallengeID
+		response["gopay_payment_client_id"] = paymentResult.PaymentClientID
+		response["gopay_payment_pin_token"] = paymentResult.PaymentPINToken
+		response["gopay_payment_process"] = paymentResult.PaymentProcess
+		response["midtrans_status"] = paymentResult.MidtransStatus
+		response["summary"] = map[string]any{
+			"account_id":           accountID,
+			"phone_number":         req.PhoneNumber,
+			"country_code":         req.CountryCode,
+			"reference_id":         paymentResult.PaymentReferenceID,
+			"payment_reference_id": paymentResult.PaymentReferenceID,
+			"transaction_id":       paymentResult.TransactionID,
+			"payment_pin":          paymentResult.PinUsed,
+			"gopay_linked":         true,
+			"reused_existing":      true,
+			"account_status":       stringifyJSONValue(resolution.AccountResult["account_status"]),
+			"conflict_reason":      resolution.ConflictReason,
+		}
+		writeJSON(w, http.StatusOK, response)
+		return
+	}
+	linkResult := resolution.LinkResult
+	referenceID := stringifyJSONValue(linkResult["reference_id"])
+	response["reference_id"] = referenceID
+	addStage("force-link-api", map[string]any{"ok": true, "reference_id": referenceID})
+	refResult, refErr := validateGopayReferenceViaLocalMock(ctx, referenceID)
+	if refErr != nil || validateGopayReferenceResult(refResult) != nil {
+		response["stage"] = "validate_reference_failed"
+		response["error"] = "ref validation failed"
+		addStage("validate-reference", map[string]any{"ok": false})
+		writeJSON(w, http.StatusOK, response)
+		return
+	}
+	addStage("validate-reference", map[string]any{"ok": true})
+	consentResult, consentErr := requestGopayUserConsentViaLocalMock(ctx, referenceID, req.OTPChannel)
+	if consentErr != nil || validateGopayUserConsentResult(consentResult) != nil {
+		response["stage"] = "user_consent_failed"
+		response["error"] = "consent failed"
+		addStage("user-consent", map[string]any{"ok": false})
+		writeJSON(w, http.StatusOK, response)
+		return
+	}
+	addStage("user-consent", map[string]any{"ok": true})
+	sandboxOTPs := []string{"111111", "123456", "000000", "654321", "888888", "999999", "222222", "333333"}
+	otpCands := make([]string, 0, len(sandboxOTPs)+1)
+	if req.OTP != "" {
+		otpCands = append(otpCands, req.OTP)
+	}
+	otpCands = append(otpCands, sandboxOTPs...)
+	var otpR map[string]any
+	var vOTP string
+	otpOk := false
+	otpTried := make([]string, 0, len(otpCands))
+	for _, o := range otpCands {
+		otpCtx, oc := context.WithTimeout(ctx, 8*time.Second)
+		r, er := validateGopayOTPViaLocalMock(otpCtx, referenceID, o)
+		oc()
+		otpTried = append(otpTried, o)
+		if er == nil && validateGopayOTPResult(r) == nil {
+			otpR = r
+			vOTP = o
+			otpOk = true
+			break
+		}
+	}
+	if !otpOk {
+		response["stage"] = "otp_all_failed"
+		response["error"] = "所有 OTP 候选码均失败"
+		addStage("otp-enum", map[string]any{"ok": false, "tried": otpTried})
+		writeJSON(w, http.StatusOK, response)
+		return
+	}
+	challengeID := gopayOTPChallengeID(otpR)
+	addStage("otp-enum", map[string]any{"ok": true, "otp": vOTP, "challenge_id": challengeID})
+	sandboxPINs := []string{"123456", "111111", "000000", "654321", "145236"}
+	pinCands := make([]string, 0, len(sandboxPINs)+1)
+	pinCands = append(pinCands, sandboxPINs...)
+	var vPIN string
+	pinOk := false
+	pinT := ""
+	pinTried := make([]string, 0, len(pinCands))
+	for _, p := range pinCands {
+		pinCtx, pc := context.WithTimeout(ctx, 8*time.Second)
+		r, er := requestGopayPINTokenViaLocalMock(pinCtx, challengeID, p)
+		pc()
+		pinTried = append(pinTried, p)
+		if er == nil && r["success"] == true {
+			pinT = gopayPINToken(r)
+			if pinT != "" {
+				vPIN = p
+				pinOk = true
+				break
+			}
+		}
+	}
+	if !pinOk {
+		response["stage"] = "pin_all_failed"
+		response["error"] = "所有 PIN 候选码均失败"
+		addStage("pin-enum", map[string]any{"ok": false, "tried": pinTried})
+		writeJSON(w, http.StatusOK, response)
+		return
+	}
+	addStage("pin-enum", map[string]any{"ok": true, "pin": vPIN})
+	pvR, pvErr := validateGopayPINViaLocalMock(ctx, referenceID, pinT)
+	if pvErr != nil || validateGopayPINResult(pvR) != nil {
+		response["stage"] = "validate_pin_failed"
+		response["error"] = "PIN validation failed"
+		addStage("validate-pin", map[string]any{"ok": false})
+		writeJSON(w, http.StatusOK, response)
+		return
+	}
+	addStage("validate-pin", map[string]any{"ok": true, "next_action": "linking-success"})
+	response["ok"] = true
+	response["stage"] = "linking_success"
+	response["summary"] = map[string]any{"account_id": accountID, "phone_number": req.PhoneNumber, "country_code": req.CountryCode, "otp": vOTP, "pin": vPIN, "reference_id": referenceID, "gopay_linked": true}
+	writeJSON(w, http.StatusOK, response)
+}
+
+func extractSnapAccountID(urlStr string) string {
+	if urlStr == "" {
+		return ""
+	}
+	const prefix = "app.midtrans.com/snap/v4/redirection/"
+	idx := strings.Index(urlStr, prefix)
+	if idx < 0 {
+		return ""
+	}
+	return extractSnapAccountIDWithSource(urlStr)
+}
+
+func extractSnapAccountIDWithSource(urlStr string) string {
+	if urlStr == "" {
+		return ""
+	}
+	const prefix = "app.midtrans.com/snap/v4/redirection/"
+	idx := strings.Index(urlStr, prefix)
+	if idx < 0 {
+		return ""
+	}
+	rest := urlStr[idx+len(prefix):]
+	if hashIdx := strings.Index(rest, "#"); hashIdx >= 0 {
+		rest = rest[:hashIdx]
+	}
+	if qIdx := strings.Index(rest, "?"); qIdx >= 0 {
+		rest = rest[:qIdx]
+	}
+	return strings.TrimSpace(rest)
+}
+
+func extractSnapAccountIDFromBody(body any) string {
+	accountID, _, _ := extractSnapAccountIDFromBodyWithSource(body)
+	return accountID
+}
+
+func extractSnapAccountIDFromBodyWithSource(body any) (string, string, string) {
+	if body == nil {
+		return "", "", ""
+	}
+	b, err := json.Marshal(body)
+	if err != nil {
+		return "", "", ""
+	}
+	s := string(b)
+	const prefix = "snap/v4/redirection/"
+	idx := strings.Index(s, prefix)
+	if idx < 0 {
+		return "", "", ""
+	}
+	rest := s[idx+len(prefix):]
+	end := strings.IndexAny(rest, `"#?\`)
+	if end < 0 {
+		end = len(rest)
+	}
+	if end > 50 {
+		end = 50
+	}
+	accountID := strings.TrimSpace(rest[:end])
+	snippetStart := max(0, idx-120)
+	snippetEnd := min(len(s), idx+220)
+	return accountID, "checkout_body_fallback", s[snippetStart:snippetEnd]
+}
+
+func mapKeys(m map[string]any) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	return keys
+}
+
+func hasFillableCheckoutInputs(probe map[string]any) bool {
+	if probe == nil {
+		return false
+	}
+	switch typed := probe["inputCount"].(type) {
+	case float64:
+		return typed > 0
+	case int:
+		return typed > 0
+	case int64:
+		return typed > 0
+	default:
+		return false
+	}
+}
+
+func handleCheckoutResolveTarget(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	if !isCDPReady(cdpDebuggingPort) {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"ok": false, "error": "CDP not ready"})
+		return
+	}
+	defer r.Body.Close()
+	var req struct {
+		OpenedURL string `json:"opened_url"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<18)).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json")
+		return
+	}
+	req.OpenedURL = strings.TrimSpace(req.OpenedURL)
+	if req.OpenedURL == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "error": "opened_url is required"})
+		return
+	}
+	targets, err := getCDPTargets(cdpDebuggingPort)
+	if err != nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"ok": false, "error": err.Error()})
+		return
+	}
+	target, currentURL, err := resolveCheckoutPageTarget(targets, req.OpenedURL)
+	if err != nil {
+		writeJSON(w, http.StatusOK, map[string]any{"ok": false, "error": err.Error(), "opened_url": req.OpenedURL})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":          true,
+		"opened_url":  req.OpenedURL,
+		"current_url": currentURL,
+		"target": map[string]any{
+			"id":   target.ID,
+			"type": target.Type,
+			"url":  target.URL,
+		},
+	})
+}
+
+func handleCheckoutAutoFill(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	if !isCDPReady(cdpDebuggingPort) {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"ok": false, "error": "CDP not ready"})
+		return
+	}
+	defer r.Body.Close()
+	var req struct {
+		ExpectedURL string `json:"expected_url"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<18)).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json")
+		return
+	}
+	req.ExpectedURL = strings.TrimSpace(req.ExpectedURL)
+	if req.ExpectedURL == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "error": "expected_url is required"})
+		return
+	}
+	targets, err := getCDPTargets(cdpDebuggingPort)
+	if err != nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"ok": false, "error": err.Error()})
+		return
+	}
+	pageTarget, canonicalURL, err := resolveCheckoutPageTarget(targets, req.ExpectedURL)
+	if err != nil {
+		writeJSON(w, http.StatusOK, map[string]any{"ok": false, "error": err.Error(), "expected_url": req.ExpectedURL})
+		return
+	}
+	addr := generateUSAddress()
+	response := map[string]any{
+		"address":      addr,
+		"expected_url": req.ExpectedURL,
+		"current_url":  canonicalURL,
+		"page_target": map[string]any{
+			"id":   pageTarget.ID,
+			"type": pageTarget.Type,
+			"url":  pageTarget.URL,
+		},
+	}
+	target, canonicalFillURL, err := resolveCheckoutFillTarget(targets, req.ExpectedURL)
+	if err != nil {
+		response["ok"] = false
+		response["error"] = err.Error()
+		writeJSON(w, http.StatusOK, response)
+		return
+	}
+	if canonicalFillURL != canonicalURL {
+		response["ok"] = false
+		response["error"] = "当前支付页与本工具最近一次打开的支付链接不一致，已拒绝自动填写。"
+		writeJSON(w, http.StatusOK, response)
+		return
+	}
+	response["fill_target"] = map[string]any{
+		"id":   target.ID,
+		"type": target.Type,
+		"url":  target.URL,
+	}
+	conn, _, err := websocket.DefaultDialer.Dial(target.WebSocketDebuggerURL, nil)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "CDP failed: "+err.Error())
+		return
+	}
+	defer conn.Close()
+	sendCDPCommand(conn, "Runtime.enable", nil)
+	isStripeFrame := strings.Contains(target.URL, "elements-inner-payment") || strings.Contains(target.URL, "stripe.com/v3")
+	probeR, _ := executeCDPScript(conn, `(async () => { const ins=document.querySelectorAll('input'); const sels=document.querySelectorAll('select'); return JSON.stringify({url:window.location.href,title:document.title,inputCount:ins.length,inputs:Array.from(ins).map(el=>({type:el.type,name:el.name,id:el.id,ph:(el.placeholder||'').slice(0,30),auto:el.autocomplete,required:el.required})),selectCount:sels.length,selects:Array.from(sels).map(el=>({name:el.name,id:el.id,ops:Array.from(el.options).slice(0,10).map(o=>o.value)}))}); })()`)
+	var probe map[string]any
+	if probeR != "" {
+		json.Unmarshal([]byte(probeR), &probe)
+	}
+	response["probe"] = probe
+	if !hasFillableCheckoutInputs(probe) {
+		if !isStripeFrame {
+			response["hint"] = "表单在 Stripe iframe 中。请先在页面上点一次「订阅」加载 Stripe Elements 后重试。"
+		}
+		response["ok"] = false
+		response["error"] = "未在目标支付页检测到可填写的地址表单。"
+		writeJSON(w, http.StatusOK, response)
+		return
+	}
+	fillR, _ := executeCDPScript(conn, fmt.Sprintf(`(async () => { function snv(el,v){const s=Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value').set;s.call(el,v);el.dispatchEvent(new Event('input',{bubbles:true}));el.dispatchEvent(new Event('change',{bubbles:true}));} function so(sel,v){const o=Array.from(sel.options).find(o=>o.value===v||o.text===v||o.text.includes(v));if(o){sel.value=o.value;sel.dispatchEvent(new Event('change',{bubbles:true}));return true}return false} function mf(el,ks){const s=(el.name+'|'+el.id+'|'+el.autocomplete+'|'+(el.placeholder||'')+'|'+(el.getAttribute('aria-label')||'')).toLowerCase();return ks.some(k=>s.includes(k))} const a={fn:%q,ln:%q,l1:%q,c:%q,s:%q,z:%q};const ins=document.querySelectorAll('input');const sls=document.querySelectorAll('select');let f={}; const fi=Array.from(ins).find(el=>mf(el,['first','given','fname','firstName','first_name','vorname']));if(fi){snv(fi,a.fn);f.first_name=true}else{const ni=Array.from(ins).find(el=>mf(el,['fullname','full_name','name']));if(ni){snv(ni,a.fn+' '+a.ln);f.full_name=true}} const li=Array.from(ins).find(el=>mf(el,['last','family','lname','lastName','surname','nachname']));if(li){snv(li,a.ln);f.last_name=true} const ai=Array.from(ins).find(el=>mf(el,['address-line1','address1','address','street','addr1','line1']));if(ai){snv(ai,a.l1);f.address=true} const ci=Array.from(ins).find(el=>mf(el,['city','town','locality','address-level2']));if(ci){snv(ci,a.c);f.city=true} const si=Array.from(ins).find(el=>mf(el,['state','region','province','address-level1']));const ss=Array.from(sls).find(el=>mf(el,['state','region','province']));if(ss){so(ss,a.s);f.state=true}else if(si){snv(si,a.s);f.state=true} const zi=Array.from(ins).find(el=>mf(el,['zip','postal','postcode','postal_code','zip_code']));if(zi){snv(zi,a.z);f.zip=true} const cs=Array.from(sls).find(el=>mf(el,['country']));if(cs){so(cs,'US');f.country=true} await new Promise(r=>setTimeout(r,600)); return JSON.stringify({url:window.location.href,filled:f,inputCount:ins.length}); })()`, addr.FirstName, addr.LastName, addr.Line1, addr.City, addr.State, addr.ZipCode))
+	var fillMap map[string]any
+	if fillR != "" {
+		json.Unmarshal([]byte(fillR), &fillMap)
+	}
+	response["filled"] = fillMap
+	anyF := false
+	if fillMap != nil {
+		if fm, _ := fillMap["filled"].(map[string]any); fm != nil {
+			for _, v := range fm {
+				if b, ok := v.(bool); ok && b {
+					anyF = true
+					break
+				}
+			}
+		}
+	}
+	if anyF {
+		executeCDPScript(conn, `(async () => { await new Promise(r=>setTimeout(r,500)); const btns=document.querySelectorAll('button'); const t=Array.from(btns).find(b=>{const tx=(b.textContent||'').toLowerCase(); return tx.includes('continue')||tx.includes('submit')||tx.includes('save')||tx.includes('next')||tx.includes('confirm');}); if(t&&!t.disabled){t.click();return'clicked'} return'none'; })()`)
+	}
+	if !anyF {
+		response["ok"] = false
+		response["error"] = "地址表单已检测到，但没有任何字段被成功写入。"
+		writeJSON(w, http.StatusOK, response)
+		return
+	}
+	response["ok"] = true
+	writeJSON(w, http.StatusOK, response)
 }

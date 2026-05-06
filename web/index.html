@@ -55,6 +55,12 @@
             <div class="toolbar">
               <button id="submitButton" type="submit">生成支付链接</button>
             </div>
+
+            <div class="incognito-toolbar">
+              <button id="openIncognitoBtn" type="button" class="secondary-button">打开无痕窗口</button>
+              <button id="autoFillCheckoutBtn" type="button" class="secondary-button">自动填地址</button>
+              <button id="fetchSessionBtn" type="button" class="secondary-button">获取 Session JSON</button>
+            </div>
           </form>
         </div>
 
@@ -79,6 +85,57 @@
             </div>
           </div>
 
+          <div id="stepFlow" class="step-flow">
+            <div class="step-flow-item" data-step="input">
+              <span class="step-dot"></span>
+              <div>
+                <strong>识别输入</strong>
+                <p id="stepInputText">等待提交</p>
+              </div>
+            </div>
+            <div class="step-flow-item" data-step="token">
+              <span class="step-dot"></span>
+              <div>
+                <strong>提取 Token</strong>
+                <p id="stepTokenText">等待提交</p>
+              </div>
+            </div>
+            <div class="step-flow-item" data-step="checkout">
+              <span class="step-dot"></span>
+              <div>
+                <strong>请求 Checkout</strong>
+                <p id="stepCheckoutText">等待提交</p>
+              </div>
+            </div>
+            <div class="step-flow-item" data-step="cookie">
+              <span class="step-dot"></span>
+              <div>
+                <strong>浏览器会话</strong>
+                <p id="stepCookieText">等待提交</p>
+              </div>
+            </div>
+            <div class="step-flow-item" data-step="link">
+              <span class="step-dot"></span>
+              <div>
+                <strong>生成链接</strong>
+                <p id="stepLinkText">等待提交</p>
+              </div>
+            </div>
+          </div>
+
+          <div id="alertBox" class="alert-box" hidden>
+            <div class="alert-head">
+              <strong id="alertTitle">生成失败</strong>
+              <span id="alertBadge" class="alert-badge">错误</span>
+            </div>
+            <p id="alertMessage" class="alert-message">-</p>
+            <p id="alertHint" class="alert-hint" hidden>-</p>
+            <div id="alertSteps" class="alert-steps" hidden>
+              <span class="alert-steps-title">下一步</span>
+              <ol id="alertStepsList"></ol>
+            </div>
+          </div>
+
           <div id="finalStatus" class="final-status">
             <div>
               <span class="metric-label">结果</span>
@@ -87,6 +144,7 @@
             <div>
               <span class="metric-label">支付链接</span>
               <a id="checkoutUrlLink" class="checkout-link" href="#" target="_blank" rel="noreferrer" hidden>打开链接</a>
+              <button id="openInIncognitoBtn" class="incognito-link-button" type="button" hidden>无痕打开</button>
               <button id="copyCheckoutLinkButton" class="copy-button" type="button" hidden>复制链接</button>
             </div>
             <div>
@@ -96,6 +154,135 @@
           </div>
 
           <pre id="output">{}</pre>
+        </div>
+
+        <div class="panel gopay-panel" id="gopayPanel">
+          <div class="panel-head">
+            <h2>GoPay 一键绑定</h2>
+            <span id="gopayBadge" class="badge neutral">就绪</span>
+          </div>
+
+          <div class="gopay-form">
+            <div class="gopay-field-row">
+              <label class="gopay-field">
+                <span>Account ID</span>
+                <input id="gopayAccountId" placeholder="从支付链接 URL 提取的 gopay_guid" autocomplete="off">
+              </label>
+            </div>
+            <div class="gopay-field-row gopay-two-col">
+              <label class="gopay-field">
+                <span>国家码</span>
+                <input id="gopayCountryCode" value="86" placeholder="86" autocomplete="off">
+              </label>
+              <label class="gopay-field">
+                <span>手机号</span>
+                <input id="gopayPhone" value="18120322232" placeholder="18120322232" autocomplete="off">
+              </label>
+            </div>
+            <div class="gopay-field-row gopay-two-col">
+              <label class="gopay-field">
+                <span>OTP 通道</span>
+                <select id="gopayOTPChannel">
+                  <option value="whatsapp" selected>WhatsApp</option>
+                  <option value="sms">SMS</option>
+                </select>
+              </label>
+              <label class="gopay-field">
+                <span>6 位 OTP 验证码</span>
+                <input id="gopayOTP" type="text" inputmode="numeric" maxlength="6" placeholder="输入收到的 OTP" autocomplete="off">
+              </label>
+            </div>
+            <div class="gopay-field-row">
+              <label class="gopay-field">
+                <span>6 位 GoPay PIN（复用已绑定账号或支付阶段使用）</span>
+                <input id="gopayPINCode" type="password" inputmode="numeric" maxlength="6" placeholder="输入 GoPay PIN，不会保存在本地" autocomplete="off">
+              </label>
+            </div>
+            <div class="gopay-toolbar">
+              <button id="gopayLinkBtn" type="button">GoPay 一键绑定</button>
+              <button id="gopayMonitorBtn" type="button" class="secondary-button">开始流程监控</button>
+            </div>
+          </div>
+
+          <div id="gopayStepFlow" class="step-flow" hidden>
+            <div class="step-flow-item" data-gopay-step="linking">
+              <span class="step-dot"></span>
+              <div>
+                <strong>Linking</strong>
+                <p id="gopayLinkingText">等待提交</p>
+              </div>
+            </div>
+            <div class="step-flow-item" data-gopay-step="reference">
+              <span class="step-dot"></span>
+              <div>
+                <strong>验证引用</strong>
+                <p id="gopayReferenceText">等待提交</p>
+              </div>
+            </div>
+            <div class="step-flow-item" data-gopay-step="consent">
+              <span class="step-dot"></span>
+              <div>
+                <strong>触发 OTP</strong>
+                <p id="gopayConsentText">等待提交</p>
+              </div>
+            </div>
+            <div class="step-flow-item" data-gopay-step="otp">
+              <span class="step-dot"></span>
+              <div>
+                <strong>验证 OTP</strong>
+                <p id="gopayOTPText">等待提交</p>
+              </div>
+            </div>
+            <div class="step-flow-item" data-gopay-step="pin">
+              <span class="step-dot"></span>
+              <div>
+                <strong>PIN 验证</strong>
+                <p id="gopayPINText">等待提交</p>
+              </div>
+            </div>
+            <div class="step-flow-item" data-gopay-step="success">
+              <span class="step-dot"></span>
+              <div>
+                <strong>绑定完成</strong>
+                <p id="gopaySuccessText">等待提交</p>
+              </div>
+            </div>
+          </div>
+
+          <div id="gopayResult" class="gopay-result" hidden>
+            <div class="gopay-result-grid">
+              <div>
+                <span class="metric-label">Link 状态</span>
+                <strong id="gopayLinkStatus">-</strong>
+              </div>
+              <div>
+                <span class="metric-label">Reference ID</span>
+                <strong id="gopayRefID">-</strong>
+              </div>
+              <div>
+                <span class="metric-label">耗时</span>
+                <strong id="gopayLatency">-</strong>
+              </div>
+            </div>
+            <pre id="gopayOutput">{}</pre>
+          </div>
+
+          <div id="gopayMonitor" class="gopay-monitor" hidden>
+            <div class="monitor-head">
+              <h3>流程监控</h3>
+              <span id="monitorBadge" class="badge neutral">空闲</span>
+            </div>
+            <div class="monitor-summary" id="monitorSummary" hidden>
+              <span>网络请求: <strong id="monitorNetCount">0</strong></span>
+              <span>页面跳转: <strong id="monitorPageCount">0</strong></span>
+              <span>API 调用: <strong id="monitorAPICount">0</strong></span>
+              <span>JS 错误: <strong id="monitorErrorCount">0</strong></span>
+            </div>
+            <div class="monitor-log" id="monitorLog">
+              <div class="monitor-empty">点击「开始流程监控」抓取页面全流程数据</div>
+            </div>
+            <pre id="monitorOutput" hidden>{}</pre>
+          </div>
         </div>
       </section>
     </main>

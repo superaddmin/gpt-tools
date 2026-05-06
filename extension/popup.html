@@ -1,0 +1,173 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ChatAdd 凭证提取器</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      width: 360px;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      background: #1a1a2e;
+      color: #e0e0e0;
+      font-size: 13px;
+    }
+    .header {
+      padding: 16px 20px;
+      background: linear-gradient(135deg, #10a37f 0%, #1a7f64 100%);
+      color: #fff;
+    }
+    .header h1 { font-size: 16px; font-weight: 700; }
+    .header p { font-size: 11px; opacity: 0.85; margin-top: 4px; }
+    .content { padding: 16px 20px; }
+    .section { margin-bottom: 16px; }
+    .section-title {
+      font-size: 12px;
+      font-weight: 600;
+      color: #aaa;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      margin-bottom: 8px;
+    }
+    .field { margin-bottom: 12px; }
+    .field label {
+      display: block;
+      font-size: 12px;
+      color: #bbb;
+      margin-bottom: 4px;
+    }
+    .field input, .field textarea {
+      width: 100%;
+      padding: 8px 10px;
+      background: #16213e;
+      border: 1px solid #2a2a4a;
+      border-radius: 6px;
+      color: #e0e0e0;
+      font-size: 12px;
+      font-family: inherit;
+      outline: none;
+      transition: border-color 0.2s;
+    }
+    .field input:focus, .field textarea:focus { border-color: #10a37f; }
+    .field textarea { resize: vertical; min-height: 60px; }
+    .field-hint { font-size: 10px; color: #777; margin-top: 3px; }
+    .btn-row { display: flex; gap: 8px; margin-top: 16px; }
+    .btn {
+      flex: 1;
+      padding: 10px 16px;
+      border: none;
+      border-radius: 8px;
+      font-size: 13px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: all 0.2s;
+    }
+    .btn-primary {
+      background: linear-gradient(135deg, #10a37f 0%, #1a7f64 100%);
+      color: #fff;
+    }
+    .btn-primary:hover { opacity: 0.9; transform: translateY(-1px); }
+    .btn-secondary {
+      background: #2a2a4a;
+      color: #ccc;
+    }
+    .btn-secondary:hover { background: #3a3a5a; }
+    .btn-danger {
+      background: #5a2020;
+      color: #f88;
+    }
+    .btn-danger:hover { background: #6a3030; }
+    .btn:disabled { opacity: 0.5; cursor: not-allowed; transform: none; }
+    .status-bar {
+      padding: 10px 20px;
+      background: #0f0f23;
+      border-top: 1px solid #2a2a4a;
+      font-size: 11px;
+      color: #888;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .status-dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: #555;
+      flex-shrink: 0;
+    }
+    .status-dot.active { background: #10a37f; animation: pulse 1.5s infinite; }
+    .status-dot.error { background: #f55; }
+    @keyframes pulse {
+      0%, 100% { opacity: 1; }
+      50% { opacity: 0.4; }
+    }
+    .toast {
+      position: fixed;
+      bottom: 12px;
+      left: 12px;
+      right: 12px;
+      padding: 10px 14px;
+      border-radius: 8px;
+      font-size: 12px;
+      text-align: center;
+      opacity: 0;
+      transform: translateY(10px);
+      transition: all 0.3s;
+      pointer-events: none;
+    }
+    .toast.show { opacity: 1; transform: translateY(0); }
+    .toast.success { background: #0d3b2c; color: #8ff0a4; }
+    .toast.error { background: #3b0d0d; color: #f08f8f; }
+  </style>
+</head>
+<body>
+  <div class="header">
+    <h1>ChatAdd 凭证提取器</h1>
+    <p>一键提取 Cookies / LocalStorage / SessionStorage</p>
+  </div>
+
+  <div class="content">
+    <div class="section">
+      <div class="section-title">目标配置</div>
+      <div class="field">
+        <label for="targetUrl">目标网址</label>
+        <input id="targetUrl" type="text" placeholder="https://chatgpt.com/">
+        <div class="field-hint">无痕窗口将导航至此地址</div>
+      </div>
+      <div class="field">
+        <label for="sessionCookieName">会话 Cookie 名称</label>
+        <input id="sessionCookieName" type="text" placeholder="__Secure-next-auth.session-token">
+        <div class="field-hint">用于检测登录状态的 Cookie 名</div>
+      </div>
+      <div class="field">
+        <label for="loginSuccessUrls">登录成功 URL（每行一个）</label>
+        <textarea id="loginSuccessUrls" rows="2" placeholder="https://chatgpt.com/"></textarea>
+        <div class="field-hint">匹配任一 URL 即认为登录成功</div>
+      </div>
+      <div class="field">
+        <label for="loginTimeout">登录超时（秒）</label>
+        <input id="loginTimeout" type="number" min="10" max="600" value="120">
+      </div>
+    </div>
+
+    <div class="btn-row">
+      <button id="saveBtn" class="btn btn-primary">保存配置</button>
+      <button id="resetBtn" class="btn btn-secondary">恢复默认</button>
+    </div>
+    <div class="btn-row">
+      <button id="extractBtn" class="btn btn-primary">立即提取凭证</button>
+      <button id="cancelBtn" class="btn btn-danger" disabled>取消任务</button>
+    </div>
+  </div>
+
+  <div class="status-bar">
+    <span id="statusDot" class="status-dot"></span>
+    <span id="statusText">就绪</span>
+  </div>
+
+  <div id="toast" class="toast"></div>
+
+  <script src="popup.js"></script>
+</body>
+</html>
