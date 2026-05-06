@@ -282,6 +282,10 @@ async function fetchLatestSessionJSON() {
     monitorOutput.textContent = JSON.stringify({ stream: fullOutput, diagnostics: diagnostics }, null, 2);
   }
 
+  if (diagnostics?.conclusion) {
+    renderSessionConclusion(diagnostics.conclusion);
+  }
+
   if (resultJSON) {
     fields.token.value = resultJSON;
     if (sessionText) setText(sessionText, "已提取 Session JSON");
@@ -291,6 +295,25 @@ async function fetchLatestSessionJSON() {
 
   if (monitorBadge) { monitorBadge.textContent = "Session 失败"; monitorBadge.className = "badge error"; }
   throw new Error(finalError || diagnostics?.session_preview || "获取 Session JSON 失败，请确认已在无痕窗口中登录 ChatGPT");
+}
+
+function renderSessionConclusion(conclusion) {
+  if (!conclusion) return;
+  if (conclusion.message) {
+    appendMonitorEvent({ domain: "Log", method: "session-conclusion", summary: conclusion.message, ts: Date.now() });
+  }
+  if (alertBox) {
+    alertBox.hidden = false;
+    alertBox.classList.remove("cookie", "token");
+    if (alertTitle) setText(alertTitle, "Session 诊断结论");
+    if (alertBadge) setText(alertBadge, conclusion.status || "诊断");
+    if (alertMessage) setText(alertMessage, conclusion.message || "-");
+    if (alertHint) {
+      alertHint.hidden = false;
+      setText(alertHint, conclusion.status || "-");
+    }
+    renderAlertSteps(Array.isArray(conclusion.next_steps) ? conclusion.next_steps : []);
+  }
 }
 
 /**

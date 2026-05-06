@@ -543,6 +543,130 @@ func fetchSessionJSONViaCDP() (string, error) {
 	return sessionJSON, err
 }
 
+func sessionBoolValue(diagnostics map[string]any, key string) bool {
+	value, _ := diagnostics[key].(bool)
+	return value
+}
+
+func sessionIntValue(diagnostics map[string]any, key string) int {
+	switch value := diagnostics[key].(type) {
+	case float64:
+		return int(value)
+	case int:
+		return value
+	case int64:
+		return int(value)
+	default:
+		return 0
+	}
+}
+
+func buildSessionDiagnosticsConclusion(diagnostics map[string]any) map[string]any {
+	if diagnostics == nil {
+		return map[string]any{
+			"status":  "unknown",
+			"message": "尚未生成 Session 诊断信息",
+			"next_steps": []string{
+				"打开 Chrome 无痕窗口",
+				"访问 chatgpt.com 并完成登录",
+				"再次点击获取 Session JSON",
+			},
+		}
+	}
+
+	if !sessionBoolValue(diagnostics, "cdp_ready") {
+		return map[string]any{
+			"status":  "cdp_not_ready",
+			"message": "Chrome CDP 尚未就绪，本地无痕窗口或远程调试端口不可用",
+			"next_steps": []string{
+				"先点击打开无痕窗口",
+				"确认 Chrome 已启动且远程调试端口 9223 可用",
+				"等待页面打开后重新获取 Session JSON",
+			},
+		}
+	}
+
+	if !sessionBoolValue(diagnostics, "target_found") {
+		return map[string]any{
+			"status":  "chatgpt_page_missing",
+			"message": "未找到 chatgpt.com 页面，当前无痕窗口可能未打开到目标站点",
+			"next_steps": []string{
+				"确认无痕窗口已打开 chatgpt.com",
+				"若页面被跳转到其他站点，请切回 ChatGPT 首页或登录页",
+				"重新执行获取 Session JSON",
+			},
+		}
+	}
+
+	hasToken := sessionBoolValue(diagnostics, "has_access_token")
+	loginSelectorCount := sessionIntValue(diagnostics, "login_selector_count")
+	sessionStatus := sessionIntValue(diagnostics, "session_status")
+	targetURL := stringifyJSONValue(diagnostics["target_url"])
+	preview := strings.ToLower(stringifyJSONValue(diagnostics["session_preview"]))
+	bodyText := strings.ToLower(stringifyJSONValue(diagnostics["body_text"]))
+
+	if hasToken {
+		return map[string]any{
+			"status":  "session_ready",
+			"message": "已检测到 accessToken，可以继续后续 checkout 自动化流程",
+			"next_steps": []string{
+				"直接生成支付链接",
+				"如需排查支付链路，可保持当前监控面板开启",
+			},
+		}
+	}
+
+	if sessionStatus == http.StatusUnauthorized || loginSelectorCount > 0 || strings.Contains(targetURL, "/auth/login") || strings.Contains(bodyText, "log in") || strings.Contains(bodyText, "登录") {
+		return map[string]any{
+			"status":  "login_required",
+			"message": "当前页面仍处于未登录态，请先在无痕窗口中完成 ChatGPT 登录",
+			"next_steps": []string{
+				"在无痕窗口输入账号并完成登录",
+				"确认页面进入聊天页或已登录首页",
+				"再次点击获取 Session JSON",
+			},
+		}
+	}
+
+	if sessionStatus >= 500 {
+		return map[string]any{
+			"status":  "session_endpoint_error",
+			"message": "已访问 /api/auth/session，但上游返回 5xx，当前更像是会话接口临时异常",
+			"next_steps": []string{
+				"刷新无痕窗口页面后重试",
+				"确认网络代理或浏览器环境未拦截请求",
+				"如多次失败，查看监控面板中的 OpenAI 网络请求",
+			},
+		}
+	}
+
+	if sessionStatus >= 200 && sessionStatus < 300 && !hasToken {
+		message := "已请求 /api/auth/session，但返回内容里没有 accessToken"
+		if strings.Contains(preview, "error") || strings.Contains(preview, "unauthorized") {
+			message = "会话接口已返回响应，但内容表现为异常或未登录态"
+		}
+		return map[string]any{
+			"status":  "session_missing_token",
+			"message": message,
+			"next_steps": []string{
+				"确认当前账号已完整登录而不是停留在中间页",
+				"检查是否命中了风控、验证页或灰度页面",
+				"继续观察监控面板里的 session_preview 和 body_text",
+			},
+		}
+	}
+
+	return map[string]any{
+		"status":  "session_unknown",
+		"message": "Session 获取流程已执行，但暂时无法自动判定具体卡点",
+		"next_steps": []string{
+			"查看监控面板中的 session_preview、body_text 和 target_url",
+			"确认页面是否已完成登录并停留在 chatgpt.com",
+			"必要时重新打开无痕窗口后重试",
+		},
+	}
+}
+
 func fetchSessionJSONViaCDPWithDiagnostics(onEvent func(monitorEvent)) (string, map[string]any, error) {
 	if !isCDPReady(cdpDebuggingPort) {
 		return "", map[string]any{"cdp_ready": false}, &cdpNotReadyError{message: "CDP 未就绪"}
@@ -615,6 +739,7 @@ func fetchSessionJSONViaCDPWithDiagnostics(onEvent func(monitorEvent)) (string, 
 		"body_text":            stringifyJSONValue(snapshot["body_text"]),
 		"elapsed_ms":           time.Since(start).Milliseconds(),
 	}
+	diagnostics["conclusion"] = buildSessionDiagnosticsConclusion(diagnostics)
 	if onEvent != nil {
 		onEvent(monitorEvent{Timestamp: time.Now().UnixMilli(), Domain: "Network", Method: "session-fetch", Summary: fmt.Sprintf("/api/auth/session status=%v len=%v", snapshot["session_status"], snapshot["session_length"])})
 		if hasToken, _ := snapshot["has_access_token"].(bool); hasToken {
@@ -659,6 +784,13 @@ func handleSessionFetch(w http.ResponseWriter, r *http.Request) {
 			_ = encoder.Encode(monitorStreamEnvelope{Type: "error", Error: err.Error(), Data: diagnostics})
 			flusher.Flush()
 			return
+		}
+		if conclusion, ok := diagnostics["conclusion"].(map[string]any); ok {
+			message := stringifyJSONValue(conclusion["message"])
+			if message != "" {
+				_ = encoder.Encode(monitorStreamEnvelope{Type: "event", Event: &monitorEvent{Timestamp: time.Now().UnixMilli(), Domain: "Log", Method: "session-conclusion", Summary: message}})
+				flusher.Flush()
+			}
 		}
 		_ = encoder.Encode(monitorStreamEnvelope{Type: "data", Data: map[string]any{"json": sessionJSON, "diagnostics": diagnostics}})
 		flusher.Flush()
@@ -6290,6 +6422,28 @@ func hasFillableCheckoutInputs(probe map[string]any) bool {
 	}
 }
 
+func checkoutProbeText(probe map[string]any) string {
+	if probe == nil {
+		return ""
+	}
+	return strings.ToLower(strings.TrimSpace(stringifyJSONValue(probe["text"])))
+}
+
+func checkoutProbeShowsGopayChoice(probe map[string]any) bool {
+	text := checkoutProbeText(probe)
+	return strings.Contains(text, "gopay") && (strings.Contains(text, "银行卡") || strings.Contains(text, "bank card") || strings.Contains(text, "payment method") || strings.Contains(text, "支付方式"))
+}
+
+func checkoutAutoFillAction(probe map[string]any, isStripeFrame bool) string {
+	if hasFillableCheckoutInputs(probe) {
+		return "fill"
+	}
+	if !isStripeFrame && checkoutProbeShowsGopayChoice(probe) {
+		return "activate_gopay"
+	}
+	return "manual"
+}
+
 func handleCheckoutResolveTarget(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
@@ -6403,15 +6557,61 @@ func handleCheckoutAutoFill(w http.ResponseWriter, r *http.Request) {
 	defer conn.Close()
 	sendCDPCommand(conn, "Runtime.enable", nil)
 	isStripeFrame := strings.Contains(target.URL, "elements-inner-payment") || strings.Contains(target.URL, "stripe.com/v3")
-	probeR, _ := executeCDPScript(conn, `(async () => { const ins=document.querySelectorAll('input'); const sels=document.querySelectorAll('select'); return JSON.stringify({url:window.location.href,title:document.title,inputCount:ins.length,inputs:Array.from(ins).map(el=>({type:el.type,name:el.name,id:el.id,ph:(el.placeholder||'').slice(0,30),auto:el.autocomplete,required:el.required})),selectCount:sels.length,selects:Array.from(sels).map(el=>({name:el.name,id:el.id,ops:Array.from(el.options).slice(0,10).map(o=>o.value)}))}); })()`)
+	probeScript := `(async () => { const ins=document.querySelectorAll('input'); const sels=document.querySelectorAll('select'); return JSON.stringify({url:window.location.href,title:document.title,text:(document.body?.innerText||document.body?.textContent||'').replace(/\s+/g,' ').trim().slice(0,2000),inputCount:ins.length,inputs:Array.from(ins).map(el=>({type:el.type,name:el.name,id:el.id,ph:(el.placeholder||'').slice(0,30),auto:el.autocomplete,required:el.required})),selectCount:sels.length,selects:Array.from(sels).map(el=>({name:el.name,id:el.id,ops:Array.from(el.options).slice(0,10).map(o=>o.value)}))}); })()`
+	probeR, _ := executeCDPScript(conn, probeScript)
 	var probe map[string]any
 	if probeR != "" {
 		json.Unmarshal([]byte(probeR), &probe)
 	}
 	response["probe"] = probe
-	if !hasFillableCheckoutInputs(probe) {
+	action := checkoutAutoFillAction(probe, isStripeFrame)
+	if action == "activate_gopay" {
+		clickR, _ := executeCDPScript(conn, `(async () => {
+			const textOf = (el) => ((el?.textContent || '') + ' ' + (el?.getAttribute?.('aria-label') || '')).toLowerCase();
+			const radio = Array.from(document.querySelectorAll('input[type="radio"], [role="radio"]')).find(el => textOf(el.closest('label,div,section') || el).includes('gopay'));
+			if (radio) { radio.click(); await new Promise(r=>setTimeout(r,900)); return JSON.stringify({clicked:true, via:'radio'}); }
+			const label = Array.from(document.querySelectorAll('label, button, div, section, span')).find(el => textOf(el).includes('gopay'));
+			if (label) { label.click(); await new Promise(r=>setTimeout(r,900)); return JSON.stringify({clicked:true, via:'label'}); }
+			return JSON.stringify({clicked:false});
+		})()`)
+		var clickMap map[string]any
+		if clickR != "" {
+			json.Unmarshal([]byte(clickR), &clickMap)
+		}
+		response["gopay_activation"] = clickMap
+		updatedTargets, refreshErr := getCDPTargets(cdpDebuggingPort)
+		if refreshErr == nil {
+			if refreshedTarget, _, reselectErr := resolveCheckoutFillTarget(updatedTargets, req.ExpectedURL); reselectErr == nil {
+				target = refreshedTarget
+				response["fill_target"] = map[string]any{
+					"id":   target.ID,
+					"type": target.Type,
+					"url":  target.URL,
+				}
+				if target.ID != pageTarget.ID {
+					conn.Close()
+					conn, _, err = websocket.DefaultDialer.Dial(target.WebSocketDebuggerURL, nil)
+					if err != nil {
+						writeError(w, http.StatusInternalServerError, "CDP failed: "+err.Error())
+						return
+					}
+					defer conn.Close()
+					sendCDPCommand(conn, "Runtime.enable", nil)
+					isStripeFrame = strings.Contains(target.URL, "elements-inner-payment") || strings.Contains(target.URL, "stripe.com/v3")
+				}
+			}
+		}
+		probeR, _ = executeCDPScript(conn, probeScript)
+		probe = map[string]any{}
+		if probeR != "" {
+			json.Unmarshal([]byte(probeR), &probe)
+		}
+		response["probe_after_gopay"] = probe
+		action = checkoutAutoFillAction(probe, isStripeFrame)
+	}
+	if action != "fill" {
 		if !isStripeFrame {
-			response["hint"] = "表单在 Stripe iframe 中。请先在页面上点一次「订阅」加载 Stripe Elements 后重试。"
+			response["hint"] = "表单在 Stripe iframe 中，或当前还未切到 GoPay 表单。请先确认页面已展开 GoPay 地址区后重试。"
 		}
 		response["ok"] = false
 		response["error"] = "未在目标支付页检测到可填写的地址表单。"

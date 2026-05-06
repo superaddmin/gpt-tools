@@ -57,6 +57,42 @@ func TestNormalizeOTPChannelRejectsUnknownValues(t *testing.T) {
 	}
 }
 
+func TestBuildSessionDiagnosticsConclusionReturnsSessionReady(t *testing.T) {
+	conclusion := buildSessionDiagnosticsConclusion(map[string]any{
+		"cdp_ready":        true,
+		"target_found":     true,
+		"has_access_token": true,
+		"session_status":   float64(200),
+	})
+	if conclusion["status"] != "session_ready" {
+		t.Fatalf("status = %#v", conclusion["status"])
+	}
+}
+
+func TestBuildSessionDiagnosticsConclusionDetectsLoginRequired(t *testing.T) {
+	conclusion := buildSessionDiagnosticsConclusion(map[string]any{
+		"cdp_ready":            true,
+		"target_found":         true,
+		"has_access_token":     false,
+		"session_status":       float64(401),
+		"login_selector_count": float64(1),
+		"target_url":           "https://chatgpt.com/auth/login",
+	})
+	if conclusion["status"] != "login_required" {
+		t.Fatalf("status = %#v", conclusion["status"])
+	}
+}
+
+func TestBuildSessionDiagnosticsConclusionDetectsMissingChatGPTPage(t *testing.T) {
+	conclusion := buildSessionDiagnosticsConclusion(map[string]any{
+		"cdp_ready":    true,
+		"target_found": false,
+	})
+	if conclusion["status"] != "chatgpt_page_missing" {
+		t.Fatalf("status = %#v", conclusion["status"])
+	}
+}
+
 func TestSetCheckoutBackendHeadersUsesExplicitSessionCookie(t *testing.T) {
 	req, err := http.NewRequest(http.MethodPost, "https://chatgpt.com/backend-api/payments/checkout", nil)
 	if err != nil {
@@ -323,6 +359,26 @@ func TestHasFillableCheckoutInputsAcceptsPositiveInputs(t *testing.T) {
 	probe := map[string]any{"inputCount": float64(3)}
 	if !hasFillableCheckoutInputs(probe) {
 		t.Fatal("hasFillableCheckoutInputs = false, want true for positive inputs")
+	}
+}
+
+func TestCheckoutAutoFillActionActivatesGopayWhenChoiceVisible(t *testing.T) {
+	probe := map[string]any{
+		"inputCount": float64(0),
+		"text":       "支付方式 银行卡 GoPay 联系信息",
+	}
+	if got := checkoutAutoFillAction(probe, false); got != "activate_gopay" {
+		t.Fatalf("checkoutAutoFillAction = %q, want activate_gopay", got)
+	}
+}
+
+func TestCheckoutAutoFillActionNeedsManualWhenNoInputsAndNoGopay(t *testing.T) {
+	probe := map[string]any{
+		"inputCount": float64(0),
+		"text":       "Something went wrong",
+	}
+	if got := checkoutAutoFillAction(probe, false); got != "manual" {
+		t.Fatalf("checkoutAutoFillAction = %q, want manual", got)
 	}
 }
 
