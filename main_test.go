@@ -147,7 +147,7 @@ func TestBuildAuditLogRecordUsesHeaderEmail(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/api/session/fetch", strings.NewReader(`{"stream":true}`))
 	req.Header.Set("X-Account-Email", "Tester@example.com")
 	req.RemoteAddr = "127.0.0.1:56789"
-	record := buildAuditLogRecord(req, []byte(`{"stream":true}`), http.StatusOK, time.Now())
+	record := buildAuditLogRecord(req, []byte(`{"stream":true}`), nil, http.StatusOK, time.Now())
 	if record.AccountEmail != "tester@example.com" {
 		t.Fatalf("AccountEmail = %q", record.AccountEmail)
 	}
@@ -156,6 +156,321 @@ func TestBuildAuditLogRecordUsesHeaderEmail(t *testing.T) {
 	}
 	if record.OperationName != "获取 Session JSON" {
 		t.Fatalf("OperationName = %q", record.OperationName)
+	}
+}
+
+func TestBuildAuditLogRecordMarksBusinessFailureFromResponseBody(t *testing.T) {
+	req := httptest.NewRequest(http.MethodPost, "/api/gopay/full-link", strings.NewReader(`{"phone_number":"18120322232"}`))
+	responseBody := []byte(`{"ok":false,"stage":"payment_pin_all_failed","error":"所有支付 PIN 候选码均失败","payment_reference_id":"pay-ref-1"}`)
+
+	record := buildAuditLogRecord(req, []byte(`{"phone_number":"18120322232"}`), responseBody, http.StatusOK, time.Now())
+
+	if record.OperationResult != "failed" {
+		t.Fatalf("OperationResult = %q, want failed", record.OperationResult)
+	}
+	if !strings.Contains(record.ErrorMessage, "payment_pin_all_failed") {
+		t.Fatalf("ErrorMessage = %q, want stage", record.ErrorMessage)
+	}
+	summary, _ := record.Metadata["response_summary"].(map[string]any)
+	if summary["stage"] != "payment_pin_all_failed" {
+		t.Fatalf("response_summary.stage = %#v", summary["stage"])
+	}
+	if summary["payment_reference_id"] != "pay-ref-1" {
+		t.Fatalf("response_summary.payment_reference_id = %#v", summary["payment_reference_id"])
+	}
+}
+
+func TestBuildAuditLogRecordExtractsOperationFlowAndPaymentVoucher(t *testing.T) {
+	oldConfig := config
+	config = appConfig{}
+	t.Cleanup(func() { config = oldConfig })
+
+	req := httptest.NewRequest(http.MethodPost, "/api/gopay/full-link", strings.NewReader(`{"phone_number":"18120322232","pin":"123456"}`))
+	responseBody := []byte(`{
+		"ok": true,
+		"stage": "gopay_complete",
+		"strategy": "full-link",
+		"account_id": "acct-123",
+		"stages": [
+			{"name":"generate-checkout","ok":true,"status":200},
+			{"name":"pin-enum","ok":true,"pin":"123456"},
+			{"name":"validate-pin","ok":true,"message":"支付完成"}
+		],
+		"diagnostics": {"phone_e164":"+8618120322232"},
+		"linking_diagnostics": {"account_source":"checkout_url_direct"},
+		"payment_voucher": {
+			"payment_reference_id":"pay-ref-123",
+			"transaction_id":"tx-123",
+			"transaction_status":"settlement",
+			"status_code":"200",
+			"order_id":"order-123",
+			"gross_amount":"20.00",
+			"currency":"IDR"
+		}
+	}`)
+
+	record := buildAuditLogRecord(req, []byte(`{"phone_number":"18120322232","pin":"123456"}`), responseBody, http.StatusOK, time.Now())
+
+	flow, _ := record.Metadata["operation_flow"].(map[string]any)
+	if flow["stage"] != "gopay_complete" {
+		t.Fatalf("operation_flow.stage = %#v", flow["stage"])
+	}
+	stages, _ := flow["stages"].([]any)
+	if len(stages) != 3 {
+		t.Fatalf("operation_flow.stages length = %d, want 3", len(stages))
+	}
+	pinStage, _ := stages[1].(map[string]any)
+	if pinStage["pin"] != maskedAuditValue {
+		t.Fatalf("operation_flow pin = %#v, want masked", pinStage["pin"])
+	}
+	voucher, _ := record.Metadata["payment_voucher"].(map[string]any)
+	if voucher["payment_reference_id"] != "pay-ref-123" {
+		t.Fatalf("payment_voucher.payment_reference_id = %#v", voucher["payment_reference_id"])
+	}
+	if voucher["transaction_id"] != "tx-123" {
+		t.Fatalf("payment_voucher.transaction_id = %#v", voucher["transaction_id"])
+	}
+}
+
+func TestBuildAuditLogRecordKeepsSensitiveAnalysisDataWhenEnabled(t *testing.T) {
+	oldConfig := config
+	config = appConfig{AuditCaptureSensitive: true}
+	t.Cleanup(func() { config = oldConfig })
+
+	req := httptest.NewRequest(http.MethodPost, "/api/gopay/full-link", strings.NewReader(`{"access_token":"tok-analysis","otp":"654321","pin":"123456"}`))
+	responseBody := []byte(`{
+		"ok": true,
+		"stage": "gopay_complete",
+		"stages": [{"name":"otp-enum","ok":true,"otp":"654321"}],
+		"payment_voucher": {"payment_reference_id":"pay-ref-123","payment_pin":"123456"},
+		"gopay_payment_pin_token": {"token":"pin-token-secret"}
+	}`)
+
+	record := buildAuditLogRecord(req, []byte(`{"access_token":"tok-analysis","otp":"654321","pin":"123456"}`), responseBody, http.StatusOK, time.Now())
+
+	detail, _ := record.OperationDetail.(map[string]any)
+	if detail["access_token"] != "tok-analysis" {
+		t.Fatalf("operation_detail.access_token = %#v, want raw analysis token", detail["access_token"])
+	}
+	flow, _ := record.Metadata["operation_flow"].(map[string]any)
+	stages, _ := flow["stages"].([]any)
+	otpStage, _ := stages[0].(map[string]any)
+	if otpStage["otp"] != "654321" {
+		t.Fatalf("operation_flow otp = %#v, want raw otp", otpStage["otp"])
+	}
+	responsePayload, _ := record.Metadata["response_payload"].(map[string]any)
+	pinToken, _ := responsePayload["gopay_payment_pin_token"].(map[string]any)
+	if pinToken["token"] != "pin-token-secret" {
+		t.Fatalf("response_payload.gopay_payment_pin_token.token = %#v", pinToken["token"])
+	}
+	if record.Metadata["sensitive_capture"] != true {
+		t.Fatalf("sensitive_capture = %#v, want true", record.Metadata["sensitive_capture"])
+	}
+}
+
+func TestBuildAuditLogRecordIncludesAutoTriggerFlowFields(t *testing.T) {
+	req := httptest.NewRequest(http.MethodPost, "/api/gopay/auto-trigger-check", strings.NewReader(`{"source":"verification","submitted":false}`))
+	responseBody := []byte(`{
+		"ok": true,
+		"stage": "auto_trigger_waiting",
+		"ready": false,
+		"reason": "waiting_for_checkout_submit",
+		"checkout_key": "https://pay.openai.com/c/pay/cs_test_123",
+		"conditions": {"submitted": false, "gopay_detected": true}
+	}`)
+
+	record := buildAuditLogRecord(req, []byte(`{"source":"verification","submitted":false}`), responseBody, http.StatusOK, time.Now())
+
+	flow, _ := record.Metadata["operation_flow"].(map[string]any)
+	if flow["reason"] != "waiting_for_checkout_submit" {
+		t.Fatalf("operation_flow.reason = %#v", flow["reason"])
+	}
+	if flow["ready"] != false {
+		t.Fatalf("operation_flow.ready = %#v", flow["ready"])
+	}
+	if _, ok := flow["conditions"].(map[string]any); !ok {
+		t.Fatalf("operation_flow.conditions type = %T", flow["conditions"])
+	}
+	summary, _ := record.Metadata["response_summary"].(map[string]any)
+	if summary["reason"] != "waiting_for_checkout_submit" {
+		t.Fatalf("response_summary.reason = %#v", summary["reason"])
+	}
+}
+
+func TestGopayAutoTriggerDecisionRequiresCheckoutGopayAndZeroDue(t *testing.T) {
+	req := gopayAutoTriggerCheckRequest{
+		Source:      "checkout-auto-fill",
+		CheckoutURL: "https://pay.openai.com/c/pay/cs_live_123#fragment",
+		PageText:    "今日应付合计 IDR 0.00 支付方式 银行卡 GoPay 然后在优惠券过期后，每月 IDR 349,000.00",
+		Submitted:   true,
+	}
+
+	decision := evaluateGopayAutoTrigger(req, true, false)
+
+	if !decision.Ready {
+		t.Fatalf("Ready = false, reason = %q, conditions = %#v", decision.Reason, decision.Conditions)
+	}
+	if decision.CheckoutKey != "https://pay.openai.com/c/pay/cs_live_123" {
+		t.Fatalf("CheckoutKey = %q", decision.CheckoutKey)
+	}
+
+	req.Submitted = false
+	decision = evaluateGopayAutoTrigger(req, true, false)
+	if decision.Ready {
+		t.Fatalf("Ready = true before checkout submit")
+	}
+	if decision.Reason != "waiting_for_checkout_submit" {
+		t.Fatalf("Reason = %q, want waiting_for_checkout_submit", decision.Reason)
+	}
+
+	req.Submitted = true
+	req.PageText = "今日应付合计 IDR 349,000.00 支付方式 银行卡 GoPay"
+	decision = evaluateGopayAutoTrigger(req, true, false)
+	if decision.Ready {
+		t.Fatalf("Ready = true for non-zero due amount")
+	}
+	if decision.Reason != "today_due_not_zero" {
+		t.Fatalf("Reason = %q, want today_due_not_zero", decision.Reason)
+	}
+
+	req.PageText = "今日应付合计 IDR 0.00 支付方式 银行卡"
+	decision = evaluateGopayAutoTrigger(req, true, false)
+	if decision.Ready {
+		t.Fatalf("Ready = true when GoPay is missing")
+	}
+	if decision.Reason != "gopay_not_detected" {
+		t.Fatalf("Reason = %q, want gopay_not_detected", decision.Reason)
+	}
+}
+
+func TestMarkGopayAutoTriggerReadyDoesNotClaimTrigger(t *testing.T) {
+	oldConfig := config
+	config = appConfig{AuditCaptureSensitive: true}
+	t.Cleanup(func() {
+		config = oldConfig
+		gopayAutoTriggerMu.Lock()
+		gopayAutoTriggeredCheckout = map[string]time.Time{}
+		gopayAutoTriggerMu.Unlock()
+	})
+	gopayAutoTriggerMu.Lock()
+	gopayAutoTriggeredCheckout = map[string]time.Time{}
+	gopayAutoTriggerMu.Unlock()
+
+	req := gopayAutoTriggerCheckRequest{
+		Source:      "checkout-auto-fill",
+		CheckoutURL: "https://pay.openai.com/c/pay/cs_live_once#fragment",
+		PageText:    "今日应付合计 IDR 0.00 支付方式 GoPay",
+		Submitted:   true,
+	}
+
+	first := markGopayAutoTriggerReady(req)
+	second := markGopayAutoTriggerReady(req)
+
+	if !first.Ready || first.AlreadyTriggered {
+		t.Fatalf("first decision = %#v, want ready and not already triggered", first)
+	}
+	if !second.Ready || second.AlreadyTriggered {
+		t.Fatalf("second decision = %#v, want ready and not already triggered before fill is claimed", second)
+	}
+	if !claimGopayAutoTrigger(req.CheckoutURL) {
+		t.Fatal("first claimGopayAutoTrigger returned false, want true")
+	}
+	third := markGopayAutoTriggerReady(req)
+	if third.Ready || !third.AlreadyTriggered {
+		t.Fatalf("third decision = %#v, want not ready and already triggered after fill claim", third)
+	}
+	if claimGopayAutoTrigger(req.CheckoutURL) {
+		t.Fatal("second claimGopayAutoTrigger returned true, want false")
+	}
+}
+
+func TestCheckoutResolveCandidateURLsReturnsRecentPageTargets(t *testing.T) {
+	targets := []cdpTarget{
+		{Type: "iframe", URL: "https://js.stripe.com/v3/elements-inner-payment"},
+		{Type: "page", URL: "https://chatgpt.com/"},
+		{Type: "page", URL: "https://app.midtrans.com/snap/v4/redirection/acct-123#/payment"},
+	}
+
+	urls := checkoutResolveCandidateURLs(targets)
+
+	if len(urls) != 2 {
+		t.Fatalf("candidate urls length = %d, want 2", len(urls))
+	}
+	if urls[0] != "https://app.midtrans.com/snap/v4/redirection/acct-123#/payment" {
+		t.Fatalf("urls[0] = %q", urls[0])
+	}
+	if urls[1] != "https://chatgpt.com/" {
+		t.Fatalf("urls[1] = %q", urls[1])
+	}
+}
+
+func TestMidtransLinkingAccountIDFromURL(t *testing.T) {
+	rawURL := "https://app.midtrans.com/snap/v4/redirection/b070d7fb-6d98-4cbd-99df-fa13843415ba#/gopay-tokenization/linking"
+
+	accountID := midtransLinkingAccountID(rawURL)
+
+	if accountID != "b070d7fb-6d98-4cbd-99df-fa13843415ba" {
+		t.Fatalf("accountID = %q", accountID)
+	}
+}
+
+func TestMidtransRedirectionAccountIDFromBaseURL(t *testing.T) {
+	rawURL := "https://app.midtrans.com/snap/v4/redirection/b070d7fb-6d98-4cbd-99df-fa13843415ba"
+
+	accountID := midtransRedirectionAccountID(rawURL)
+
+	if accountID != "b070d7fb-6d98-4cbd-99df-fa13843415ba" {
+		t.Fatalf("accountID = %q", accountID)
+	}
+}
+
+func TestMidtransLinkingAccountIDRejectsNonLinkingURL(t *testing.T) {
+	rawURL := "https://app.midtrans.com/snap/v4/redirection/b070d7fb-6d98-4cbd-99df-fa13843415ba#/payment"
+
+	accountID := midtransLinkingAccountID(rawURL)
+
+	if accountID != "" {
+		t.Fatalf("accountID = %q, want empty", accountID)
+	}
+}
+
+func TestMidtransLinkingFillOutcomeRejectsClickedWithWrongCountry(t *testing.T) {
+	ok, stage := midtransLinkingFillOutcome(map[string]any{
+		"clicked":           true,
+		"country_code":      "86",
+		"page_text_snippet": "Link GoPay account with OpenAI LLC. Phone number: +62 Link and pay",
+		"found": map[string]any{
+			"country": false,
+			"phone":   true,
+			"button":  true,
+		},
+	})
+
+	if ok {
+		t.Fatal("ok = true, want false when country code is not confirmed")
+	}
+	if stage != "midtrans_country_code_not_selected" {
+		t.Fatalf("stage = %q, want midtrans_country_code_not_selected", stage)
+	}
+}
+
+func TestMidtransLinkingFillOutcomeAcceptsVerifiedCountry(t *testing.T) {
+	ok, stage := midtransLinkingFillOutcome(map[string]any{
+		"clicked":          true,
+		"country_code":     "86",
+		"country_verified": true,
+		"found": map[string]any{
+			"country": true,
+			"phone":   true,
+			"button":  true,
+		},
+	})
+
+	if !ok {
+		t.Fatal("ok = false, want true when country, phone and button are confirmed")
+	}
+	if stage != "midtrans_linking_submitted" {
+		t.Fatalf("stage = %q, want midtrans_linking_submitted", stage)
 	}
 }
 
@@ -934,6 +1249,57 @@ func TestGopayReuseStagesWithPaymentShowsCompletion(t *testing.T) {
 	}
 	if !strings.Contains(successMessage, "支付完成") {
 		t.Fatalf("success message = %q, want it to contain 支付完成", successMessage)
+	}
+}
+
+func TestCompleteGopayFullLinkPaymentContinuesAfterNewBinding(t *testing.T) {
+	response := map[string]any{
+		"ok":     false,
+		"stages": []map[string]any{},
+	}
+	var gotGUID string
+	var gotPIN string
+
+	completeGopayFullLinkPayment(
+		context.Background(),
+		response,
+		"snap-guid-new",
+		"86",
+		"18120322232",
+		"654321",
+		gopayLinkingResolution{},
+		gopayFullLinkPaymentDeps{
+			completePayment: func(_ context.Context, guid string, pin string) (gopayPaymentResolution, error) {
+				gotGUID = guid
+				gotPIN = pin
+				return gopayPaymentResolution{
+					PaymentReferenceID: "pay-ref-123",
+					TransactionID:      "tx-123",
+					PinUsed:            "654321",
+					MidtransStatus:     map[string]any{"transaction_status": "settlement"},
+				}, nil
+			},
+		},
+	)
+
+	if gotGUID != "snap-guid-new" {
+		t.Fatalf("payment guid = %q, want snap-guid-new", gotGUID)
+	}
+	if gotPIN != "654321" {
+		t.Fatalf("payment pin = %q, want 654321", gotPIN)
+	}
+	if response["ok"] != true {
+		t.Fatalf("ok = %#v, want true", response["ok"])
+	}
+	if response["stage"] != "gopay_complete" {
+		t.Fatalf("stage = %#v, want gopay_complete", response["stage"])
+	}
+	summary, _ := response["summary"].(map[string]any)
+	if summary["payment_reference_id"] != "pay-ref-123" {
+		t.Fatalf("payment_reference_id = %#v", summary["payment_reference_id"])
+	}
+	if summary["transaction_id"] != "tx-123" {
+		t.Fatalf("transaction_id = %#v", summary["transaction_id"])
 	}
 }
 

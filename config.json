@@ -3,6 +3,7 @@
   "checkout_approve_endpoint": "",
   "checkout_cookie": "",
   "checkout_user_agent": "",
+  "audit_capture_sensitive": true,
   "local_mock_base_url": "",
   "midtrans_mock_base_url": "https://app.midtrans.com",
   "gopay_gwa_mock_base_url": "https://gwa.gopayapi.com",

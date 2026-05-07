@@ -23,6 +23,19 @@
         "error-handling",
         "detailed-logging"
       ]
+    },
+    {
+      "name": "ui-ux-pro-max",
+      "path": "../skills/ui-ux-pro-max/SKILL.md",
+      "source": "https://github.com/nextlevelbuilder/ui-ux-pro-max-skill",
+      "capabilities": [
+        "ui-ux-layout-analysis",
+        "responsive-review",
+        "spacing-and-alignment-audit",
+        "accessibility-checklist",
+        "visual-consistency-review",
+        "implementation-planning"
+      ]
     }
   ],
   "defaults": {

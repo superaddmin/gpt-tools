@@ -34,21 +34,37 @@ async function readTaskInput() {
   const args = process.argv.slice(2);
   const jsonIndex = args.indexOf("--json");
   if (jsonIndex >= 0 && args[jsonIndex + 1]) {
-    return JSON.parse(args[jsonIndex + 1]);
+    return parseTaskJSON(args[jsonIndex + 1], "--json 参数");
   }
 
   const fileIndex = args.indexOf("--file");
   if (fileIndex >= 0 && args[fileIndex + 1]) {
     const fs = await import("node:fs/promises");
-    const content = await fs.readFile(args[fileIndex + 1], "utf8");
-    return JSON.parse(content);
+    const filePath = args[fileIndex + 1];
+    const content = await fs.readFile(filePath, "utf8");
+    return parseTaskJSON(content, `文件 ${filePath}`);
   }
 
   const stdin = await readStdin();
   if (!stdin.trim()) {
     throw new Error("缺少输入，请使用 --json、--file 或标准输入提供任务 JSON");
   }
-  return JSON.parse(stdin);
+  return parseTaskJSON(stdin, "标准输入");
+}
+
+/**
+ * 解析任务 JSON 文本并附带来源上下文。
+ * @param {string} content
+ * @param {string} source
+ * @returns {object}
+ */
+function parseTaskJSON(content, source) {
+  try {
+    return JSON.parse(content);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    throw new Error(`${source} JSON解析失败: ${message}`);
+  }
 }
 
 /**

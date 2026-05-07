@@ -874,8 +874,9 @@ autoFillCheckoutBtn?.addEventListener("click", async () => {
         "地址: " + (a.line1 || "") + "\n" +
         "城市: " + (a.city || "") + ", " + (a.state || "") + " " + (a.zip_code || "") + "\n\n" +
         "填入结果: " + JSON.stringify(fields);
-      showAutoFillNotice("自动填地址完成", "成功", msg, data.submitted === false ? "本次只填写表单，没有点击订阅。" : "", "");
+      showAutoFillNotice("自动填地址完成", "成功", msg, "本次只填写表单。请在支付页面点击订阅，系统会在提交后自动触发 GoPay 一键绑定。", "");
       setText(autoFillCheckoutBtn, "已填入 ✓");
+      startCheckoutSubmitWatcher(data);
     } else {
       showAutoFillNotice("自动填地址失败", "错误", data.error || "自动填地址失败", "请先在无痕窗口中手动进入 ChatGPT Plus 升级结账页面。", "error");
     }
@@ -904,6 +905,11 @@ const gopayLatency = document.querySelector("#gopayLatency");
 const gopayLinkStatus = document.querySelector("#gopayLinkStatus");
 const gopayRefID = document.querySelector("#gopayRefID");
 const gopayOutput = document.querySelector("#gopayOutput");
+let gopayPaymentFlowRunning = false;
+let gopayAutoTriggerRunning = false;
+let gopayCheckoutWatcherActive = false;
+let checkoutSubmitWatcherId = 0;
+const gopayAutoTriggeredCheckoutKeys = new Set();
 
 const gopayStepItems = Array.from(document.querySelectorAll("[data-gopay-step]"));
 const gopayStepTexts = {
@@ -1068,15 +1074,307 @@ function startGopayOTPAutoCapture() {
   return function () { stop = true; };
 }
 
-gopayLinkBtn?.addEventListener("click", async function () {
-  var accountId = (gopayAccountId?.value || "").trim();
+function checkoutAutoTriggerKey(rawURL) {
+  var value = (rawURL || "").trim();
+  if (!value) return "";
+  try {
+    var parsed = new URL(value);
+    if (parsed.hostname.toLowerCase() !== "pay.openai.com") return "";
+    if (!parsed.pathname.startsWith("/c/pay/cs_")) return "";
+    return parsed.protocol + "//" + parsed.host + parsed.pathname;
+  } catch (_err) {
+    return "";
+  }
+}
+
+function checkoutAutoFillProbeText(data) {
+  var chunks = [];
+  ["probe_after_gopay", "probe_fallback", "probe"].forEach(function (key) {
+    var text = data?.[key]?.text;
+    if (typeof text === "string" && text.trim()) {
+      chunks.push(text.trim());
+    }
+  });
+  return chunks.join(" ");
+}
+
+function checkoutURLIndicatesSubmitted(currentURL, checkoutKey) {
+  var value = (currentURL || "").trim();
+  if (!value) return false;
+  try {
+    var parsed = new URL(value);
+    var host = parsed.hostname.toLowerCase();
+    var path = parsed.pathname.toLowerCase();
+    if (host.includes("midtrans") || host.includes("gopay")) return true;
+    if (path.includes("/checkout/verify") || path.includes("/snap/") || path.includes("/redirection/")) return true;
+    var currentKey = checkoutAutoTriggerKey(value);
+    if (checkoutKey && currentKey && currentKey !== checkoutKey) return true;
+    if (checkoutKey && !currentKey && host !== "pay.openai.com") return true;
+    return false;
+  } catch (_err) {
+    var lower = value.toLowerCase();
+    return lower.includes("midtrans.com") || lower.includes("app.gopay") || lower.includes("/snap/");
+  }
+}
+
+function midtransLinkingAccountID(currentURL) {
+  var value = (currentURL || "").trim();
+  if (!value) return "";
+  try {
+    var parsed = new URL(value);
+    if (!parsed.hostname.toLowerCase().includes("midtrans.com")) return "";
+    if (!parsed.hash.toLowerCase().includes("gopay-tokenization/linking")) return "";
+    var match = parsed.pathname.match(/\/snap\/v4\/redirection\/([^/?#]+)/i);
+    return match ? decodeURIComponent(match[1]) : "";
+  } catch (_err) {
+    return "";
+  }
+}
+
+function midtransRedirectionAccountID(currentURL) {
+  var value = (currentURL || "").trim();
+  if (!value) return "";
+  try {
+    var parsed = new URL(value);
+    if (!parsed.hostname.toLowerCase().includes("midtrans.com")) return "";
+    var match = parsed.pathname.match(/\/snap\/v4\/redirection\/([^/?#]+)/i);
+    return match ? decodeURIComponent(match[1]) : "";
+  } catch (_err) {
+    return "";
+  }
+}
+
+function appendCheckoutWatcherEvent(method, summary) {
+  if (gopayMonitor) {
+    gopayMonitor.hidden = false;
+  }
+  if (typeof appendMonitorEvent === "function") {
+    appendMonitorEvent({ domain: "Log", method: method, summary: summary, ts: Date.now() });
+  }
+}
+
+function prepareCheckoutWatcherMonitor() {
+  if (gopayMonitor) {
+    gopayMonitor.hidden = false;
+  }
+  if (!gopayMonitorRunning && !sessionMonitorAbortController) {
+    clearMonitor();
+  }
+  if (monitorBadge) {
+    monitorBadge.textContent = "等待订阅";
+    monitorBadge.className = "badge";
+  }
+}
+
+async function checkGopayAutoTriggerReady(payload) {
+  var response = await fetch("/api/gopay/auto-trigger-check", {
+    method: "POST",
+    headers: buildRequestHeaders(),
+    body: JSON.stringify(payload),
+  });
+  var data = await response.json();
+  if (!response.ok) {
+    throw new Error(data.error || "GoPay 自动触发检查失败");
+  }
+  return data;
+}
+
+async function fillCurrentMidtransLinkingPage(targetURL, checkoutURL) {
+  var countryCode = (gopayCountryCode?.value || "86").trim();
+  var phoneNumber = (gopayPhone?.value || "18120322232").trim();
+  var response = await fetch("/api/gopay/midtrans-linking-fill", {
+    method: "POST",
+    headers: buildRequestHeaders(),
+    body: JSON.stringify({
+      target_url: targetURL,
+      checkout_url: checkoutURL || "",
+      country_code: countryCode,
+      phone_number: phoneNumber,
+    }),
+  });
+  var data = await response.json();
+  if (!response.ok) {
+    throw new Error(data.error || "Midtrans GoPay 页面填充失败");
+  }
+  return data;
+}
+
+function startCheckoutSubmitWatcher(autoFillData) {
+  var checkoutURL = autoFillData?.current_url || autoFillData?.expected_url || latestOpenedCheckoutURL;
+  var checkoutKey = checkoutAutoTriggerKey(checkoutURL);
+  var pageText = checkoutAutoFillProbeText(autoFillData);
+
+  if (!checkoutKey) {
+    appendCheckoutWatcherEvent("auto-trigger-skip", "未识别到 pay.openai.com checkout URL，跳过自动触发监控");
+    return;
+  }
+  if (gopayAutoTriggeredCheckoutKeys.has(checkoutKey)) {
+    appendCheckoutWatcherEvent("auto-trigger-skip", "该 checkout 已触发过 GoPay 一键绑定，跳过重复监控");
+    return;
+  }
+
+  checkoutSubmitWatcherId += 1;
+  var watcherId = checkoutSubmitWatcherId;
+  var attempts = 0;
+  var maxAttempts = 45;
+  var lastCurrentURL = "";
+  var watcherButtonText = gopayLinkBtn ? gopayLinkBtn.textContent : "";
+  var finishWatcher = function () {
+    if (watcherId !== checkoutSubmitWatcherId) return;
+    gopayCheckoutWatcherActive = false;
+    if (gopayLinkBtn && !gopayPaymentFlowRunning) {
+      gopayLinkBtn.disabled = false;
+      setText(gopayLinkBtn, watcherButtonText || "GoPay 一键绑定");
+      gopayLinkBtn.removeAttribute("title");
+    }
+  };
+
+  prepareCheckoutWatcherMonitor();
+  gopayCheckoutWatcherActive = true;
+  if (gopayLinkBtn) {
+    gopayLinkBtn.disabled = true;
+    gopayLinkBtn.title = "自动监控已接管本次 checkout，请等待 Midtrans linking 页面出现。";
+    setText(gopayLinkBtn, "自动监控中...");
+  }
+  appendCheckoutWatcherEvent("auto-trigger-watch", "已开始等待支付页订阅提交：" + checkoutKey);
+
+  void checkGopayAutoTriggerReady({
+    source: "checkout-auto-fill-watch",
+    checkout_url: checkoutURL,
+    page_text: pageText,
+    submitted: false,
+  }).then(function (decision) {
+    appendCheckoutWatcherEvent("auto-trigger-wait", "自动触发判定：" + (decision.reason || "waiting"));
+  }).catch(function (error) {
+    appendCheckoutWatcherEvent("auto-trigger-check-error", error.message || "自动触发预检查失败");
+  });
+
+  var poll = async function () {
+    if (watcherId !== checkoutSubmitWatcherId || gopayAutoTriggeredCheckoutKeys.has(checkoutKey)) {
+      finishWatcher();
+      return;
+    }
+    attempts += 1;
+
+    try {
+      var response = await fetch("/api/checkout/resolve-target", {
+        method: "POST",
+        headers: buildRequestHeaders(),
+        body: JSON.stringify({ opened_url: checkoutURL }),
+      });
+      var data = await response.json();
+      var currentURL = data.current_url || data.target?.url || "";
+      var candidateURLs = Array.isArray(data.candidate_urls) ? data.candidate_urls : [];
+      var submittedCandidateURL = candidateURLs.find(function (url) {
+        return checkoutURLIndicatesSubmitted(url, checkoutKey);
+      }) || "";
+      if (!currentURL && submittedCandidateURL) {
+        currentURL = submittedCandidateURL;
+      }
+      var linkingURL = midtransRedirectionAccountID(currentURL) ? currentURL : "";
+      if (!linkingURL) {
+        linkingURL = candidateURLs.find(function (url) {
+          return !!midtransRedirectionAccountID(url);
+        }) || "";
+      }
+      if (currentURL && currentURL !== lastCurrentURL) {
+        lastCurrentURL = currentURL;
+        appendCheckoutWatcherEvent("checkout-url", currentURL);
+      }
+
+      if (response.ok && (data.ok || submittedCandidateURL) && checkoutURLIndicatesSubmitted(currentURL, checkoutKey)) {
+        appendCheckoutWatcherEvent("checkout-submitted", "检测到支付页已提交，开始 GoPay 自动触发检查");
+        var decision = await checkGopayAutoTriggerReady({
+          source: "checkout-submit-watch",
+          checkout_url: checkoutURL,
+          page_text: pageText,
+          submitted: true,
+        });
+
+        if (decision.ready) {
+          if (monitorBadge) {
+            monitorBadge.textContent = "自动触发";
+            monitorBadge.className = "badge";
+          }
+          if (!linkingURL) {
+            appendCheckoutWatcherEvent("auto-trigger-wait", "支付页已提交，继续等待 Midtrans GoPay redirection 页面");
+            if (monitorBadge) {
+              monitorBadge.textContent = "等 Midtrans";
+              monitorBadge.className = "badge neutral";
+            }
+          } else if (!gopayAutoTriggerRunning) {
+            appendCheckoutWatcherEvent("auto-trigger-ready", "条件满足，填写当前 Midtrans GoPay 页面：" + midtransRedirectionAccountID(linkingURL));
+            gopayAutoTriggerRunning = true;
+            try {
+              var fillResult = await fillCurrentMidtransLinkingPage(linkingURL, checkoutURL);
+              if (gopayOutput) setText(gopayOutput, JSON.stringify(fillResult, null, 2));
+              if (fillResult.ok) {
+                gopayAutoTriggeredCheckoutKeys.add(checkoutKey);
+                appendCheckoutWatcherEvent("midtrans-linking-fill", "已填写 +" + (fillResult.country_code || "86") + " / " + (fillResult.phone_number || "18120322232") + " 并提交 Link and pay");
+                if (monitorBadge) {
+                  monitorBadge.textContent = "已提交绑定";
+                  monitorBadge.className = "badge";
+                }
+                startGopayOTPAutoCapture();
+                finishWatcher();
+                return;
+              } else {
+                appendCheckoutWatcherEvent("midtrans-linking-fill", "页面填充未完成：" + (fillResult.stage || fillResult.error || "unknown"));
+                if (monitorBadge) {
+                  monitorBadge.textContent = "继续等待";
+                  monitorBadge.className = "badge neutral";
+                }
+              }
+            } finally {
+              gopayAutoTriggerRunning = false;
+            }
+          }
+          if (gopayAutoTriggeredCheckoutKeys.has(checkoutKey)) return;
+        }
+
+        if (!decision.ready) {
+          appendCheckoutWatcherEvent("auto-trigger-skip", "自动触发检查未通过：" + (decision.reason || "unknown"));
+          if (monitorBadge) {
+            monitorBadge.textContent = "未触发";
+            monitorBadge.className = "badge neutral";
+          }
+          finishWatcher();
+          return;
+        }
+      }
+    } catch (error) {
+      appendCheckoutWatcherEvent("auto-trigger-error", error.message || "自动触发监控失败");
+    }
+
+    if (attempts < maxAttempts) {
+      window.setTimeout(poll, 2000);
+    } else {
+      appendCheckoutWatcherEvent("auto-trigger-timeout", "等待订阅提交超时，未自动触发 GoPay 一键绑定");
+      if (monitorBadge) {
+        monitorBadge.textContent = "等待超时";
+        monitorBadge.className = "badge neutral";
+      }
+      finishWatcher();
+    }
+  };
+
+  window.setTimeout(poll, 1500);
+}
+
+async function runGopayFullLinkPayment(options) {
+  options = options || {};
+  var triggerSource = options.triggerSource || "manual";
+  if (gopayPaymentFlowRunning) {
+    showAutoFillNotice("GoPay 付款进行中", "提示", "当前一键绑定付款流程仍在执行，请等待本次流程完成。", "", "");
+    return null;
+  }
+
   var countryCode = (gopayCountryCode?.value || "86").trim();
   var phoneNumber = (gopayPhone?.value || "18120322232").trim();
   var otpChannel = gopayOTPChannel?.value || "whatsapp";
   var otpCode = (gopayOTPInput?.value || "").trim();
   var pinCode = (gopayPINCodeInput?.value || "").trim();
   var accessToken = extractAccessToken(fields.token?.value || "");
-  var useFullLink = true;
 
   if (!phoneNumber) {
     showAutoFillNotice("GoPay 绑定失败", "错误", "请输入手机号。", "", "error");
@@ -1084,9 +1382,11 @@ gopayLinkBtn?.addEventListener("click", async function () {
   }
 
   resetGopaySteps();
-  gopayLinkBtn.disabled = true;
-  var origText = gopayLinkBtn.textContent;
-  setText(gopayLinkBtn, "提取 Session 中...");
+  gopayPaymentFlowRunning = true;
+  if (gopayLinkBtn) gopayLinkBtn.disabled = true;
+  if (gopayMonitorBtn) gopayMonitorBtn.disabled = true;
+  var origText = gopayLinkBtn ? gopayLinkBtn.textContent : "";
+  setText(gopayLinkBtn, triggerSource === "auto-trigger" ? "自动触发中..." : "提取 Session 中...");
 
   var startedAt = performance.now();
 
@@ -1207,6 +1507,7 @@ gopayLinkBtn?.addEventListener("click", async function () {
       if (gopayBadge) { setText(gopayBadge, "失败"); gopayBadge.className = "badge error"; }
     }
 
+    return data;
   } catch (err) {
     var elapsed = Math.round(performance.now() - startedAt);
     if (gopayLatency) setText(gopayLatency, elapsed + "ms");
@@ -1214,10 +1515,22 @@ gopayLinkBtn?.addEventListener("click", async function () {
     if (gopayOutput) setText(gopayOutput, JSON.stringify({ error: err.message }));
     if (gopayBadge) { setText(gopayBadge, "错误"); gopayBadge.className = "badge error"; }
     setGopayStep("linking", "error", "网络错误: " + err.message);
+    return null;
   } finally {
-    gopayLinkBtn.disabled = false;
+    gopayPaymentFlowRunning = false;
+    if (gopayLinkBtn) gopayLinkBtn.disabled = false;
+    if (gopayMonitorBtn) gopayMonitorBtn.disabled = false;
     setText(gopayLinkBtn, origText);
   }
+}
+
+gopayLinkBtn?.addEventListener("click", async function () {
+  if (gopayCheckoutWatcherActive) {
+    appendCheckoutWatcherEvent("manual-full-link-blocked", "自动监控已接管本次 checkout，已阻止手动 full-link 路径");
+    showAutoFillNotice("自动监控运行中", "提示", "当前 checkout 已由自动监控接管。请在支付页点击订阅后等待程序自动填写 Midtrans GoPay 页面。", "手动 GoPay 一键绑定会新建后端 full-link 流程，容易造成回跳状态错乱。", "");
+    return;
+  }
+  await runGopayFullLinkPayment({ triggerSource: "manual" });
 });
 
 // =================================
@@ -1363,6 +1676,11 @@ function escapeHTML(str) {
 
 gopayMonitorBtn?.addEventListener("click", async function () {
   if (!gopayMonitor) return;
+
+  if (gopayPaymentFlowRunning) {
+    showAutoFillNotice("GoPay 付款进行中", "提示", "一键绑定付款流程运行期间暂不启动或停止流程监控，避免中断付款状态。", "", "");
+    return;
+  }
 
   if (gopayMonitorRunning) {
     if (gopayMonitorAbortController) {

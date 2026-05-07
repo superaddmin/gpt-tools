@@ -263,6 +263,87 @@ textarea {
   gap: 8px;
 }
 
+.flow-nav,
+.mobile-anchor-nav {
+  border: 1px solid rgba(30, 38, 80, 0.55);
+  border-radius: 8px;
+  background: rgba(15, 22, 53, 0.52);
+  box-shadow: var(--panel-shadow-soft);
+  backdrop-filter: blur(18px);
+}
+
+.flow-nav {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  margin-bottom: 18px;
+  padding: 12px 14px;
+}
+
+.flow-nav > span {
+  flex-shrink: 0;
+  color: var(--success);
+  font-size: 12px;
+  font-weight: 900;
+}
+
+.flow-nav ol {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.flow-nav li {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.flow-nav li:not(:last-child)::after {
+  content: "→";
+  color: var(--muted);
+}
+
+.flow-nav a,
+.mobile-anchor-nav a {
+  color: #d7ecff;
+  text-decoration: none;
+}
+
+.flow-nav a:hover,
+.mobile-anchor-nav a:hover {
+  text-decoration: underline;
+}
+
+.mobile-anchor-nav {
+  display: none;
+  gap: 8px;
+  margin-bottom: 16px;
+  padding: 8px;
+}
+
+.mobile-anchor-nav a {
+  display: inline-flex;
+  min-width: 0;
+  min-height: 40px;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: rgba(30, 38, 80, 0.46);
+  padding: 8px 10px;
+  text-align: center;
+  font-size: 12px;
+  font-weight: 800;
+  line-height: 1.2;
+}
+
 .status-chip {
   display: inline-flex;
   min-height: 34px;
@@ -302,6 +383,37 @@ textarea {
 
 .result-panel {
   grid-area: result;
+  display: flex;
+  flex-direction: column;
+}
+
+.result-panel .panel-head {
+  order: 0;
+  margin-bottom: 10px;
+}
+
+.result-panel .alert-box {
+  order: 1;
+}
+
+.result-panel .final-status {
+  order: 2;
+}
+
+.result-panel .next-actions {
+  order: 3;
+}
+
+.result-panel .summary {
+  order: 4;
+}
+
+.result-panel .step-flow {
+  order: 5;
+}
+
+.result-panel .raw-output {
+  order: 6;
 }
 
 .tools-column {
@@ -310,6 +422,35 @@ textarea {
   gap: 16px;
   min-width: 0;
   align-content: start;
+}
+
+.tool-tabs {
+  display: none;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.tool-tab,
+.next-action-link {
+  display: inline-flex;
+  min-height: 38px;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: rgba(15, 22, 53, 0.62);
+  color: #d7ecff;
+  padding: 0 12px;
+  font-size: 13px;
+  font-weight: 800;
+  text-decoration: none;
+}
+
+.tool-tab:hover,
+.next-action-link:hover {
+  border-color: rgba(0, 128, 255, 0.5);
+  background: rgba(0, 128, 255, 0.12);
+  text-decoration: none;
 }
 
 .panel {
@@ -321,9 +462,12 @@ textarea {
   backdrop-filter: blur(20px);
 }
 
-.form-panel,
-.result-panel {
+.form-panel {
   padding: 16px;
+}
+
+.result-panel {
+  padding: 12px;
 }
 
 .panel-head {
@@ -492,6 +636,22 @@ details.section-box > *:not(summary) {
   margin-top: 10px;
 }
 
+.compact-options {
+  margin: 0;
+}
+
+.compact-options > .gopay-field-row,
+.compact-options > .browser-use-row,
+.compact-options > .browser-use-field {
+  margin-top: 10px;
+}
+
+.compact-options > .gopay-field-row:first-of-type,
+.compact-options > .browser-use-row:first-of-type,
+.compact-options > .browser-use-field:first-of-type {
+  margin-top: 10px;
+}
+
 .focus-box {
   background: var(--soft);
   border-color: rgba(0, 128, 255, 0.28);
@@ -620,44 +780,56 @@ button:disabled {
 .final-status {
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
-  gap: 10px;
-  margin-bottom: 10px;
+  gap: 8px;
+  margin-bottom: 8px;
 }
 
 .step-flow {
   display: grid;
-  gap: 8px;
-  margin-bottom: 10px;
+  gap: 6px;
+  margin-bottom: 8px;
+}
+
+.result-panel .step-flow {
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+}
+
+#gopayStepFlow {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
 }
 
 .step-flow-item {
   display: grid;
-  grid-template-columns: 18px minmax(0, 1fr);
-  gap: 10px;
+  grid-template-columns: 12px minmax(0, 1fr);
+  gap: 6px;
   align-items: start;
   border: 1px solid var(--line);
   border-radius: 8px;
   background: rgba(10, 14, 39, 0.52);
-  padding: 10px 12px;
+  padding: 8px;
 }
 
 .step-flow-item strong {
   display: block;
-  margin-bottom: 4px;
+  margin-bottom: 2px;
   color: var(--ink);
-  font-size: 13px;
+  font-size: 12px;
+  line-height: 1.25;
 }
 
 .step-flow-item p {
   margin: 0;
+  overflow: hidden;
   color: var(--muted);
-  font-size: 12px;
-  line-height: 1.55;
+  font-size: 11px;
+  line-height: 1.35;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .step-dot {
-  width: 12px;
-  height: 12px;
+  width: 9px;
+  height: 9px;
   margin-top: 3px;
   border-radius: 999px;
   border: 2px solid var(--line);
@@ -802,12 +974,37 @@ button:disabled {
   border: 1px solid var(--line);
   border-radius: 8px;
   background: rgba(10, 14, 39, 0.52);
-  padding: 10px;
+  padding: 8px;
 }
 
 .final-status > div {
   border-color: rgba(0, 128, 255, 0.32);
   background: rgba(0, 128, 255, 0.08);
+}
+
+.next-actions {
+  margin-bottom: 8px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: rgba(10, 14, 39, 0.52);
+  padding: 8px;
+}
+
+.next-actions-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.raw-output {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: rgba(10, 14, 39, 0.46);
+  padding: 8px;
+}
+
+.raw-output pre {
+  margin-top: 10px;
 }
 
 .metric-label {
@@ -1181,7 +1378,20 @@ summary:focus-visible,
   }
 
   .tools-column {
-    grid-template-columns: minmax(300px, 340px) minmax(0, 1fr);
+    grid-template-columns: 1fr;
+  }
+
+  .tool-tabs {
+    display: grid;
+  }
+
+  .step-flow,
+  .result-panel .step-flow {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+
+  #gopayStepFlow {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
   }
 }
 
@@ -1204,6 +1414,24 @@ summary:focus-visible,
     justify-content: start;
   }
 
+  .flow-nav {
+    display: none;
+  }
+
+  .mobile-anchor-nav {
+    display: grid;
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+  }
+
+  .mobile-anchor-nav a:last-child {
+    font-size: 11px;
+  }
+
+  .summary,
+  .final-status {
+    grid-template-columns: 1fr;
+  }
+
   .workspace {
     grid-template-columns: 1fr;
     grid-template-areas:
@@ -1214,6 +1442,15 @@ summary:focus-visible,
 
   .tools-column {
     grid-template-columns: 1fr;
+  }
+
+  .step-flow,
+  .result-panel .step-flow {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  #gopayStepFlow {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
   pre {
@@ -1257,12 +1494,21 @@ summary:focus-visible,
   .browser-use-two-col,
   .browser-use-result-grid,
   .gopay-two-col,
-  .gopay-result-grid {
+  .gopay-result-grid,
+  .next-actions-grid {
     grid-template-columns: 1fr;
   }
 
   .workbench-status {
     display: grid;
+  }
+
+  .mobile-anchor-nav {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .mobile-anchor-nav a:last-child {
+    font-size: 12px;
   }
 
   .status-chip {
@@ -1279,6 +1525,9 @@ summary:focus-visible,
   .grid,
   .proxy-grid,
   .step-actions,
+  .step-flow,
+  .result-panel .step-flow,
+  #gopayStepFlow,
   .summary,
   .final-status,
   .flow-summary {

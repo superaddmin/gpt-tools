@@ -6,7 +6,7 @@
     <meta name="description" content="OpenAI 支付长链接生成器">
     <title>Checkout Workbench</title>
     <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%2308745f'/%3E%3Cpath d='M8 10h16v4H8zM8 18h11v4H8z' fill='white'/%3E%3C/svg%3E">
-    <link rel="stylesheet" href="/styles.css?v=20260507a">
+    <link rel="stylesheet" href="/styles.css?v=20260507b">
   </head>
   <body>
     <main class="shell">
@@ -21,6 +21,24 @@
           <span class="status-chip muted">布局模式 <strong>三栏工作台</strong></span>
         </div>
       </header>
+
+      <nav class="flow-nav" aria-label="推荐流程">
+        <span>推荐流程</span>
+        <ol>
+          <li><a href="#checkoutForm">获取 Session</a></li>
+          <li><a href="#checkoutForm">生成支付链接</a></li>
+          <li><a href="#resultPanel">打开支付页</a></li>
+          <li><a href="#gopayPanel">GoPay 绑定</a></li>
+          <li><a href="#browserUsePanel">Browser Use 分析</a></li>
+        </ol>
+      </nav>
+
+      <nav class="mobile-anchor-nav" aria-label="页面快捷导航">
+        <a href="#checkoutForm">生成</a>
+        <a href="#resultPanel">结果</a>
+        <a href="#gopayPanel">GoPay</a>
+        <a href="#browserUsePanel">Browser Use</a>
+      </nav>
 
       <section class="workspace">
         <div class="panel form-panel">
@@ -77,7 +95,7 @@
           </form>
         </div>
 
-        <div class="panel result-panel">
+        <div class="panel result-panel" id="resultPanel">
           <div class="panel-head">
             <h2>生成结果</h2>
             <span id="latency" class="badge neutral">空闲</span>
@@ -166,10 +184,29 @@
             </div>
           </div>
 
-          <pre id="output">{}</pre>
+          <div class="next-actions" aria-label="下一步操作">
+            <span class="metric-label">下一步操作</span>
+            <div class="next-actions-grid">
+              <a class="next-action-link" href="#gopayPanel">GoPay 绑定</a>
+              <a class="next-action-link" href="#browserUsePanel">Browser Use 分析</a>
+            </div>
+          </div>
+
+          <details class="raw-output">
+            <summary class="section-title">
+              <span>查看原始 JSON 输出</span>
+              <small>调试详情</small>
+            </summary>
+            <pre id="output">{}</pre>
+          </details>
         </div>
 
         <div class="tools-column">
+          <div class="tool-tabs" role="tablist" aria-label="工具面板切换">
+            <a class="tool-tab" href="#gopayPanel">GoPay</a>
+            <a class="tool-tab" href="#browserUsePanel">Browser Use</a>
+          </div>
+
           <div class="panel gopay-panel" id="gopayPanel">
           <div class="panel-head">
             <h2>GoPay 一键绑定</h2>
@@ -185,33 +222,39 @@
             </div>
             <div class="gopay-field-row gopay-two-col">
               <label class="gopay-field">
-                <span>国家码</span>
-                <input id="gopayCountryCode" value="86" placeholder="86" autocomplete="off">
-              </label>
-              <label class="gopay-field">
                 <span>手机号</span>
                 <input id="gopayPhone" value="18120322232" placeholder="18120322232" autocomplete="off">
-              </label>
-            </div>
-            <div class="gopay-field-row gopay-two-col">
-              <label class="gopay-field">
-                <span>OTP 通道</span>
-                <select id="gopayOTPChannel">
-                  <option value="whatsapp" selected>WhatsApp</option>
-                  <option value="sms">SMS</option>
-                </select>
               </label>
               <label class="gopay-field">
                 <span>6 位 OTP 验证码</span>
                 <input id="gopayOTP" type="text" inputmode="numeric" maxlength="6" placeholder="输入收到的 OTP" autocomplete="off">
               </label>
             </div>
-            <div class="gopay-field-row">
-              <label class="gopay-field">
-                <span>6 位 GoPay PIN（复用已绑定账号或支付阶段使用）</span>
-                <input id="gopayPINCode" type="password" inputmode="numeric" maxlength="6" placeholder="输入 GoPay PIN，不会保存在本地" autocomplete="off">
-              </label>
-            </div>
+            <details class="section-box compact-options">
+              <summary class="section-title">
+                <span>GoPay 高级选项</span>
+                <small>国家码 / 通道 / PIN / 监控</small>
+              </summary>
+              <div class="gopay-field-row gopay-two-col">
+                <label class="gopay-field">
+                  <span>国家码</span>
+                  <input id="gopayCountryCode" value="86" placeholder="86" autocomplete="off">
+                </label>
+                <label class="gopay-field">
+                  <span>OTP 通道</span>
+                  <select id="gopayOTPChannel">
+                    <option value="whatsapp" selected>WhatsApp</option>
+                    <option value="sms">SMS</option>
+                  </select>
+                </label>
+              </div>
+              <div class="gopay-field-row">
+                <label class="gopay-field">
+                  <span>6 位 GoPay PIN（复用已绑定账号或支付阶段使用）</span>
+                  <input id="gopayPINCode" type="password" inputmode="numeric" maxlength="6" placeholder="输入 GoPay PIN，不会保存在本地" autocomplete="off">
+                </label>
+              </div>
+            </details>
             <div class="gopay-toolbar">
               <button id="gopayLinkBtn" type="button">GoPay 一键绑定</button>
               <button id="gopayMonitorBtn" type="button" class="secondary-button">开始流程监控</button>
@@ -316,43 +359,49 @@
               <textarea id="browserUseTask" rows="3" placeholder="例如：打开页面，填写邮箱并提取全部文本与链接"></textarea>
             </label>
 
-            <div class="browser-use-row browser-use-two-col">
-              <label class="browser-use-field">
-                <span>等待文本</span>
-                <input id="browserUseWaitText" placeholder="例如：Example Domain" autocomplete="off">
-              </label>
-              <label class="browser-use-field">
-                <span>等待选择器</span>
-                <input id="browserUseWaitSelector" placeholder="例如：form input[name='email']" autocomplete="off">
-              </label>
-            </div>
+            <details class="section-box compact-options browser-use-advanced">
+              <summary class="section-title">
+                <span>Browser Use 高级选项</span>
+                <small>等待条件 / 表单 JSON / 运行参数</small>
+              </summary>
+              <div class="browser-use-row browser-use-two-col">
+                <label class="browser-use-field">
+                  <span>等待文本</span>
+                  <input id="browserUseWaitText" placeholder="例如：Example Domain" autocomplete="off">
+                </label>
+                <label class="browser-use-field">
+                  <span>等待选择器</span>
+                  <input id="browserUseWaitSelector" placeholder="例如：form input[name='email']" autocomplete="off">
+                </label>
+              </div>
 
-            <label class="browser-use-field">
-              <span>表单数据 JSON</span>
-              <textarea id="browserUseFormData" rows="5" placeholder='例如：{"email":"demo@example.com","name":"Alice"}'></textarea>
-            </label>
-
-            <label class="browser-use-field">
-              <span>字段提示 JSON</span>
-              <textarea id="browserUseFieldHints" rows="5" placeholder='例如：{"email":{"label":"Email"},"name":{"placeholder":"Your name"}}'></textarea>
-            </label>
-
-            <div class="browser-use-row browser-use-two-col">
               <label class="browser-use-field">
-                <span>运行模式</span>
-                <select id="browserUseHeadless">
-                  <option value="true" selected>无头</option>
-                  <option value="false">可见浏览器</option>
-                </select>
+                <span>表单数据 JSON</span>
+                <textarea id="browserUseFormData" rows="5" placeholder='例如：{"email":"demo@example.com","name":"Alice"}'></textarea>
               </label>
+
               <label class="browser-use-field">
-                <span>提交表单</span>
-                <select id="browserUseSubmit">
-                  <option value="false" selected>仅填写/提取</option>
-                  <option value="true">填写后提交</option>
-                </select>
+                <span>字段提示 JSON</span>
+                <textarea id="browserUseFieldHints" rows="5" placeholder='例如：{"email":{"label":"Email"},"name":{"placeholder":"Your name"}}'></textarea>
               </label>
-            </div>
+
+              <div class="browser-use-row browser-use-two-col">
+                <label class="browser-use-field">
+                  <span>运行模式</span>
+                  <select id="browserUseHeadless">
+                    <option value="true" selected>无头</option>
+                    <option value="false">可见浏览器</option>
+                  </select>
+                </label>
+                <label class="browser-use-field">
+                  <span>提交表单</span>
+                  <select id="browserUseSubmit">
+                    <option value="false" selected>仅填写/提取</option>
+                    <option value="true">填写后提交</option>
+                  </select>
+                </label>
+              </div>
+            </details>
 
             <div class="browser-use-toolbar">
               <button id="browserUseRunBtn" type="button">一键调用 browser-use</button>
