@@ -6438,7 +6438,7 @@ func midtransLinkingRetryConfig(aggressive bool) midtransLinkingRetryProfile {
 		PostClickWaitCycles:    18,
 		PostClickWaitMs:        500,
 		RecoveryWaitMs:         900,
-		RetryStillLinking:      true,
+		RetryStillLinking:      false,
 		UnboundedUntilNextStep: true,
 	}
 }
@@ -7011,6 +7011,19 @@ func handleGopayMidtransLinkingFill(w http.ResponseWriter, r *http.Request) {
 			phone_number: phoneNumber,
 			found: { country: false, phone: false, button: false },
 		};
+		const loadingShellReloadKey = 'gopay_midtrans_loading_reload_' + result.account_id;
+		const scheduleLoadingShellReload = () => {
+			try {
+				const last = Number(window.sessionStorage?.getItem(loadingShellReloadKey) || 0);
+				if (Number.isFinite(last) && last > 0 && Date.now() - last < 15000) return false;
+				window.sessionStorage?.setItem(loadingShellReloadKey, String(Date.now()));
+				window.setTimeout(() => window.location.reload(), 250);
+				return true;
+			} catch (_) {
+				window.setTimeout(() => window.location.reload(), 250);
+				return true;
+			}
+		};
 		const networkDiagnostics = {
 			capture_method: 'fetch_xhr_wrapper',
 			started_at: new Date().toISOString(),
@@ -7371,6 +7384,18 @@ func handleGopayMidtransLinkingFill(w http.ResponseWriter, r *http.Request) {
 			}
 			return looksLikeLinkingPage() && !hasTechnicalError();
 		};
+		const isSubmitActionButton = (button) => {
+			const text = textOf(button).toLowerCase();
+			return text.includes('link and pay') || text.includes('hubungkan') || text.includes('bayar') || text.includes('continue') || text.includes('lanjut') || text.includes('pay');
+		};
+		const isLoadingActionButton = (button) => {
+			if (!button || isSubmitActionButton(button)) return false;
+			const text = textOf(button);
+			if (text) return false;
+			return !!button.querySelector?.('.centerload, .load-dot, [class*="load" i], [class*="spinner" i]');
+		};
+		const findSubmitActionButton = () => Array.from(document.querySelectorAll('button')).filter(visible).find(isSubmitActionButton);
+		const hasLoadingActionButton = () => Array.from(document.querySelectorAll('button')).filter(visible).some(isLoadingActionButton);
 
 		result.click_attempts = [];
 		result.technical_error_back_loop = true;
@@ -7407,16 +7432,30 @@ func handleGopayMidtransLinkingFill(w http.ResponseWriter, r *http.Request) {
 					continue;
 				}
 			}
-			const buttons = Array.from(document.querySelectorAll('button')).filter(visible);
+			let buttons = Array.from(document.querySelectorAll('button')).filter(visible);
 			result.buttons = buttons.map((button) => ({ text: textOf(button).slice(0, 80), disabled: !!button.disabled })).slice(0, 8);
-			let submitButton = buttons.find((button) => {
-				const text = textOf(button).toLowerCase();
-				return text.includes('link and pay') || text.includes('hubungkan') || text.includes('bayar') || text.includes('continue') || text.includes('lanjut') || text.includes('pay');
-			});
+			let submitButton = buttons.find(isSubmitActionButton);
+			if (!submitButton && hasLoadingActionButton()) {
+				result.loading_action_button_detected = true;
+				for (let i = 0; i < buttonWaitCycles * 2; i++) {
+					await wait(500);
+					if (hasNextStep() || hasTechnicalError()) break;
+					submitButton = findSubmitActionButton();
+					if (submitButton || !hasLoadingActionButton()) break;
+				}
+				buttons = Array.from(document.querySelectorAll('button')).filter(visible);
+				result.buttons_after_loading_wait = buttons.map((button) => ({ text: textOf(button).slice(0, 80), disabled: !!button.disabled })).slice(0, 8);
+			}
 			if (!submitButton) {
+				if (hasLoadingActionButton()) {
+					result.stage = 'midtrans_linking_loading_stuck';
+					result.loading_shell_reload_scheduled = scheduleLoadingShellReload();
+					recordClickAttempt({ attempt, action: 'loading_button', reload_scheduled: result.loading_shell_reload_scheduled, url: window.location.href, snippet: pageText().slice(0, 240) });
+					break;
+				}
+				result.stage = 'midtrans_linking_button_missing';
 				recordClickAttempt({ attempt, action: 'missing_button', url: window.location.href, snippet: pageText().slice(0, 240) });
-				await wait(postClickWaitMs);
-				continue;
+				break;
 			}
 			result.found.button = true;
 			result.button_text = textOf(submitButton).slice(0, 100);
@@ -7425,17 +7464,14 @@ func handleGopayMidtransLinkingFill(w http.ResponseWriter, r *http.Request) {
 				for (let i = 0; i < buttonWaitCycles && submitButton.disabled; i++) {
 					await wait(500);
 					const refreshedButtons = Array.from(document.querySelectorAll('button')).filter(visible);
-					submitButton = refreshedButtons.find((button) => {
-						const text = textOf(button).toLowerCase();
-						return text.includes('link and pay') || text.includes('hubungkan') || text.includes('bayar') || text.includes('continue') || text.includes('lanjut') || text.includes('pay');
-					}) || submitButton;
+					submitButton = refreshedButtons.find(isSubmitActionButton) || submitButton;
 				}
 				result.button_disabled_after_wait = !!submitButton.disabled;
 			}
 			if (submitButton.disabled) {
+				result.stage = 'midtrans_linking_button_disabled';
 				recordClickAttempt({ attempt, action: 'button_disabled' });
-				await wait(postClickWaitMs);
-				continue;
+				break;
 			}
 			if (!countryVerified()) {
 				Object.assign(result, snapshotPage(), { stage: 'midtrans_country_code_not_selected' });

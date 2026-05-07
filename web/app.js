@@ -1526,13 +1526,17 @@ function startCheckoutSubmitWatcher(autoFillData) {
           return !!midtransRedirectionAccountID(url);
         }) || "";
       }
+      var hasMidtransCandidate = !!linkingURL;
       if (currentURL && currentURL !== lastCurrentURL) {
         lastCurrentURL = currentURL;
         appendCheckoutWatcherEvent("checkout-url", currentURL);
+      } else if (hasMidtransCandidate && linkingURL !== lastCurrentURL) {
+        lastCurrentURL = linkingURL;
+        appendCheckoutWatcherEvent("checkout-url", linkingURL);
       }
 
-      if (response.ok && (data.ok || submittedCandidateURL) && checkoutURLIndicatesSubmitted(currentURL, checkoutKey)) {
-        appendCheckoutWatcherEvent("checkout-submitted", "检测到支付页已提交，开始 GoPay 自动触发检查");
+      if (response.ok && (data.ok || submittedCandidateURL || hasMidtransCandidate) && (checkoutURLIndicatesSubmitted(currentURL, checkoutKey) || hasMidtransCandidate)) {
+        appendCheckoutWatcherEvent("checkout-submitted", hasMidtransCandidate ? "检测到 Midtrans GoPay redirection 页面，开始 GoPay 自动触发检查" : "检测到支付页已提交，开始 GoPay 自动触发检查");
         var decision = await checkGopayAutoTriggerReady({
           source: "checkout-submit-watch",
           checkout_url: checkoutURL,

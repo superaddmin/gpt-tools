@@ -774,8 +774,8 @@ func TestMidtransLinkingRetryConfigDefault(t *testing.T) {
 	if cfg.PostClickWaitCycles != 18 {
 		t.Fatalf("PostClickWaitCycles = %d, want 18", cfg.PostClickWaitCycles)
 	}
-	if !cfg.RetryStillLinking {
-		t.Fatal("RetryStillLinking = false, want true")
+	if cfg.RetryStillLinking {
+		t.Fatal("RetryStillLinking = true, want false")
 	}
 }
 
@@ -824,6 +824,55 @@ func TestMidtransLinkingFillScriptUsesUnboundedTechnicalErrorRecoveryLoop(t *tes
 	} {
 		if strings.Contains(script, forbidden) {
 			t.Fatalf("midtrans linking script should not use fixed click limit; found %q", forbidden)
+		}
+	}
+}
+
+func TestMidtransLinkingFillScriptDoesNotLoopForeverForLoadingShell(t *testing.T) {
+	source, err := os.ReadFile("main.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	script := string(source)
+
+	for _, want := range []string{
+		"isLoadingActionButton",
+		"midtrans_linking_loading_stuck",
+		"loading_shell_reload_scheduled",
+		"scheduleLoadingShellReload",
+		"action: 'loading_button'",
+		"action: 'missing_button'",
+	} {
+		if !strings.Contains(script, want) {
+			t.Fatalf("midtrans linking script missing %q", want)
+		}
+	}
+	loadingAction := strings.Index(script, "action: 'loading_button'")
+	loadingBreak := strings.Index(script[loadingAction:], "break;")
+	if loadingAction < 0 || loadingBreak < 0 {
+		t.Fatalf("loading button branch should break instead of looping forever: action=%d break=%d", loadingAction, loadingBreak)
+	}
+	missingAction := strings.Index(script, "action: 'missing_button'")
+	missingBreak := strings.Index(script[missingAction:], "break;")
+	if missingAction < 0 || missingBreak < 0 {
+		t.Fatalf("missing button branch should break instead of looping forever: action=%d break=%d", missingAction, missingBreak)
+	}
+}
+
+func TestCheckoutWatcherUsesMidtransCandidateWhenResolveTargetFails(t *testing.T) {
+	source, err := os.ReadFile("web/app.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	script := string(source)
+
+	for _, want := range []string{
+		"var hasMidtransCandidate = !!linkingURL;",
+		"checkoutURLIndicatesSubmitted(currentURL, checkoutKey) || hasMidtransCandidate",
+		"检测到 Midtrans GoPay redirection 页面，开始 GoPay 自动触发检查",
+	} {
+		if !strings.Contains(script, want) {
+			t.Fatalf("checkout watcher script missing %q", want)
 		}
 	}
 }
