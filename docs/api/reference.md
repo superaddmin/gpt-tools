@@ -622,7 +622,8 @@
   "target_url": "https://app.midtrans.com/snap/v4/redirection/account-id#/gopay-tokenization/linking",
   "checkout_url": "https://pay.openai.com/c/pay/cs_...",
   "country_code": "86",
-  "phone_number": "18120322232"
+  "phone_number": "18120322232",
+  "debug_network": false
 }
 ```
 
@@ -630,6 +631,7 @@
 
 - `country_code` 默认 `86`。
 - `phone_number` 默认 `18120322232`。
+- `debug_network` 默认 `false`；设为 `true` 时会额外写入一次性网络诊断文件到 `artifacts/network-debug/`。
 
 成功响应主要字段：
 
@@ -643,9 +645,31 @@
   "country_code": "86",
   "phone_number": "18120322232",
   "trigger_claimed": true,
-  "browser_result": {}
+  "browser_result": {},
+  "network_diagnostics": {}
 }
 ```
+
+自动触发快速路径：
+
+- 前端在 checkout 自动填地址完成后启动提交监听器，检测到支付页“订阅”已提交并解析到 Midtrans redirection/linking 页面后，才调用本接口。
+- 本接口通过 Chrome CDP 连接已有 Midtrans 页面，在页面上下文内选择国家码、填写手机号并点击 `Link and pay`，不走后端 full-link 管道。
+- 自动触发使用 checkout key 去重，同一个 checkout 不会重复触发。
+- 点击后会等待真实页面状态：进入 GoPay/OTP/PIN 下一步则返回成功；出现 `technical error` 会返回 `stage: "midtrans_linking_technical_error"` 并保留点击尝试记录。
+
+`network_diagnostics` 用于排查点击 `Link and pay` 后的 Midtrans/GoPay 请求结果。字段包括：
+
+- `entries[].method`、`entries[].url`、`entries[].status`、`entries[].ok`、`entries[].elapsed_ms`。
+- `entries[].request_headers`、`entries[].response_headers`：只保存 header 名称和摘要，包括 `present`、`length`、`prefix4`、`suffix4`、`sha256`，不保存 cookie/authorization 原文。
+- `entries[].response_text_snippet.fields`：保留 `status_code`、`error_code`、`message`、`transaction_id`、`reference_id`、`payment_reference_id` 等诊断字段。
+- `entries[].response_text_snippet.credentials`：对 token、cookie、authorization、client_secret、PIN/OTP 等可复用凭证只保存 `length`、`tail4`、`sha256`。
+- URL 保留 origin、path、参数名和 Midtrans hash 路由，查询参数值统一为 `***`。
+
+一次性 debug 文件：
+
+- 在前端控制台执行 `localStorage.setItem("gopay_debug_network_once", "1")` 后，下一次自动 Midtrans linking 填充会携带 `debug_network: true`，前端随后清除该开关。
+- 响应中的 `network_debug_artifact.path` 指向本机 `artifacts/network-debug/` 下的 JSON 文件。
+- `artifacts/network-debug/` 默认在 `.gitignore` 中，文件内容仍不包含 cookie/authorization 原文或可直接复用的支付凭证。
 
 如果 `target_url` 不是 Midtrans redirection 页面，返回 HTTP 200 且：
 

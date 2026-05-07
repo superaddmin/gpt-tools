@@ -3,6 +3,8 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"io"
@@ -159,6 +161,55 @@ func TestBuildAuditLogRecordUsesHeaderEmail(t *testing.T) {
 	}
 }
 
+func TestBuildAuditLogRecordIncludesFlowAnalysisMetadata(t *testing.T) {
+	req := httptest.NewRequest(http.MethodPost, "/api/gopay/full-link", strings.NewReader(`{"customer_email":"User@example.com","pin":"123456"}`))
+	req.Header.Set("User-Agent", "CheckoutWorkbenchTest/1.0")
+	responseBody := []byte(`{"ok":true,"stage":"gopay_complete","payment_reference_id":"pay-ref-1","transaction_id":"tx-1"}`)
+
+	record := buildAuditLogRecord(req, []byte(`{"customer_email":"User@example.com","pin":"123456"}`), responseBody, http.StatusOK, time.Now())
+
+	if record.AccountEmail != "user@example.com" {
+		t.Fatalf("AccountEmail = %q", record.AccountEmail)
+	}
+	if record.Metadata["analysis_log_version"] != auditAnalysisLogVersion {
+		t.Fatalf("analysis_log_version = %#v", record.Metadata["analysis_log_version"])
+	}
+	if record.Metadata["flow_stage"] != "gopay_full_payment_flow" {
+		t.Fatalf("flow_stage = %#v", record.Metadata["flow_stage"])
+	}
+	if record.Metadata["flow_step_index"] != 110 {
+		t.Fatalf("flow_step_index = %#v", record.Metadata["flow_step_index"])
+	}
+	if record.Metadata["account_log_file_prefix"] != "user@example.com" {
+		t.Fatalf("account_log_file_prefix = %#v", record.Metadata["account_log_file_prefix"])
+	}
+	identifiers, _ := record.Metadata["correlation_identifiers"].(map[string]any)
+	if identifiers["payment_reference_id"] != "pay-ref-1" || identifiers["transaction_id"] != "tx-1" {
+		t.Fatalf("correlation_identifiers = %#v", identifiers)
+	}
+	if _, exists := identifiers["pin"]; exists {
+		t.Fatalf("correlation_identifiers should not include pin: %#v", identifiers)
+	}
+}
+
+func TestAuditCorrelationIdentifiersSkipsSensitiveKeys(t *testing.T) {
+	identifiers := auditCorrelationIdentifiers(map[string]any{
+		"checkout_session_id": "cs_test_123",
+		"pin":                 "123456",
+		"token":               "tok-secret",
+		"otp":                 "654321",
+	})
+
+	if identifiers["checkout_session_id"] != "cs_test_123" {
+		t.Fatalf("checkout_session_id = %#v", identifiers["checkout_session_id"])
+	}
+	for _, key := range []string{"pin", "token", "otp"} {
+		if _, exists := identifiers[key]; exists {
+			t.Fatalf("identifiers should not include %s: %#v", key, identifiers)
+		}
+	}
+}
+
 func TestBuildAuditLogRecordMarksBusinessFailureFromResponseBody(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/api/gopay/full-link", strings.NewReader(`{"phone_number":"18120322232"}`))
 	responseBody := []byte(`{"ok":false,"stage":"payment_pin_all_failed","error":"所有支付 PIN 候选码均失败","payment_reference_id":"pay-ref-1"}`)
@@ -232,7 +283,7 @@ func TestBuildAuditLogRecordExtractsOperationFlowAndPaymentVoucher(t *testing.T)
 	}
 }
 
-func TestBuildAuditLogRecordKeepsSensitiveAnalysisDataWhenEnabled(t *testing.T) {
+func TestBuildAuditLogRecordMasksSensitiveAnalysisDataWhenEnabled(t *testing.T) {
 	oldConfig := config
 	config = appConfig{AuditCaptureSensitive: true}
 	t.Cleanup(func() { config = oldConfig })
@@ -249,22 +300,238 @@ func TestBuildAuditLogRecordKeepsSensitiveAnalysisDataWhenEnabled(t *testing.T) 
 	record := buildAuditLogRecord(req, []byte(`{"access_token":"tok-analysis","otp":"654321","pin":"123456"}`), responseBody, http.StatusOK, time.Now())
 
 	detail, _ := record.OperationDetail.(map[string]any)
-	if detail["access_token"] != "tok-analysis" {
-		t.Fatalf("operation_detail.access_token = %#v, want raw analysis token", detail["access_token"])
+	if detail["access_token"] == "tok-analysis" {
+		t.Fatalf("operation_detail.access_token = %#v, want masked", detail["access_token"])
+	}
+	if detail["otp"] == "654321" || detail["pin"] == "123456" {
+		t.Fatalf("operation_detail contains raw otp/pin: %#v", detail)
 	}
 	flow, _ := record.Metadata["operation_flow"].(map[string]any)
 	stages, _ := flow["stages"].([]any)
 	otpStage, _ := stages[0].(map[string]any)
-	if otpStage["otp"] != "654321" {
-		t.Fatalf("operation_flow otp = %#v, want raw otp", otpStage["otp"])
+	if otpStage["otp"] == "654321" {
+		t.Fatalf("operation_flow otp = %#v, want masked", otpStage["otp"])
 	}
 	responsePayload, _ := record.Metadata["response_payload"].(map[string]any)
 	pinToken, _ := responsePayload["gopay_payment_pin_token"].(map[string]any)
-	if pinToken["token"] != "pin-token-secret" {
-		t.Fatalf("response_payload.gopay_payment_pin_token.token = %#v", pinToken["token"])
+	if pinToken["token"] == "pin-token-secret" {
+		t.Fatalf("response_payload.gopay_payment_pin_token.token = %#v, want masked", pinToken["token"])
 	}
 	if record.Metadata["sensitive_capture"] != true {
 		t.Fatalf("sensitive_capture = %#v, want true", record.Metadata["sensitive_capture"])
+	}
+}
+
+func TestBuildAuditLogRecordIncludesCDPPINFlowFields(t *testing.T) {
+	req := httptest.NewRequest(http.MethodPost, "/api/gopay/cdp-otp", strings.NewReader(`{"pin":"123456"}`))
+	responseBody := []byte(`{
+		"ok": true,
+		"stage": "pin_entry_binding",
+		"pin_stage": "binding",
+		"pin_auto_filled": true,
+		"pin_auto_submitted": true,
+		"balance_amount": 1,
+		"balance_state": "rp1",
+		"hubungkan_auto_clicked": true,
+		"pay_now_auto_clicked": false,
+		"auto_action_paused": false,
+		"auto_action_stage": "gopay_consent_hubungkan",
+		"otp_manual_required": false,
+		"result": {
+			"page_stage": "pin_entry_binding",
+			"pin_present": true,
+			"pin_length": 6
+		}
+	}`)
+
+	record := buildAuditLogRecord(req, []byte(`{"pin":"123456"}`), responseBody, http.StatusOK, time.Now())
+
+	detail, _ := record.OperationDetail.(map[string]any)
+	if detail["pin"] == "123456" {
+		t.Fatalf("request pin = %#v, want masked", detail["pin"])
+	}
+	flow, _ := record.Metadata["operation_flow"].(map[string]any)
+	if flow["stage"] != "pin_entry_binding" {
+		t.Fatalf("operation_flow.stage = %#v, want pin_entry_binding", flow["stage"])
+	}
+	if flow["pin_stage"] != "binding" {
+		t.Fatalf("operation_flow.pin_stage = %#v, want binding", flow["pin_stage"])
+	}
+	if flow["pin_auto_filled"] != true {
+		t.Fatalf("operation_flow.pin_auto_filled = %#v, want true", flow["pin_auto_filled"])
+	}
+	if flow["pin_auto_submitted"] != true {
+		t.Fatalf("operation_flow.pin_auto_submitted = %#v, want true", flow["pin_auto_submitted"])
+	}
+	if flow["otp_manual_required"] != false {
+		t.Fatalf("operation_flow.otp_manual_required = %#v, want false", flow["otp_manual_required"])
+	}
+	if flow["balance_state"] != "rp1" {
+		t.Fatalf("operation_flow.balance_state = %#v, want rp1", flow["balance_state"])
+	}
+	if flow["hubungkan_auto_clicked"] != true {
+		t.Fatalf("operation_flow.hubungkan_auto_clicked = %#v, want true", flow["hubungkan_auto_clicked"])
+	}
+	if flow["pay_now_auto_clicked"] != false {
+		t.Fatalf("operation_flow.pay_now_auto_clicked = %#v, want false", flow["pay_now_auto_clicked"])
+	}
+	if flow["auto_action_paused"] != false {
+		t.Fatalf("operation_flow.auto_action_paused = %#v, want false", flow["auto_action_paused"])
+	}
+	if flow["auto_action_stage"] != "gopay_consent_hubungkan" {
+		t.Fatalf("operation_flow.auto_action_stage = %#v, want gopay_consent_hubungkan", flow["auto_action_stage"])
+	}
+}
+
+func TestGopayCDPFlowScriptKeepsOTPManualAndDefinesPINStages(t *testing.T) {
+	script := gopayCDPFlowScript("123456")
+
+	for _, want := range []string{"otp_manual_required", "pin_entry_binding", "pin_entry_payment"} {
+		if !strings.Contains(script, want) {
+			t.Fatalf("script missing %q", want)
+		}
+	}
+	for _, forbidden := range []string{"setNativeValue(otpInput", "submitBtn.click()"} {
+		if strings.Contains(script, forbidden) {
+			t.Fatalf("script should not auto-fill or submit OTP; found %q", forbidden)
+		}
+	}
+}
+
+func TestGopayCDPFlowScriptDefinesConsentAndBalanceGuards(t *testing.T) {
+	script := gopayCDPFlowScript("123456")
+
+	for _, want := range []string{
+		"Hubungkan",
+		"gopay_consent_hubungkan",
+		"balance_wait_rp0",
+		"pay_now_rp1",
+		"Pay now",
+		"auto_action_paused",
+		"auto_action_stage",
+		"pay_now_auto_clicked",
+		"hubungkan_auto_clicked",
+		"!result.auto_action_paused",
+		"const actionScope = urlHost + urlPath;",
+		"findStableActionByExactText",
+		"gopay_cdp_hubungkan_cooldown_",
+	} {
+		if !strings.Contains(script, want) {
+			t.Fatalf("script missing %q", want)
+		}
+	}
+	pauseCheck := strings.Index(script, "result.balance_state === 'rp0'")
+	hubungkanCheck := strings.Index(script, "findStableActionByExactText(['Hubungkan'])")
+	if pauseCheck < 0 || hubungkanCheck < 0 || pauseCheck > hubungkanCheck {
+		t.Fatalf("script should check Rp0 pause before Hubungkan click: pause=%d hubungkan=%d", pauseCheck, hubungkanCheck)
+	}
+	markHubungkan := strings.Index(script, "storageSet(hubungkanKey);")
+	clickHubungkan := strings.Index(script, "clickElement(hubungkanButton)")
+	if markHubungkan < 0 || clickHubungkan < 0 || markHubungkan > clickHubungkan {
+		t.Fatalf("script should mark Hubungkan handled before click: mark=%d click=%d", markHubungkan, clickHubungkan)
+	}
+}
+
+func TestStaticAssetHandlerCachesAssetsAndCompressesText(t *testing.T) {
+	handler := staticAssetHandler(os.DirFS("web"))
+	req := httptest.NewRequest(http.MethodGet, "/app.js?v=test", nil)
+	req.Header.Set("Accept-Encoding", "gzip")
+	rec := httptest.NewRecorder()
+
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+	if got := rec.Header().Get("Cache-Control"); !strings.Contains(got, "public") || !strings.Contains(got, "max-age") {
+		t.Fatalf("Cache-Control = %q, want public cache", got)
+	}
+	if got := rec.Header().Get("Content-Encoding"); got != "gzip" {
+		t.Fatalf("Content-Encoding = %q, want gzip", got)
+	}
+	if got := rec.Header().Get("Vary"); !strings.Contains(got, "Accept-Encoding") {
+		t.Fatalf("Vary = %q, want Accept-Encoding", got)
+	}
+}
+
+func TestStaticAssetHandlerKeepsHTMLNoStoreButCompresses(t *testing.T) {
+	handler := staticAssetHandler(os.DirFS("web"))
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.Header.Set("Accept-Encoding", "gzip")
+	rec := httptest.NewRecorder()
+
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+	if got := rec.Header().Get("Cache-Control"); !strings.Contains(got, "no-store") {
+		t.Fatalf("Cache-Control = %q, want no-store for HTML", got)
+	}
+	if got := rec.Header().Get("Content-Encoding"); got != "gzip" {
+		t.Fatalf("Content-Encoding = %q, want gzip", got)
+	}
+}
+
+func TestWebShellAvoidsRemoteFontBlockingAndDelaysBrowserUseProbe(t *testing.T) {
+	css, err := os.ReadFile(filepath.Join("web", "styles.css"))
+	if err != nil {
+		t.Fatalf("read styles.css: %v", err)
+	}
+	html, err := os.ReadFile(filepath.Join("web", "index.html"))
+	if err != nil {
+		t.Fatalf("read index.html: %v", err)
+	}
+	combined := string(css) + "\n" + string(html)
+	for _, forbidden := range []string{"fonts.googleapis.com", "fonts.gstatic.com", "@import url(\"https://fonts.googleapis.com"} {
+		if strings.Contains(combined, forbidden) {
+			t.Fatalf("web shell should not block on remote fonts; found %q", forbidden)
+		}
+	}
+	if !strings.Contains(string(html), "setTimeout(checkBrowserUseHealth") {
+		t.Fatal("browser-use health probe should be delayed until after first paint")
+	}
+}
+
+func TestHandleClientPerformanceLogSummarizesMetrics(t *testing.T) {
+	payload := `{
+		"page_url": "http://127.0.0.1:18473/?token=***",
+		"nav": {"duration_ms": 210, "dom_content_loaded_ms": 120, "load_event_ms": 190},
+		"resources": [
+			{"url": "http://127.0.0.1:18473/app.js?v=***", "initiator_type": "script", "duration_ms": 10, "transfer_size": 1000},
+			{"url": "http://127.0.0.1:18473/styles.css?v=***", "initiator_type": "link", "duration_ms": 8, "transfer_size": 500}
+		],
+		"long_tasks": [{"duration_ms": 75}],
+		"slow_interactions": [{"name": "click", "duration_ms": 42}],
+		"errors": [{"type": "error", "message": "boom"}]
+	}`
+	req := httptest.NewRequest(http.MethodPost, "/api/perf/client", strings.NewReader(payload))
+	rec := httptest.NewRecorder()
+
+	handleClientPerformanceLog(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200, body=%s", rec.Code, rec.Body.String())
+	}
+	var response map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if response["stage"] != "client_perf_recorded" {
+		t.Fatalf("stage = %#v", response["stage"])
+	}
+	summary, _ := response["summary"].(map[string]any)
+	if summary["resource_count"] != float64(2) {
+		t.Fatalf("resource_count = %#v, want 2", summary["resource_count"])
+	}
+	if summary["long_task_count"] != float64(1) {
+		t.Fatalf("long_task_count = %#v, want 1", summary["long_task_count"])
+	}
+	if summary["slow_interaction_count"] != float64(1) {
+		t.Fatalf("slow_interaction_count = %#v, want 1", summary["slow_interaction_count"])
+	}
+	if summary["error_count"] != float64(1) {
+		t.Fatalf("error_count = %#v, want 1", summary["error_count"])
 	}
 }
 
@@ -471,6 +738,196 @@ func TestMidtransLinkingFillOutcomeAcceptsVerifiedCountry(t *testing.T) {
 	}
 	if stage != "midtrans_linking_submitted" {
 		t.Fatalf("stage = %q, want midtrans_linking_submitted", stage)
+	}
+}
+
+func TestMidtransLinkingFillOutcomeRejectsTechnicalErrorAfterClick(t *testing.T) {
+	ok, stage := midtransLinkingFillOutcome(map[string]any{
+		"clicked":          true,
+		"country_code":     "86",
+		"country_verified": true,
+		"found": map[string]any{
+			"country": true,
+			"phone":   true,
+			"button":  true,
+		},
+		"page_text_snippet": "Phone number: +86 Link and pay There’s a technical error Don’t worry, we’re working on it. Please try again. Back",
+	})
+
+	if ok {
+		t.Fatal("ok = true, want false when technical error is still visible")
+	}
+	if stage != "midtrans_linking_technical_error" {
+		t.Fatalf("stage = %q, want midtrans_linking_technical_error", stage)
+	}
+}
+
+func TestMidtransLinkingRetryConfigDefault(t *testing.T) {
+	cfg := midtransLinkingRetryConfig(false)
+
+	if cfg.MaxClickAttempts != 3 {
+		t.Fatalf("MaxClickAttempts = %d, want 3", cfg.MaxClickAttempts)
+	}
+	if cfg.ButtonWaitCycles != 8 {
+		t.Fatalf("ButtonWaitCycles = %d, want 8", cfg.ButtonWaitCycles)
+	}
+	if cfg.PostClickWaitCycles != 18 {
+		t.Fatalf("PostClickWaitCycles = %d, want 18", cfg.PostClickWaitCycles)
+	}
+	if cfg.RetryStillLinking {
+		t.Fatal("RetryStillLinking = true, want false")
+	}
+}
+
+func TestMidtransLinkingRetryConfigAggressive(t *testing.T) {
+	cfg := midtransLinkingRetryConfig(true)
+
+	if cfg.MaxClickAttempts <= 3 {
+		t.Fatalf("MaxClickAttempts = %d, want > 3", cfg.MaxClickAttempts)
+	}
+	if cfg.MaxClickAttempts > 5 {
+		t.Fatalf("MaxClickAttempts = %d, want <= 5 to avoid rate-limit bursts", cfg.MaxClickAttempts)
+	}
+	if cfg.ButtonWaitCycles <= 8 {
+		t.Fatalf("ButtonWaitCycles = %d, want > 8", cfg.ButtonWaitCycles)
+	}
+	if cfg.PostClickWaitCycles <= 18 {
+		t.Fatalf("PostClickWaitCycles = %d, want > 18", cfg.PostClickWaitCycles)
+	}
+	if cfg.PostClickWaitMs < 800 {
+		t.Fatalf("PostClickWaitMs = %d, want >= 800 to avoid rapid repeated clicks", cfg.PostClickWaitMs)
+	}
+	if !cfg.RetryStillLinking {
+		t.Fatal("RetryStillLinking = false, want true")
+	}
+}
+
+func TestSanitizeMidtransNetworkDiagnosticsSummarizesHeadersAndResponseFields(t *testing.T) {
+	authValue := "Bearer abcdefghijklmnopqrstuvwxyz"
+	cookieValue := "midtrans_session=session-cookie-value"
+	result := map[string]any{
+		"network_diagnostics": map[string]any{
+			"entries": []any{
+				map[string]any{
+					"kind":                  "fetch",
+					"method":                "POST",
+					"url":                   "https://app.midtrans.com/snap/v4/token?token=secret-token&account_id=acct-123#frag",
+					"status":                float64(500),
+					"request_headers":       map[string]any{"authorization": authValue, "cookie": cookieValue, "x-client-id": "client-value-1234"},
+					"response_headers":      "content-type: application/json\r\nset-cookie: sid=secret-cookie\r\nx-request-id: request-12345678\r\n",
+					"response_text_snippet": `{"status_code":500,"error_code":"GOPAY_LINK_FAILED","message":"technical error","transaction_id":"tx-123","reference_id":"ref-123","access_token":"secret-access-token-value","payment_token":"payment-token-9999"}`,
+				},
+			},
+		},
+	}
+
+	sanitizeMidtransNetworkDiagnostics(result)
+
+	diagnostics := result["network_diagnostics"].(map[string]any)
+	entries := diagnostics["entries"].([]any)
+	entry := entries[0].(map[string]any)
+	if entry["url"] != "https://app.midtrans.com/snap/v4/token?token=***&account_id=***#frag" {
+		t.Fatalf("url = %#v", entry["url"])
+	}
+	requestHeaders := entry["request_headers"].(map[string]any)
+	authSummary := requestHeaders["authorization"].(map[string]any)
+	if authSummary["present"] != true {
+		t.Fatalf("authorization present = %#v", authSummary["present"])
+	}
+	if authSummary["length"] != len(authValue) {
+		t.Fatalf("authorization length = %#v", authSummary["length"])
+	}
+	if authSummary["prefix4"] != "Bear" || authSummary["suffix4"] != "wxyz" {
+		t.Fatalf("authorization fingerprint = %#v", authSummary)
+	}
+	authSum := sha256.Sum256([]byte(authValue))
+	if authSummary["sha256"] != hex.EncodeToString(authSum[:]) {
+		t.Fatalf("authorization sha256 = %#v", authSummary["sha256"])
+	}
+	if strings.Contains(stringifyJSONValue(requestHeaders), "abcdefghijklmnopqrstuvwxyz") {
+		t.Fatalf("request_headers leaked raw authorization: %#v", requestHeaders)
+	}
+
+	responseHeaders := entry["response_headers"].(map[string]any)
+	setCookie := responseHeaders["set-cookie"].(map[string]any)
+	if setCookie["present"] != true || setCookie["length"] == 0 {
+		t.Fatalf("set-cookie summary = %#v", setCookie)
+	}
+	if strings.Contains(stringifyJSONValue(responseHeaders), "secret-cookie") {
+		t.Fatalf("response_headers leaked raw cookie: %#v", responseHeaders)
+	}
+
+	body := entry["response_text_snippet"].(map[string]any)
+	fields := body["fields"].(map[string]any)
+	if fields["message"] != "technical error" {
+		t.Fatalf("message = %#v", fields["message"])
+	}
+	if fields["error_code"] != "GOPAY_LINK_FAILED" || fields["transaction_id"] != "tx-123" || fields["reference_id"] != "ref-123" {
+		t.Fatalf("diagnostic fields = %#v", fields)
+	}
+	credentials := body["credentials"].(map[string]any)
+	accessToken := credentials["access_token"].(map[string]any)
+	if accessToken["tail4"] != "alue" || accessToken["length"] == 0 || accessToken["sha256"] == "" {
+		t.Fatalf("access_token credential summary = %#v", accessToken)
+	}
+	if strings.Contains(stringifyJSONValue(body), "secret-access-token-value") {
+		t.Fatalf("response body leaked raw token: %#v", body)
+	}
+}
+
+func TestWriteMidtransNetworkDebugArtifactUsesSanitizedPayload(t *testing.T) {
+	debugDir := t.TempDir()
+	result := map[string]any{
+		"network_diagnostics": map[string]any{
+			"entries": []any{
+				map[string]any{
+					"url":                   "https://app.midtrans.com/snap/v4/token?token=secret-token",
+					"request_headers":       map[string]any{"authorization": "Bearer token-value-1234"},
+					"response_text_snippet": `{"message":"denied","access_token":"raw-token-value"}`,
+				},
+			},
+		},
+	}
+	sanitizeMidtransNetworkDiagnostics(result)
+
+	artifact, err := writeMidtransNetworkDebugArtifact(debugDir, "acct/test", gopayMidtransLinkingFillRequest{
+		TargetURL:   "https://app.midtrans.com/snap/v4/redirection/acct?session=secret",
+		CheckoutURL: "https://pay.openai.com/c/pay/cs_test?client_secret=secret",
+	}, result)
+	if err != nil {
+		t.Fatalf("writeMidtransNetworkDebugArtifact returned error: %v", err)
+	}
+	path := stringifyJSONValue(artifact["path"])
+	if !strings.HasPrefix(path, debugDir) {
+		t.Fatalf("debug path = %q, want under %q", path, debugDir)
+	}
+	payload, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read debug artifact: %v", err)
+	}
+	text := string(payload)
+	for _, leaked := range []string{"secret-token", "token-value-1234", "raw-token-value", "client_secret=secret", "session=secret"} {
+		if strings.Contains(text, leaked) {
+			t.Fatalf("debug artifact leaked %q: %s", leaked, text)
+		}
+	}
+	if !strings.Contains(text, `"sha256"`) || !strings.Contains(text, `"tail4"`) || !strings.Contains(text, `"message"`) {
+		t.Fatalf("debug artifact missing diagnostic summaries: %s", text)
+	}
+}
+
+func TestAuditOperationFlowIncludesNetworkDiagnostics(t *testing.T) {
+	flow := auditOperationFlow(map[string]any{
+		"ok": true,
+		"network_diagnostics": map[string]any{
+			"entries": []any{
+				map[string]any{"url": "https://app.midtrans.com/snap/v4/token", "status": float64(500)},
+			},
+		},
+	})
+
+	if _, ok := flow["network_diagnostics"]; !ok {
+		t.Fatal("network_diagnostics missing from audit operation flow")
 	}
 }
 

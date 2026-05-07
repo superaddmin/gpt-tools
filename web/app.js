@@ -38,6 +38,145 @@ const wechatGroupModalCloseBtn = document.querySelector("#wechatGroupModalCloseB
 let latestCheckoutURL = "";
 let latestOpenedCheckoutURL = "";
 let incognitoWindowOpened = false;
+const clientPerfState = {
+  longTasks: [],
+  slowInteractions: [],
+  errors: [],
+};
+
+function safePerfURL(rawURL) {
+  try {
+    const parsed = new URL(String(rawURL || ""), window.location.href);
+    const params = [];
+    parsed.searchParams.forEach(function (_value, key) {
+      if (!params.includes(key)) params.push(key);
+    });
+    const query = params.length ? "?" + params.map(function (key) { return encodeURIComponent(key) + "=***"; }).join("&") : "";
+    var hash = parsed.hash || "";
+    if (hash.includes("?")) {
+      const parts = hash.split("?");
+      const route = parts.shift();
+      const hashParams = new URLSearchParams(parts.join("?"));
+      const hashNames = [];
+      hashParams.forEach(function (_value, key) {
+        if (!hashNames.includes(key)) hashNames.push(key);
+      });
+      hash = route + (hashNames.length ? "?" + hashNames.map(function (key) { return encodeURIComponent(key) + "=***"; }).join("&") : "");
+    }
+    return parsed.origin + parsed.pathname + query + hash;
+  } catch (_error) {
+    return String(rawURL || "").split("?")[0].slice(0, 180);
+  }
+}
+
+function initClientPerformanceObservers() {
+  window.addEventListener("error", function (event) {
+    clientPerfState.errors.push({
+      type: "error",
+      message: String(event.message || "script error").slice(0, 240),
+      source: safePerfURL(event.filename || ""),
+      line: event.lineno || 0,
+      column: event.colno || 0,
+    });
+  });
+  window.addEventListener("unhandledrejection", function (event) {
+    clientPerfState.errors.push({
+      type: "unhandledrejection",
+      message: String(event.reason?.message || event.reason || "promise rejection").slice(0, 240),
+    });
+  });
+  if (!window.PerformanceObserver) return;
+  try {
+    if (PerformanceObserver.supportedEntryTypes?.includes("longtask")) {
+      new PerformanceObserver(function (list) {
+        list.getEntries().slice(-20).forEach(function (entry) {
+          clientPerfState.longTasks.push({
+            name: entry.name,
+            start_ms: Math.round(entry.startTime),
+            duration_ms: Math.round(entry.duration),
+          });
+        });
+        clientPerfState.longTasks = clientPerfState.longTasks.slice(-20);
+      }).observe({ entryTypes: ["longtask"] });
+    }
+  } catch (_error) {}
+  try {
+    if (PerformanceObserver.supportedEntryTypes?.includes("event")) {
+      new PerformanceObserver(function (list) {
+        list.getEntries().slice(-20).forEach(function (entry) {
+          if (entry.duration >= 40) {
+            clientPerfState.slowInteractions.push({
+              name: entry.name,
+              start_ms: Math.round(entry.startTime),
+              duration_ms: Math.round(entry.duration),
+            });
+          }
+        });
+        clientPerfState.slowInteractions = clientPerfState.slowInteractions.slice(-20);
+      }).observe({ type: "event", buffered: true, durationThreshold: 40 });
+    }
+  } catch (_error) {}
+}
+
+function buildClientPerformancePayload() {
+  const nav = performance.getEntriesByType("navigation")[0];
+  const resources = performance.getEntriesByType("resource").map(function (entry) {
+    return {
+      url: safePerfURL(entry.name),
+      initiator_type: entry.initiatorType,
+      start_ms: Math.round(entry.startTime),
+      duration_ms: Math.round(entry.duration),
+      transfer_size: entry.transferSize || 0,
+      encoded_size: entry.encodedBodySize || 0,
+      decoded_size: entry.decodedBodySize || 0,
+      response_end_ms: Math.round(entry.responseEnd || 0),
+    };
+  }).slice(-80);
+  return {
+    page_url: safePerfURL(window.location.href),
+    recorded_at: new Date().toISOString(),
+    nav: nav ? {
+      duration_ms: Math.round(nav.duration),
+      dom_content_loaded_ms: Math.round(nav.domContentLoadedEventEnd),
+      load_event_ms: Math.round(nav.loadEventEnd),
+      response_start_ms: Math.round(nav.responseStart),
+      response_end_ms: Math.round(nav.responseEnd),
+      transfer_size: nav.transferSize || 0,
+      encoded_size: nav.encodedBodySize || 0,
+      decoded_size: nav.decodedBodySize || 0,
+    } : null,
+    resources: resources,
+    resource_totals: {
+      count: resources.length,
+      transfer_size: resources.reduce(function (sum, item) { return sum + item.transfer_size; }, 0),
+      decoded_size: resources.reduce(function (sum, item) { return sum + item.decoded_size; }, 0),
+    },
+    long_tasks: clientPerfState.longTasks.slice(-20),
+    slow_interactions: clientPerfState.slowInteractions.slice(-20),
+    errors: clientPerfState.errors.slice(-20),
+  };
+}
+
+function sendClientPerformanceLog() {
+  try {
+    const body = JSON.stringify(buildClientPerformancePayload());
+    if (navigator.sendBeacon) {
+      const blob = new Blob([body], { type: "application/json" });
+      if (navigator.sendBeacon("/api/perf/client", blob)) return;
+    }
+    fetch("/api/perf/client", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: body,
+      keepalive: true,
+    }).catch(function () {});
+  } catch (_error) {}
+}
+
+initClientPerformanceObservers();
+window.addEventListener("load", function () {
+  window.setTimeout(sendClientPerformanceLog, 2500);
+});
 
 const fields = {
   token: document.querySelector("#token"),
@@ -897,6 +1036,7 @@ const gopayPhone = document.querySelector("#gopayPhone");
 const gopayOTPChannel = document.querySelector("#gopayOTPChannel");
 const gopayOTPInput = document.querySelector("#gopayOTP");
 const gopayPINCodeInput = document.querySelector("#gopayPINCode");
+const gopayAggressiveRetryInput = document.querySelector("#gopayAggressiveRetry");
 const gopayLinkBtn = document.querySelector("#gopayLinkBtn");
 const gopayBadge = document.querySelector("#gopayBadge");
 const gopayStepFlow = document.querySelector("#gopayStepFlow");
@@ -908,6 +1048,7 @@ const gopayOutput = document.querySelector("#gopayOutput");
 let gopayPaymentFlowRunning = false;
 let gopayAutoTriggerRunning = false;
 let gopayCheckoutWatcherActive = false;
+let stopGopayOTPAutoCapture = null;
 let checkoutSubmitWatcherId = 0;
 const gopayAutoTriggeredCheckoutKeys = new Set();
 
@@ -924,27 +1065,41 @@ const gopayStepTexts = {
 // GoPay 表单记忆功能
 (function initGopayFormMemory() {
   var GPM = "gopay_form_";
+  try {
+    var retryDefaultMigrationKey = GPM + "aggressive_retry_default_v2";
+    if (gopayAggressiveRetryInput && localStorage.getItem(retryDefaultMigrationKey) !== "1") {
+      localStorage.setItem(GPM + "aggressive_retry", "0");
+      localStorage.setItem(retryDefaultMigrationKey, "1");
+    }
+  } catch (_err) {}
   var fields = [
     { el: gopayAccountId,    key: "account_id" },
     { el: gopayCountryCode,  key: "country_code" },
     { el: gopayPhone,        key: "phone_number" },
     { el: gopayOTPChannel,   key: "otp_channel" },
+    { el: gopayPINCodeInput, key: "pin_code" },
+    { el: gopayAggressiveRetryInput, key: "aggressive_retry", type: "checkbox", defaultValue: "0" },
   ];
 
   fields.forEach(function (f) {
     if (!f.el) return;
     // 恢复上次值
     var saved = localStorage.getItem(GPM + f.key);
-    if (saved !== null && saved !== undefined) {
+    if (f.type === "checkbox") {
+      if (saved !== null && saved !== undefined) {
+        f.el.checked = saved === "1";
+      } else if (f.defaultValue !== undefined) {
+        f.el.checked = f.defaultValue === "1";
+      }
+    } else if (saved !== null && saved !== undefined) {
       f.el.value = saved;
     }
     // 监听变化并保存
-    f.el.addEventListener("input", function () {
-      localStorage.setItem(GPM + f.key, f.el.value);
-    });
-    f.el.addEventListener("change", function () {
-      localStorage.setItem(GPM + f.key, f.el.value);
-    });
+    var persistField = function () {
+      localStorage.setItem(GPM + f.key, f.type === "checkbox" ? (f.el.checked ? "1" : "0") : f.el.value);
+    };
+    f.el.addEventListener("input", persistField);
+    f.el.addEventListener("change", persistField);
   });
 })();
 
@@ -1031,10 +1186,14 @@ function renderGopayStageResults(stages) {
 }
 
 function startGopayOTPAutoCapture() {
+  if (typeof stopGopayOTPAutoCapture === "function") {
+    stopGopayOTPAutoCapture();
+  }
   var stop = false;
   var attempts = 0;
-  var maxAttempts = 24;
-  var seenOTP = (gopayOTPInput?.value || "").trim();
+  var maxAttempts = 120;
+  var pollDelayMs = 1500;
+  var lastStageKey = "";
 
   var poll = async function () {
     if (stop || attempts >= maxAttempts) return;
@@ -1044,34 +1203,114 @@ function startGopayOTPAutoCapture() {
       var resp = await fetch("/api/gopay/cdp-otp", {
         method: "POST",
         headers: buildRequestHeaders(),
-        body: JSON.stringify({ otp: (gopayOTPInput?.value || "").trim() }),
+        body: JSON.stringify({
+          otp: (gopayOTPInput?.value || "").trim(),
+          pin: (gopayPINCodeInput?.value || "").trim(),
+        }),
       });
       var data = await resp.json();
       var result = data.result || {};
-      var detected = (result.detected_otp || result.used_otp || "").trim();
+      var pageStage = (data.stage || result.page_stage || "").trim();
+      var pinStage = (data.pin_stage || result.pin_stage || "").trim();
+      var otpManualRequired = !!(data.otp_manual_required ?? result.otp_manual_required);
+      var pinAutoFilled = !!(data.pin_auto_filled ?? result.pin_auto_filled);
+      var pinAutoSubmitted = !!(data.pin_auto_submitted ?? result.pin_auto_submitted);
+      var hasOTPField = !!(data.has_otp_field ?? result.has_otp_field ?? result.hasOTPField);
+      var hasPinField = !!(data.has_pin_field ?? result.has_pin_field);
+      var inputStrategy = (data.pin_input_strategy || result.pin_input_strategy || "").trim();
+      var balanceState = (data.balance_state || result.balance_state || "").trim();
+      var balanceAmount = data.balance_amount ?? result.balance_amount;
+      var hubungkanAutoClicked = !!(data.hubungkan_auto_clicked ?? result.hubungkan_auto_clicked);
+      var payNowAutoClicked = !!(data.pay_now_auto_clicked ?? result.pay_now_auto_clicked);
+      var autoActionPaused = !!(data.auto_action_paused ?? result.auto_action_paused);
+      var autoActionStage = (data.auto_action_stage || result.auto_action_stage || "").trim();
+      var stageKey = [
+        pageStage,
+        pinStage,
+        autoActionStage,
+        balanceState,
+        balanceAmount,
+        hubungkanAutoClicked ? "hubungkan-clicked" : "",
+        payNowAutoClicked ? "pay-now-clicked" : "",
+        autoActionPaused ? "paused" : "",
+        otpManualRequired ? "otp-manual" : "",
+        pinAutoFilled ? "pin-filled" : "",
+        pinAutoSubmitted ? "pin-submitted" : "",
+        inputStrategy,
+      ].join("|");
 
-      if (detected && detected !== seenOTP) {
-        seenOTP = detected;
-        if (gopayOTPInput) {
-          gopayOTPInput.value = detected;
-          gopayOTPInput.dispatchEvent(new Event("input", { bubbles: true }));
-          gopayOTPInput.dispatchEvent(new Event("change", { bubbles: true }));
+      if (stageKey && stageKey !== lastStageKey) {
+        lastStageKey = stageKey;
+        if (pageStage === "gopay_consent_hubungkan" || hubungkanAutoClicked) {
+          setGopayStep("consent", "done", "Hubungkan 已出现并自动确认");
+          appendCheckoutWatcherEvent("gopay-hubungkan", "检测到 Hubungkan，已执行一次自动确认");
+          if (gopayBadge) {
+            setText(gopayBadge, "已确认");
+            gopayBadge.className = "badge";
+          }
         }
-        showAutoFillNotice("OTP 已截取", "成功", "已自动截取到 WhatsApp OTP 验证码：" + detected, "系统已自动填入 OTP 输入框。", "");
-        stop = true;
-        return;
+        if (pageStage === "balance_wait_rp0" || autoActionPaused || balanceState === "rp0") {
+          setGopayStep("success", "warning", "余额 Rp0，已暂停自动操作并等待余额变化");
+          appendCheckoutWatcherEvent("gopay-balance-wait", "检测到账户余额 Rp0，自动操作已暂停");
+          if (gopayBadge) {
+            setText(gopayBadge, "等余额");
+            gopayBadge.className = "badge neutral";
+          }
+        } else if (pageStage === "pay_now_rp1" || payNowAutoClicked) {
+          setGopayStep("success", "active", "余额 Rp1，已自动点击 Pay now");
+          appendCheckoutWatcherEvent("gopay-pay-now", "检测到账户余额 Rp1，已点击 Pay now");
+          if (gopayBadge) {
+            setText(gopayBadge, "Pay now");
+            gopayBadge.className = "badge";
+          }
+        } else if (pageStage === "balance_rp1_observed" || balanceState === "rp1") {
+          setGopayStep("success", "active", "余额 Rp1，正在等待 Pay now 可点击");
+          appendCheckoutWatcherEvent("gopay-pay-now-wait", "检测到账户余额 Rp1，等待 Pay now 按钮可点击");
+        }
+        if (pageStage === "otp_entry" || hasOTPField || otpManualRequired) {
+          setGopayStep("otp", "active", "检测到 OTP 页面，等待手动输入");
+          appendCheckoutWatcherEvent("gopay-otp-manual", "已进入 OTP 页面，OTP 保持手动输入");
+          if (gopayBadge) {
+            setText(gopayBadge, "等 OTP");
+            gopayBadge.className = "badge neutral";
+          }
+        }
+        if (pageStage === "pin_entry_binding" || pageStage === "pin_entry_payment" || hasPinField) {
+          var pinLabel = pinStage === "payment" ? "支付确认 PIN" : "绑定授权 PIN";
+          var pinMessage = "检测到 " + pinLabel + " 页面";
+          var pinState = "active";
+          if (pinAutoSubmitted) {
+            pinMessage = pinLabel + " 已自动填入并提交";
+            pinState = "done";
+          } else if (pinAutoFilled) {
+            pinMessage = pinLabel + " 已自动填入，等待页面继续";
+          } else if (!(gopayPINCodeInput?.value || "").trim()) {
+            pinMessage = "检测到 " + pinLabel + " 页面，但面板里还没有可复用的 PIN";
+            pinState = "warning";
+          }
+          setGopayStep("pin", pinState, pinMessage);
+          appendCheckoutWatcherEvent(
+            pageStage === "pin_entry_payment" ? "gopay-payment-pin" : "gopay-binding-pin",
+            pinMessage + (inputStrategy ? "（" + inputStrategy + "）" : "")
+          );
+          if (gopayBadge) {
+            setText(gopayBadge, pinStage === "payment" ? "支付 PIN" : "绑定 PIN");
+            gopayBadge.className = pinAutoSubmitted ? "badge" : "badge neutral";
+          }
+        }
       }
     } catch (error) {
       console.error("otp auto capture failed:", error);
     }
 
     if (!stop && attempts < maxAttempts) {
-      window.setTimeout(poll, 2500);
+      window.setTimeout(poll, pollDelayMs);
     }
   };
 
-  window.setTimeout(poll, 1500);
-  return function () { stop = true; };
+  window.setTimeout(poll, 800);
+  stopGopayOTPAutoCapture = function () { stop = true; };
+  return stopGopayOTPAutoCapture;
 }
 
 function checkoutAutoTriggerKey(rawURL) {
@@ -1182,6 +1421,14 @@ async function checkGopayAutoTriggerReady(payload) {
 async function fillCurrentMidtransLinkingPage(targetURL, checkoutURL) {
   var countryCode = (gopayCountryCode?.value || "86").trim();
   var phoneNumber = (gopayPhone?.value || "18120322232").trim();
+  var aggressiveRetry = !!gopayAggressiveRetryInput?.checked;
+  var debugNetworkOnce = false;
+  try {
+    debugNetworkOnce = window.localStorage?.getItem("gopay_debug_network_once") === "1";
+    if (debugNetworkOnce) window.localStorage?.removeItem("gopay_debug_network_once");
+  } catch (_err) {
+    debugNetworkOnce = false;
+  }
   var response = await fetch("/api/gopay/midtrans-linking-fill", {
     method: "POST",
     headers: buildRequestHeaders(),
@@ -1190,6 +1437,8 @@ async function fillCurrentMidtransLinkingPage(targetURL, checkoutURL) {
       checkout_url: checkoutURL || "",
       country_code: countryCode,
       phone_number: phoneNumber,
+      aggressive_retry: aggressiveRetry,
+      debug_network: debugNetworkOnce,
     }),
   });
   var data = await response.json();
@@ -1319,7 +1568,8 @@ function startCheckoutSubmitWatcher(autoFillData) {
                 finishWatcher();
                 return;
               } else {
-                appendCheckoutWatcherEvent("midtrans-linking-fill", "页面填充未完成：" + (fillResult.stage || fillResult.error || "unknown"));
+                var retryHint = fillResult.aggressive_retry ? "（连续重试已开启）" : "";
+                appendCheckoutWatcherEvent("midtrans-linking-fill", "页面填充未完成：" + (fillResult.stage || fillResult.error || "unknown") + retryHint);
                 if (monitorBadge) {
                   monitorBadge.textContent = "继续等待";
                   monitorBadge.className = "badge neutral";
@@ -1401,9 +1651,7 @@ async function runGopayFullLinkPayment(options) {
 
     setText(gopayLinkBtn, "创建新链路中...");
     setGopayStep("linking", "active", "正在提取最新 Session 并生成新的 Plus 结账链路...");
-    if (!otpCode) {
-      startGopayOTPAutoCapture();
-    }
+    startGopayOTPAutoCapture();
 
     var payload = {
       access_token: accessToken,

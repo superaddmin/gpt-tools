@@ -2,8 +2,10 @@ package main
 
 import (
 	"bytes"
+	"compress/gzip"
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/tls"
 	"embed"
 	"encoding/binary"
@@ -15,11 +17,13 @@ import (
 	"io/fs"
 	"log"
 	"math"
+	"mime"
 	"net"
 	"net/http"
 	"net/url"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
 	"regexp"
 	"sort"
@@ -581,7 +585,16 @@ func buildAuditLogRecord(r *http.Request, body []byte, responseBody []byte, stat
 		result = "failed"
 	}
 	metadata := map[string]any{
-		"duration_ms": time.Since(startedAt).Milliseconds(),
+		"analysis_log_version":         auditAnalysisLogVersion,
+		"duration_ms":                  time.Since(startedAt).Milliseconds(),
+		"request_body_bytes":           len(body),
+		"captured_response_body_bytes": len(responseBody),
+		"account_log_file_prefix":      sanitizeAuditFileName(email),
+		"flow_stage":                   auditFlowStage(r.URL.Path),
+		"flow_step_index":              auditFlowStepIndex(r.URL.Path),
+		"flow_route_role":              auditFlowRouteRole(r.URL.Path),
+		"request_host":                 r.Host,
+		"request_user_agent":           sanitizeAuditValue(r.UserAgent()),
 	}
 	if len(detail) > 0 {
 		metadata["request_payload"] = detail
@@ -594,6 +607,9 @@ func buildAuditLogRecord(r *http.Request, body []byte, responseBody []byte, stat
 	}
 	if paymentVoucher := auditPaymentVoucher(responsePayload); len(paymentVoucher) > 0 {
 		metadata["payment_voucher"] = paymentVoucher
+	}
+	if identifiers := auditCorrelationIdentifiers(detail, responseSummary, responsePayload); len(identifiers) > 0 {
+		metadata["correlation_identifiers"] = identifiers
 	}
 	if captureSensitive {
 		metadata["sensitive_capture"] = true
@@ -651,6 +667,65 @@ func auditBusinessFailure(summary map[string]any) (bool, string) {
 	return false, ""
 }
 
+// auditFlowStage 将 API 路由归一化为支付链路分析阶段，方便按账号日志复盘全流程。
+func auditFlowStage(path string) string {
+	if stage := auditFlowStages[path]; stage != "" {
+		return stage
+	}
+	return "other"
+}
+
+// auditFlowStepIndex 为支付链路阶段提供稳定排序索引，方便后续日志分析工具还原执行顺序。
+func auditFlowStepIndex(path string) int {
+	if index, ok := auditFlowStepIndexes[path]; ok {
+		return index
+	}
+	return 900
+}
+
+// auditFlowRouteRole 说明当前接口在 checkout 到 GoPay 支付全流程中的职责边界。
+func auditFlowRouteRole(path string) string {
+	if role := auditFlowRouteRoles[path]; role != "" {
+		return role
+	}
+	return "通用 API 请求记录"
+}
+
+// auditCorrelationIdentifiers 从已脱敏载荷中提取可关联的非密钥字段，用于跨接口追踪同一支付链路。
+func auditCorrelationIdentifiers(sources ...map[string]any) map[string]any {
+	identifiers := make(map[string]any)
+	for _, source := range sources {
+		copyAuditIdentifier(identifiers, source, "checkout_session_id")
+		copyAuditIdentifier(identifiers, source, "checkout_key")
+		copyAuditIdentifier(identifiers, source, "target_url")
+		copyAuditIdentifier(identifiers, source, "account_id")
+		copyAuditIdentifier(identifiers, source, "reference_id")
+		copyAuditIdentifier(identifiers, source, "linking_reference_id")
+		copyAuditIdentifier(identifiers, source, "payment_reference_id")
+		copyAuditIdentifier(identifiers, source, "gopay_payment_reference_id")
+		copyAuditIdentifier(identifiers, source, "transaction_id")
+	}
+	if len(identifiers) == 0 {
+		return nil
+	}
+	return identifiers
+}
+
+// copyAuditIdentifier 将安全标识字段复制到关联索引中，同时跳过空值和已存在字段。
+func copyAuditIdentifier(target map[string]any, source map[string]any, key string) {
+	if len(source) == 0 {
+		return
+	}
+	if _, exists := target[key]; exists {
+		return
+	}
+	value, exists := source[key]
+	if !exists || stringifyJSONValue(value) == "" {
+		return
+	}
+	target[key] = value
+}
+
 func sanitizeAuditBody(body []byte) map[string]any {
 	return auditBodyMap(body, false)
 }
@@ -662,14 +737,9 @@ func auditBodyMap(body []byte, captureSensitive bool) map[string]any {
 	}
 	var parsed any
 	if err := json.Unmarshal(trimmed, &parsed); err != nil {
-		return map[string]any{"raw": string(trimmed)}
+		return map[string]any{"raw": sanitizeAuditValue(string(trimmed))}
 	}
-	var sanitized any
-	if captureSensitive {
-		sanitized = parsed
-	} else {
-		sanitized = sanitizeAuditValue(parsed)
-	}
+	sanitized := sanitizeAuditValue(parsed)
 	if m, ok := sanitized.(map[string]any); ok {
 		return m
 	}
@@ -710,6 +780,25 @@ func auditOperationFlow(response map[string]any) map[string]any {
 		"summary",
 		"stages",
 		"browser_result",
+		"network_diagnostics",
+		"network_debug_artifact",
+		"network_debug_error",
+		"aggressive_retry",
+		"pin_stage",
+		"pin_auto_filled",
+		"pin_auto_submitted",
+		"pin_input_strategy",
+		"balance_amount",
+		"balance_state",
+		"hubungkan_auto_clicked",
+		"pay_now_auto_clicked",
+		"auto_action_paused",
+		"auto_action_stage",
+		"otp_manual_required",
+		"has_otp_field",
+		"has_pin_field",
+		"cdp_url_host",
+		"cdp_url_path",
 	}
 	flow := make(map[string]any)
 	for _, key := range keys {
@@ -909,7 +998,8 @@ func main() {
 	mux.HandleFunc("/api/gopay/midtrans-linking-fill", handleGopayMidtransLinkingFill)
 	mux.HandleFunc("/api/checkout/resolve-target", handleCheckoutResolveTarget)
 	mux.HandleFunc("/api/checkout/auto-fill", handleCheckoutAutoFill)
-	mux.Handle("/", noCache(http.FileServer(http.FS(staticFiles))))
+	mux.HandleFunc("/api/perf/client", handleClientPerformanceLog)
+	mux.Handle("/", staticAssetHandler(staticFiles))
 
 	handler := securityHeaders(withAuditLogging(mux))
 
@@ -934,6 +1024,74 @@ func noCache(next http.Handler) http.Handler {
 	})
 }
 
+func staticAssetHandler(staticFiles fs.FS) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet && r.Method != http.MethodHead {
+			writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+			return
+		}
+		cleanPath := path.Clean("/" + strings.TrimSpace(r.URL.Path))
+		fileName := strings.TrimPrefix(cleanPath, "/")
+		if fileName == "" || fileName == "." {
+			fileName = "index.html"
+		}
+		info, err := fs.Stat(staticFiles, fileName)
+		if err != nil || info.IsDir() {
+			http.NotFound(w, r)
+			return
+		}
+		data, err := fs.ReadFile(staticFiles, fileName)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "static file read failed")
+			return
+		}
+		ext := strings.ToLower(path.Ext(fileName))
+		contentType := mime.TypeByExtension(ext)
+		if contentType == "" {
+			contentType = http.DetectContentType(data)
+		}
+		w.Header().Set("Content-Type", contentType)
+		if fileName == "index.html" || ext == ".html" {
+			w.Header().Set("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
+			w.Header().Set("Pragma", "no-cache")
+			w.Header().Set("Expires", "0")
+		} else {
+			w.Header().Set("Cache-Control", "public, max-age=86400")
+		}
+		serveStaticBytes(w, r, data)
+	})
+}
+
+func serveStaticBytes(w http.ResponseWriter, r *http.Request, data []byte) {
+	if r.Method == http.MethodHead {
+		w.Header().Set("Content-Length", strconv.Itoa(len(data)))
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+	if len(data) >= 1024 && acceptsGzip(r.Header.Get("Accept-Encoding")) {
+		w.Header().Set("Content-Encoding", "gzip")
+		w.Header().Add("Vary", "Accept-Encoding")
+		w.WriteHeader(http.StatusOK)
+		gz := gzip.NewWriter(w)
+		_, _ = gz.Write(data)
+		_ = gz.Close()
+		return
+	}
+	w.Header().Set("Content-Length", strconv.Itoa(len(data)))
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(data)
+}
+
+func acceptsGzip(value string) bool {
+	for _, part := range strings.Split(value, ",") {
+		token := strings.ToLower(strings.TrimSpace(strings.Split(part, ";")[0]))
+		if token == "gzip" {
+			return true
+		}
+	}
+	return false
+}
+
 func handleHealth(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
@@ -944,6 +1102,41 @@ func handleHealth(w http.ResponseWriter, r *http.Request) {
 		"status": "ok",
 		"time":   time.Now().Format(time.RFC3339),
 	})
+}
+
+func handleClientPerformanceLog(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	defer r.Body.Close()
+	var payload map[string]any
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 256<<10)).Decode(&payload); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json")
+		return
+	}
+	summary := map[string]any{
+		"page_url":               safeNetworkDiagnosticURL(stringifyJSONValue(payload["page_url"])),
+		"resource_count":         jsonArrayLength(payload["resources"]),
+		"long_task_count":        jsonArrayLength(payload["long_tasks"]),
+		"slow_interaction_count": jsonArrayLength(payload["slow_interactions"]),
+		"error_count":            jsonArrayLength(payload["errors"]),
+	}
+	if nav, ok := payload["nav"].(map[string]any); ok {
+		summary["navigation"] = sanitizeAuditValue(nav)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":      true,
+		"stage":   "client_perf_recorded",
+		"summary": summary,
+	})
+}
+
+func jsonArrayLength(value any) int {
+	if items, ok := value.([]any); ok {
+		return len(items)
+	}
+	return 0
 }
 
 type incognitoOpenRequest struct {
@@ -1526,10 +1719,12 @@ type gopaySmartLinkRequest struct {
 }
 
 type gopayMidtransLinkingFillRequest struct {
-	TargetURL   string `json:"target_url"`
-	CheckoutURL string `json:"checkout_url,omitempty"`
-	CountryCode string `json:"country_code"`
-	PhoneNumber string `json:"phone_number"`
+	TargetURL       string `json:"target_url"`
+	CheckoutURL     string `json:"checkout_url,omitempty"`
+	CountryCode     string `json:"country_code"`
+	PhoneNumber     string `json:"phone_number"`
+	DebugNetwork    bool   `json:"debug_network,omitempty"`
+	AggressiveRetry bool   `json:"aggressive_retry,omitempty"`
 }
 
 type usAddress struct {
@@ -1631,6 +1826,68 @@ func (l *auditLogger) Close() error {
 	return closeErr
 }
 
+const auditAnalysisLogVersion = "checkout-payment-flow-v1"
+
+var auditFlowStages = map[string]string{
+	"/api/health":                      "system_health",
+	"/api/incognito/open":              "login_browser_prepare",
+	"/api/session/fetch":               "session_capture",
+	"/api/checkout":                    "checkout_create",
+	"/api/checkout/start":              "checkout_create",
+	"/api/checkout/resolve-target":     "checkout_target_resolve",
+	"/api/checkout/auto-fill":          "checkout_page_fill",
+	"/api/gopay/auto-trigger-check":    "gopay_auto_trigger_decision",
+	"/api/gopay/midtrans-linking-fill": "gopay_midtrans_page_linking",
+	"/api/gopay/full-link":             "gopay_full_payment_flow",
+	"/api/gopay/force-link":            "gopay_linking",
+	"/api/gopay/auto-link":             "gopay_linking",
+	"/api/gopay/smart-link":            "gopay_linking",
+	"/api/gopay/cdp-otp":               "gopay_otp_pin_browser_flow",
+	"/api/gopay/snap-probe":            "gopay_snap_probe",
+	"/api/gopay/monitor":               "payment_monitoring",
+	"/api/pricing/monitor":             "pricing_monitoring",
+}
+
+var auditFlowStepIndexes = map[string]int{
+	"/api/health":                      10,
+	"/api/incognito/open":              20,
+	"/api/session/fetch":               30,
+	"/api/checkout":                    40,
+	"/api/checkout/start":              40,
+	"/api/checkout/resolve-target":     50,
+	"/api/checkout/auto-fill":          60,
+	"/api/gopay/auto-trigger-check":    70,
+	"/api/gopay/midtrans-linking-fill": 80,
+	"/api/gopay/force-link":            90,
+	"/api/gopay/auto-link":             90,
+	"/api/gopay/smart-link":            90,
+	"/api/gopay/cdp-otp":               100,
+	"/api/gopay/full-link":             110,
+	"/api/gopay/snap-probe":            120,
+	"/api/gopay/monitor":               130,
+	"/api/pricing/monitor":             140,
+}
+
+var auditFlowRouteRoles = map[string]string{
+	"/api/health":                      "确认本地 Go 服务可用，是全流程运行前的环境健康信号",
+	"/api/incognito/open":              "打开或复用系统 Chrome 无痕窗口，为登录态、checkout 页面和 CDP 观测建立浏览器上下文",
+	"/api/session/fetch":               "从浏览器上下文读取 ChatGPT Session JSON，用于后续 checkout token 获取或诊断",
+	"/api/checkout":                    "基于账号 token、套餐、账单地区和税区信息生成 OpenAI/Stripe checkout 链接",
+	"/api/checkout/start":              "基于账号 token、套餐、账单地区和税区信息生成 OpenAI/Stripe checkout 链接",
+	"/api/checkout/resolve-target":     "从当前浏览器页面或输入链接中锁定真实 checkout 支付页目标",
+	"/api/checkout/auto-fill":          "在 checkout 页面执行地址、支付方式和提交相关自动化动作",
+	"/api/gopay/auto-trigger-check":    "判断页面是否已满足 GoPay 自动触发条件，避免重复或过早执行支付链路",
+	"/api/gopay/midtrans-linking-fill": "在 Midtrans/GoPay 页面填充手机号并推进绑定入口",
+	"/api/gopay/full-link":             "执行 GoPay 绑定、PIN 验证、支付处理和最终状态查询的后端全流程辅助",
+	"/api/gopay/force-link":            "执行 GoPay 指定参数绑定请求",
+	"/api/gopay/auto-link":             "执行 GoPay 自动绑定请求",
+	"/api/gopay/smart-link":            "执行 GoPay 智能绑定请求并处理冲突复用场景",
+	"/api/gopay/cdp-otp":               "通过 CDP 观测或操作 GoPay OTP/PIN 页面，但不记录明文 OTP/PIN",
+	"/api/gopay/snap-probe":            "探测 Snap/Midtrans 页面结构与账号标识",
+	"/api/gopay/monitor":               "采集支付相关页面、网络和控制台状态，用于异常定位和流畅性分析",
+	"/api/pricing/monitor":             "采集定价页面状态，用于 checkout 前置页面诊断",
+}
+
 var flowAuditLogger = newAuditLogger(filepath.Join(".", "log"), 24*time.Hour, 8<<20, 512)
 
 var gopayAutoTriggerMu sync.Mutex
@@ -1654,6 +1911,7 @@ var operationDisplayNames = map[string]string{
 	"/api/gopay/midtrans-linking-fill": "Midtrans GoPay 页面填充",
 	"/api/checkout/resolve-target":     "Checkout 目标解析",
 	"/api/checkout/auto-fill":          "Checkout 自动填充",
+	"/api/perf/client":                 "客户端性能日志",
 }
 
 var operationTypes = map[string]string{
@@ -1674,6 +1932,7 @@ var operationTypes = map[string]string{
 	"/api/gopay/midtrans-linking-fill": "gopay_browser_linking",
 	"/api/checkout/resolve-target":     "data_query",
 	"/api/checkout/auto-fill":          "data_modify",
+	"/api/perf/client":                 "performance_trace",
 }
 
 var sensitiveJSONKeys = map[string]struct{}{
@@ -1684,8 +1943,13 @@ var sensitiveJSONKeys = map[string]struct{}{
 	"checkout_cookie":            {},
 	"authorization":              {},
 	"pin":                        {},
+	"pin_token":                  {},
+	"pin_used":                   {},
 	"payment_pin":                {},
 	"otp":                        {},
+	"detected_otp":               {},
+	"otp_used":                   {},
+	"used_otp":                   {},
 	"challenge_id":               {},
 	"gopay_payment_challenge_id": {},
 	"client_secret":              {},
@@ -1751,6 +2015,22 @@ var auditResponseSummaryKeys = map[string]struct{}{
 	"reused_existing":            {},
 	"already_triggered":          {},
 	"checkout_key":               {},
+	"aggressive_retry":           {},
+	"pin_stage":                  {},
+	"pin_auto_filled":            {},
+	"pin_auto_submitted":         {},
+	"pin_input_strategy":         {},
+	"balance_amount":             {},
+	"balance_state":              {},
+	"hubungkan_auto_clicked":     {},
+	"pay_now_auto_clicked":       {},
+	"auto_action_paused":         {},
+	"auto_action_stage":          {},
+	"otp_manual_required":        {},
+	"has_otp_field":              {},
+	"has_pin_field":              {},
+	"cdp_url_host":               {},
+	"cdp_url_path":               {},
 }
 
 var usStates = []string{"AL", "AK", "AZ", "AR", "CA", "CO", "CT", "DE", "FL", "GA", "HI", "ID", "IL", "IN", "IA", "KS", "KY", "LA", "ME", "MD", "MA", "MI", "MN", "MS", "MO", "MT", "NE", "NV", "NH", "NJ", "NM", "NY", "NC", "ND", "OH", "OK", "OR", "PA", "RI", "SC", "SD", "TN", "TX", "UT", "VT", "VA", "WA", "WV", "WI", "WY"}
@@ -6102,17 +6382,21 @@ func midtransLinkingFillOutcome(result map[string]any) (bool, string) {
 	if resultStage := strings.TrimSpace(stringifyJSONValue(result["stage"])); resultStage != "" && resultStage != "midtrans_linking_filled" && resultStage != "midtrans_linking_submitted" {
 		return false, resultStage
 	}
+	pageText := strings.Join([]string{
+		stringifyJSONValue(result["page_text_snippet"]),
+		stringifyJSONValue(result["url"]),
+		stringifyJSONValue(result["after_url"]),
+	}, " ")
+	if midtransTechnicalErrorInText(pageText) {
+		return false, "midtrans_linking_technical_error"
+	}
 	found, _ := result["found"].(map[string]any)
 	countryOK := boolMapValue(found, "country") || boolJSONValue(result["country_verified"])
 	phoneOK := boolMapValue(found, "phone")
 	buttonOK := boolMapValue(found, "button")
 	requestedCountry := strings.TrimPrefix(strings.TrimSpace(stringifyJSONValue(result["country_code"])), "+")
 	if requestedCountry != "" {
-		pageCountry := phoneLineCountryCode(strings.Join([]string{
-			stringifyJSONValue(result["page_text_snippet"]),
-			stringifyJSONValue(result["url"]),
-			stringifyJSONValue(result["after_url"]),
-		}, " "))
+		pageCountry := phoneLineCountryCode(pageText)
 		if pageCountry != "" && pageCountry != requestedCountry {
 			countryOK = false
 		}
@@ -6127,6 +6411,424 @@ func midtransLinkingFillOutcome(result map[string]any) (bool, string) {
 		return true, "midtrans_linking_submitted"
 	}
 	return true, "midtrans_linking_filled"
+}
+
+type midtransLinkingRetryProfile struct {
+	MaxClickAttempts    int
+	ButtonWaitCycles    int
+	PostClickWaitCycles int
+	PostClickWaitMs     int
+	RecoveryWaitMs      int
+	RetryStillLinking   bool
+}
+
+func midtransLinkingRetryConfig(aggressive bool) midtransLinkingRetryProfile {
+	if aggressive {
+		return midtransLinkingRetryProfile{
+			MaxClickAttempts:    5,
+			ButtonWaitCycles:    18,
+			PostClickWaitCycles: 24,
+			PostClickWaitMs:     900,
+			RecoveryWaitMs:      1400,
+			RetryStillLinking:   true,
+		}
+	}
+	return midtransLinkingRetryProfile{
+		MaxClickAttempts:    3,
+		ButtonWaitCycles:    8,
+		PostClickWaitCycles: 18,
+		PostClickWaitMs:     500,
+		RecoveryWaitMs:      900,
+		RetryStillLinking:   false,
+	}
+}
+
+func midtransTechnicalErrorInText(text string) bool {
+	normalized := strings.ToLower(strings.Join(strings.Fields(text), " "))
+	if normalized == "" {
+		return false
+	}
+	return strings.Contains(normalized, "technical error") ||
+		strings.Contains(normalized, "please try again") ||
+		strings.Contains(normalized, "we're working on it") ||
+		strings.Contains(normalized, "we’re working on it")
+}
+
+const midtransNetworkDiagnosticsMaxEntries = 24
+const midtransNetworkDiagnosticsTextLimit = 1200
+const midtransNetworkDebugDir = "artifacts/network-debug"
+
+var networkDiagnosticBearerPattern = regexp.MustCompile(`(?i)\bbearer\s+[a-z0-9._\-+/=]{8,}`)
+var networkDiagnosticJSONSecretPattern = regexp.MustCompile(`(?i)("(?:access_token|token|authorization|cookie|client_secret|session|pin|otp)"\s*:\s*")[^"]*(")`)
+
+var networkDiagnosticBodyFieldKeys = map[string]struct{}{
+	"code":                       {},
+	"description":                {},
+	"error":                      {},
+	"error_code":                 {},
+	"fraud_status":               {},
+	"gopay_payment_reference_id": {},
+	"message":                    {},
+	"order_id":                   {},
+	"payment_reference_id":       {},
+	"payment_type":               {},
+	"reason":                     {},
+	"reference_id":               {},
+	"status":                     {},
+	"status_code":                {},
+	"transaction_id":             {},
+	"transaction_status":         {},
+}
+
+func sanitizeMidtransNetworkDiagnostics(result map[string]any) {
+	if result == nil {
+		return
+	}
+	diagnostics, ok := result["network_diagnostics"]
+	if !ok {
+		return
+	}
+	result["network_diagnostics"] = sanitizeNetworkDiagnosticValue(diagnostics, "")
+}
+
+func sanitizeNetworkDiagnosticValue(value any, key string) any {
+	lowerKey := strings.ToLower(strings.TrimSpace(key))
+	if isNetworkDiagnosticHeaderKey(lowerKey) {
+		return summarizeNetworkDiagnosticHeaders(value)
+	}
+	if isNetworkDiagnosticCredentialKey(lowerKey) {
+		return networkDiagnosticCredentialSummary(value)
+	}
+	switch typed := value.(type) {
+	case map[string]any:
+		keys := make([]string, 0, len(typed))
+		for nestedKey := range typed {
+			keys = append(keys, nestedKey)
+		}
+		sort.Strings(keys)
+		cleaned := make(map[string]any, len(typed))
+		for _, nestedKey := range keys {
+			cleaned[nestedKey] = sanitizeNetworkDiagnosticValue(typed[nestedKey], nestedKey)
+		}
+		return cleaned
+	case []any:
+		limit := len(typed)
+		if lowerKey == "entries" && limit > midtransNetworkDiagnosticsMaxEntries {
+			limit = midtransNetworkDiagnosticsMaxEntries
+		}
+		cleaned := make([]any, 0, limit)
+		for i := 0; i < limit; i++ {
+			cleaned = append(cleaned, sanitizeNetworkDiagnosticValue(typed[i], ""))
+		}
+		return cleaned
+	case string:
+		if lowerKey == "url" || strings.HasSuffix(lowerKey, "_url") {
+			return safeNetworkDiagnosticURL(typed)
+		}
+		if isNetworkDiagnosticResponseTextKey(lowerKey) {
+			return summarizeNetworkDiagnosticResponseText(typed)
+		}
+		return sanitizeNetworkDiagnosticText(typed)
+	default:
+		return typed
+	}
+}
+
+func isNetworkDiagnosticHeaderKey(key string) bool {
+	switch key {
+	case "headers", "request_headers", "request_headers_raw", "response_headers", "response_headers_raw":
+		return true
+	default:
+		return strings.HasSuffix(key, "_headers")
+	}
+}
+
+func isNetworkDiagnosticResponseTextKey(key string) bool {
+	switch key {
+	case "response_text", "response_text_snippet", "response_body", "response_body_raw", "body", "body_text":
+		return true
+	default:
+		return false
+	}
+}
+
+func isNetworkDiagnosticCredentialKey(key string) bool {
+	normalized := strings.NewReplacer("-", "_", " ", "_", ".", "_").Replace(strings.ToLower(strings.TrimSpace(key)))
+	switch key {
+	case "authorization", "cookie", "set-cookie", "set_cookie":
+		return true
+	}
+	switch normalized {
+	case "access_token", "authorization", "challenge_id", "client_secret", "cookie", "gopay_payment_challenge_id", "gopay_payment_pin_token", "gopay_pin_token", "otp", "payment_token", "pin", "refresh_token", "session", "session_json", "token":
+		return true
+	}
+	_, ok := sensitiveJSONKeys[normalized]
+	return ok
+}
+
+func safeNetworkDiagnosticURL(rawURL string) string {
+	trimmed := strings.TrimSpace(rawURL)
+	if trimmed == "" {
+		return ""
+	}
+	if parsed, err := url.Parse(trimmed); err == nil && parsed.Scheme != "" && parsed.Host != "" {
+		parsed.Fragment = safeNetworkDiagnosticFragment(parsed.Fragment)
+		parsed.RawQuery = redactRawQueryValues(parsed.RawQuery)
+		return parsed.String()
+	}
+	if idx := strings.Index(trimmed, "?"); idx >= 0 {
+		return trimmed[:idx+1] + redactRawQueryValues(trimmed[idx+1:])
+	}
+	return sanitizeNetworkDiagnosticText(trimmed)
+}
+
+func safeNetworkDiagnosticFragment(fragment string) string {
+	fragment = strings.TrimSpace(fragment)
+	if fragment == "" {
+		return ""
+	}
+	path, rawQuery, found := strings.Cut(fragment, "?")
+	if !found {
+		return fragment
+	}
+	return path + "?" + redactRawQueryValues(rawQuery)
+}
+
+func redactRawQueryValues(rawQuery string) string {
+	if rawQuery == "" {
+		return ""
+	}
+	parts := strings.Split(rawQuery, "&")
+	for i, part := range parts {
+		if part == "" {
+			continue
+		}
+		name, _, found := strings.Cut(part, "=")
+		if found {
+			parts[i] = name + "=" + maskedAuditValue
+		}
+	}
+	return strings.Join(parts, "&")
+}
+
+func summarizeNetworkDiagnosticHeaders(value any) map[string]any {
+	headers := flattenNetworkDiagnosticHeaders(value)
+	cleaned := make(map[string]any, len(headers))
+	keys := make([]string, 0, len(headers))
+	for key := range headers {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		cleaned[key] = networkDiagnosticHeaderSummary(headers[key])
+	}
+	return cleaned
+}
+
+func flattenNetworkDiagnosticHeaders(value any) map[string]string {
+	headers := make(map[string]string)
+	add := func(name string, headerValue any) {
+		name = strings.ToLower(strings.TrimSpace(name))
+		if name == "" {
+			return
+		}
+		headers[name] = stringifyJSONValue(headerValue)
+	}
+	switch typed := value.(type) {
+	case map[string]any:
+		for key, item := range typed {
+			add(key, item)
+		}
+	case map[string]string:
+		for key, item := range typed {
+			add(key, item)
+		}
+	case string:
+		lines := strings.Split(strings.ReplaceAll(typed, "\r\n", "\n"), "\n")
+		for _, line := range lines {
+			name, headerValue, ok := strings.Cut(line, ":")
+			if ok {
+				add(name, strings.TrimSpace(headerValue))
+			}
+		}
+	case []any:
+		for _, item := range typed {
+			switch header := item.(type) {
+			case map[string]any:
+				name := firstNonEmpty(stringifyJSONValue(header["name"]), stringifyJSONValue(header["key"]))
+				add(name, firstNonNil(header["value"], header["values"]))
+			case []any:
+				if len(header) >= 2 {
+					add(stringifyJSONValue(header[0]), header[1])
+				}
+			}
+		}
+	default:
+		if text := stringifyJSONValue(value); text != "" {
+			add("value", text)
+		}
+	}
+	return headers
+}
+
+func networkDiagnosticHeaderSummary(value string) map[string]any {
+	summary := networkDiagnosticFingerprint(value)
+	summary["prefix4"] = firstNRunes(value, 4)
+	summary["suffix4"] = lastNRunes(value, 4)
+	return summary
+}
+
+func networkDiagnosticCredentialSummary(value any) map[string]any {
+	text := stringifyJSONValue(value)
+	summary := networkDiagnosticFingerprint(text)
+	summary["tail4"] = lastNRunes(text, 4)
+	return summary
+}
+
+func networkDiagnosticFingerprint(value string) map[string]any {
+	sum := sha256.Sum256([]byte(value))
+	return map[string]any{
+		"present": true,
+		"length":  len(value),
+		"sha256":  hex.EncodeToString(sum[:]),
+	}
+}
+
+func firstNRunes(value string, n int) string {
+	runes := []rune(value)
+	if len(runes) <= n {
+		return value
+	}
+	return string(runes[:n])
+}
+
+func lastNRunes(value string, n int) string {
+	runes := []rune(value)
+	if len(runes) <= n {
+		return value
+	}
+	return string(runes[len(runes)-n:])
+}
+
+func summarizeNetworkDiagnosticResponseText(text string) map[string]any {
+	trimmed := strings.TrimSpace(text)
+	summary := map[string]any{
+		"present": len(trimmed) > 0,
+		"length":  len(trimmed),
+	}
+	if trimmed == "" {
+		return summary
+	}
+	var parsed any
+	if err := json.Unmarshal([]byte(trimmed), &parsed); err == nil {
+		fields := map[string]any{}
+		credentials := map[string]any{}
+		collectNetworkDiagnosticResponseFields(parsed, fields, credentials, 0)
+		summary["format"] = "json"
+		if len(fields) > 0 {
+			summary["fields"] = fields
+		}
+		if len(credentials) > 0 {
+			summary["credentials"] = credentials
+		}
+		return summary
+	}
+	summary["format"] = "text"
+	summary["text"] = sanitizeNetworkDiagnosticText(trimmed)
+	return summary
+}
+
+func collectNetworkDiagnosticResponseFields(value any, fields map[string]any, credentials map[string]any, depth int) {
+	if depth > 5 {
+		return
+	}
+	switch typed := value.(type) {
+	case map[string]any:
+		keys := make([]string, 0, len(typed))
+		for key := range typed {
+			keys = append(keys, key)
+		}
+		sort.Strings(keys)
+		for _, key := range keys {
+			item := typed[key]
+			normalized := strings.NewReplacer("-", "_", " ", "_", ".", "_").Replace(strings.ToLower(strings.TrimSpace(key)))
+			if isNetworkDiagnosticCredentialKey(normalized) {
+				credentials[key] = networkDiagnosticCredentialSummary(item)
+				continue
+			}
+			if _, ok := networkDiagnosticBodyFieldKeys[normalized]; ok {
+				fields[key] = sanitizeNetworkDiagnosticFieldValue(item)
+				continue
+			}
+			collectNetworkDiagnosticResponseFields(item, fields, credentials, depth+1)
+		}
+	case []any:
+		limit := len(typed)
+		if limit > 12 {
+			limit = 12
+		}
+		for i := 0; i < limit; i++ {
+			collectNetworkDiagnosticResponseFields(typed[i], fields, credentials, depth+1)
+		}
+	}
+}
+
+func sanitizeNetworkDiagnosticFieldValue(value any) any {
+	switch typed := value.(type) {
+	case string:
+		return sanitizeNetworkDiagnosticText(typed)
+	case float64, bool, nil:
+		return typed
+	default:
+		return sanitizeNetworkDiagnosticText(stringifyJSONValue(typed))
+	}
+}
+
+func sanitizeNetworkDiagnosticText(text string) string {
+	cleaned := strings.TrimSpace(text)
+	if cleaned == "" {
+		return ""
+	}
+	cleaned = networkDiagnosticJSONSecretPattern.ReplaceAllString(cleaned, `$1`+maskedAuditValue+`$2`)
+	cleaned = networkDiagnosticBearerPattern.ReplaceAllString(cleaned, "Bearer "+maskedAuditValue)
+	if len(cleaned) > midtransNetworkDiagnosticsTextLimit {
+		cleaned = cleaned[:midtransNetworkDiagnosticsTextLimit] + "..."
+	}
+	return cleaned
+}
+
+func writeMidtransNetworkDebugArtifact(baseDir string, accountID string, req gopayMidtransLinkingFillRequest, result map[string]any) (map[string]any, error) {
+	baseDir = strings.TrimSpace(baseDir)
+	if baseDir == "" {
+		baseDir = midtransNetworkDebugDir
+	}
+	if err := os.MkdirAll(baseDir, 0o700); err != nil {
+		return nil, err
+	}
+	fileName := fmt.Sprintf("%s_%s.json", sanitizeAuditFileName(firstNonEmpty(accountID, "unknown_account")), time.Now().Format("20060102_150405_000"))
+	path := filepath.Join(baseDir, fileName)
+	payload := map[string]any{
+		"created_at":          time.Now().Format(time.RFC3339Nano),
+		"account_id":          accountID,
+		"target_url":          safeNetworkDiagnosticURL(req.TargetURL),
+		"checkout_url":        safeNetworkDiagnosticURL(req.CheckoutURL),
+		"network_diagnostics": nil,
+		"browser_result":      sanitizeNetworkDiagnosticValue(result, ""),
+	}
+	if result != nil {
+		payload["network_diagnostics"] = result["network_diagnostics"]
+	}
+	data, err := json.MarshalIndent(payload, "", "  ")
+	if err != nil {
+		return nil, err
+	}
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		return nil, err
+	}
+	return map[string]any{
+		"path":       path,
+		"size_bytes": len(data),
+	}, nil
 }
 
 func boolMapValue(values map[string]any, key string) bool {
@@ -6273,11 +6975,13 @@ func handleGopayMidtransLinkingFill(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer conn.Close()
+	retryProfile := midtransLinkingRetryConfig(req.AggressiveRetry)
 	countryJSON := strconv.Quote(strings.TrimPrefix(req.CountryCode, "+"))
 	phoneJSON := strconv.Quote(req.PhoneNumber)
 	resultJSON, execErr := executeCDPScript(conn, fmt.Sprintf(`(async () => {
 		const countryCode = %s;
 		const phoneNumber = %s;
+		const aggressiveRetry = %t;
 		const wait = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 		const visible = (el) => !!el && !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length);
 		const textOf = (el) => ((el?.innerText || el?.textContent || '') + ' ' + (el?.getAttribute?.('aria-label') || '') + ' ' + (el?.getAttribute?.('title') || '')).replace(/\s+/g, ' ').trim();
@@ -6297,6 +7001,178 @@ func handleGopayMidtransLinkingFill(w http.ResponseWriter, r *http.Request) {
 			phone_number: phoneNumber,
 			found: { country: false, phone: false, button: false },
 		};
+		const networkDiagnostics = {
+			capture_method: 'fetch_xhr_wrapper',
+			started_at: new Date().toISOString(),
+			entries: [],
+			dropped_entries: 0,
+		};
+		result.network_diagnostics = networkDiagnostics;
+		const shouldCaptureNetworkURL = (raw) => {
+			const text = String(raw || '').toLowerCase();
+			return text.includes('midtrans') || text.includes('gopay') || text.includes('snap') || text.includes('tokenization') || text.includes('merchants-gws');
+		};
+		const safeNetworkURL = (raw) => {
+			try {
+				const parsed = new URL(String(raw || ''), window.location.href);
+				const names = [];
+				parsed.searchParams.forEach((_, key) => {
+					if (!names.includes(key)) names.push(key);
+				});
+				const query = names.map((key) => encodeURIComponent(key) + '=***').join('&');
+				let hash = parsed.hash || '';
+				if (hash.includes('?')) {
+					const parts = hash.split('?');
+					const hashRoute = parts.shift();
+					const hashQuery = new URLSearchParams(parts.join('?'));
+					const hashNames = [];
+					hashQuery.forEach((_, key) => {
+						if (!hashNames.includes(key)) hashNames.push(key);
+					});
+					hash = hashRoute + '?' + hashNames.map((key) => encodeURIComponent(key) + '=***').join('&');
+				}
+				return parsed.origin + parsed.pathname + (query ? '?' + query : '') + hash;
+			} catch (_) {
+				return String(raw || '').split('#')[0].slice(0, 220);
+			}
+		};
+		const headerEntriesFrom = (headers) => {
+			const out = {};
+			if (!headers) return out;
+			try {
+				if (typeof Headers !== 'undefined' && headers instanceof Headers) {
+					headers.forEach((value, key) => { out[String(key).toLowerCase()] = String(value); });
+					return out;
+				}
+				if (Array.isArray(headers)) {
+					headers.forEach((item) => {
+						if (Array.isArray(item) && item.length >= 2) out[String(item[0]).toLowerCase()] = String(item[1]);
+					});
+					return out;
+				}
+				if (typeof headers === 'object') {
+					Object.keys(headers).forEach((key) => { out[String(key).toLowerCase()] = String(headers[key]); });
+				}
+			} catch (_) {}
+			return out;
+		};
+		const mergeHeaderEntries = (...items) => {
+			const out = {};
+			items.forEach((item) => {
+				const entries = headerEntriesFrom(item);
+				Object.keys(entries).forEach((key) => { out[key] = entries[key]; });
+			});
+			return out;
+		};
+		const normalizeNetworkText = (text) => String(text || '')
+			.replace(/\s+/g, ' ')
+			.trim()
+			.slice(0, 1200);
+		const addNetworkEntry = (entry) => {
+			if (!entry || !shouldCaptureNetworkURL(entry.url)) return;
+			if (networkDiagnostics.entries.length >= 24) {
+				networkDiagnostics.dropped_entries += 1;
+				return;
+			}
+			const cleaned = { ...entry, url: safeNetworkURL(entry.url) };
+			if (cleaned.response_text_snippet) cleaned.response_text_snippet = normalizeNetworkText(cleaned.response_text_snippet);
+			if (cleaned.error) cleaned.error = normalizeNetworkText(cleaned.error);
+			networkDiagnostics.entries.push(cleaned);
+		};
+		const installNetworkDiagnostics = () => {
+			window.__gopayNetworkDiagnostics = networkDiagnostics;
+			window.__gopayRecordNetworkEntry = addNetworkEntry;
+			if (window.__gopayNetworkDiagnosticsInstalled) return;
+			window.__gopayNetworkDiagnosticsInstalled = true;
+			const originalFetch = window.fetch;
+			if (typeof originalFetch === 'function') {
+				window.fetch = async function(input, init) {
+					const rawURL = typeof input === 'string' ? input : (input && input.url) || String(input || '');
+					const method = String((init && init.method) || (input && input.method) || 'GET').toUpperCase();
+					const requestHeaders = mergeHeaderEntries(input && input.headers, init && init.headers);
+					const started = performance.now();
+					try {
+						const response = await originalFetch.apply(this, arguments);
+						const entry = {
+							kind: 'fetch',
+							method,
+							url: rawURL,
+							request_headers: requestHeaders,
+							response_headers: headerEntriesFrom(response.headers),
+							status: response.status,
+							ok: response.ok,
+							status_text: response.statusText || '',
+							elapsed_ms: Math.round(performance.now() - started),
+						};
+						if (shouldCaptureNetworkURL(rawURL)) {
+							try {
+								const text = await Promise.race([response.clone().text(), wait(900).then(() => '')]);
+								if (text) entry.response_text_snippet = text;
+							} catch (error) {
+								entry.response_read_error = String(error && error.message || error || '').slice(0, 180);
+							}
+						}
+						window.__gopayRecordNetworkEntry?.(entry);
+						return response;
+					} catch (error) {
+						window.__gopayRecordNetworkEntry?.({
+							kind: 'fetch',
+							method,
+							url: rawURL,
+							error: String(error && error.message || error || ''),
+							elapsed_ms: Math.round(performance.now() - started),
+						});
+						throw error;
+					}
+				};
+			}
+			const originalOpen = XMLHttpRequest.prototype.open;
+			const originalSetRequestHeader = XMLHttpRequest.prototype.setRequestHeader;
+			const originalSend = XMLHttpRequest.prototype.send;
+			XMLHttpRequest.prototype.open = function(method, url) {
+				this.__gopayNetworkInfo = { method: String(method || 'GET').toUpperCase(), url: String(url || ''), request_headers: {} };
+				return originalOpen.apply(this, arguments);
+			};
+			XMLHttpRequest.prototype.setRequestHeader = function(name, value) {
+				if (!this.__gopayNetworkInfo) this.__gopayNetworkInfo = { method: 'GET', url: '', request_headers: {} };
+				this.__gopayNetworkInfo.request_headers[String(name || '').toLowerCase()] = String(value || '');
+				return originalSetRequestHeader.apply(this, arguments);
+			};
+			XMLHttpRequest.prototype.send = function() {
+				const info = this.__gopayNetworkInfo || {};
+				const started = performance.now();
+				this.addEventListener('loadend', () => {
+					const entry = {
+						kind: 'xhr',
+						method: info.method || 'GET',
+						url: info.url || this.responseURL || '',
+						request_headers: info.request_headers || {},
+						response_headers: this.getAllResponseHeaders?.() || '',
+						status: this.status,
+						ok: this.status >= 200 && this.status < 400,
+						status_text: this.statusText || '',
+						elapsed_ms: Math.round(performance.now() - started),
+					};
+					try {
+						if (shouldCaptureNetworkURL(entry.url) && typeof this.responseText === 'string') {
+							entry.response_text_snippet = this.responseText.slice(0, 1200);
+						}
+					} catch (_) {}
+					window.__gopayRecordNetworkEntry?.(entry);
+				});
+				this.addEventListener('error', () => {
+					window.__gopayRecordNetworkEntry?.({
+						kind: 'xhr',
+						method: info.method || 'GET',
+						url: info.url || this.responseURL || '',
+						error: 'xhr error',
+						elapsed_ms: Math.round(performance.now() - started),
+					});
+				});
+				return originalSend.apply(this, arguments);
+			};
+		};
+		installNetworkDiagnostics();
 		const pageText = () => ((document.body?.innerText || document.body?.textContent || '')).replace(/\s+/g, ' ').trim();
 		const snapshotPage = () => ({
 			url: window.location.href,
@@ -6446,27 +7322,112 @@ func handleGopayMidtransLinkingFill(w http.ResponseWriter, r *http.Request) {
 			Object.assign(result, snapshotPage(), { stage: 'midtrans_country_code_not_selected' });
 			return JSON.stringify(result);
 		}
+		const hasTechnicalError = () => {
+			const text = pageText().toLowerCase();
+			return text.includes('technical error') || text.includes('please try again') || text.includes("we're working on it") || text.includes('we’re working on it');
+		};
+		const hasNextStep = () => {
+			const href = window.location.href.toLowerCase();
+			const text = pageText().toLowerCase();
+			return href.includes('merchants-gws-app.gopayapi.com') ||
+				href.includes('pin-web-client.gopayapi.com') ||
+				text.includes('otp dikirim') ||
+				text.includes('masukkin otp') ||
+				text.includes('masukkan otp') ||
+				text.includes('buat akun gopay') ||
+				text.includes('create gopay account') ||
+				text.includes('pin kamu');
+		};
+		const waitForPostClickState = async () => {
+			for (let i = 0; i < %d; i++) {
+				await wait(%d);
+				if (hasNextStep()) return 'next_step';
+				if (hasTechnicalError()) return 'technical_error';
+				if (!window.location.href.toLowerCase().includes('midtrans.com')) return 'navigated';
+			}
+			return hasTechnicalError() ? 'technical_error' : 'still_linking';
+		};
+		const clickBackFromTechnicalError = async () => {
+			const buttons = Array.from(document.querySelectorAll('button')).filter(visible);
+			const backButton = buttons.find((button) => /back|kembali|try again/i.test(textOf(button)));
+			result.technical_error_recovery_attempts = (result.technical_error_recovery_attempts || 0) + 1;
+			result.technical_error_back_button = backButton ? textOf(backButton).slice(0, 80) : '';
+			if (!backButton) return false;
+			clickElement(backButton);
+			await wait(%d);
+			for (let i = 0; i < 10; i++) {
+				if (looksLikeLinkingPage() && !hasTechnicalError()) return true;
+				await wait(500);
+			}
+			return looksLikeLinkingPage();
+		};
 
-		const buttons = Array.from(document.querySelectorAll('button')).filter(visible);
-		result.buttons = buttons.map((button) => ({ text: textOf(button).slice(0, 80), disabled: !!button.disabled })).slice(0, 8);
-		const submitButton = buttons.find((button) => {
-			const text = textOf(button).toLowerCase();
-			return text.includes('link and pay') || text.includes('hubungkan') || text.includes('bayar') || text.includes('continue') || text.includes('lanjut') || text.includes('pay');
-		});
-		if (submitButton) {
+		result.click_attempts = [];
+		for (let attempt = 1; attempt <= %d; attempt++) {
+			if (hasNextStep()) break;
+			if (hasTechnicalError()) {
+				const recovered = await clickBackFromTechnicalError();
+				result.click_attempts.push({ attempt, action: 'recover_technical_error', recovered });
+				if (!recovered) break;
+				await wait(700);
+			}
+			const buttons = Array.from(document.querySelectorAll('button')).filter(visible);
+			result.buttons = buttons.map((button) => ({ text: textOf(button).slice(0, 80), disabled: !!button.disabled })).slice(0, 8);
+			let submitButton = buttons.find((button) => {
+				const text = textOf(button).toLowerCase();
+				return text.includes('link and pay') || text.includes('hubungkan') || text.includes('bayar') || text.includes('continue') || text.includes('lanjut') || text.includes('pay');
+			});
+			if (!submitButton) {
+				result.click_attempts.push({ attempt, action: 'missing_button' });
+				break;
+			}
 			result.found.button = true;
 			result.button_text = textOf(submitButton).slice(0, 100);
 			result.button_disabled = !!submitButton.disabled;
-			if (!submitButton.disabled) {
-				submitButton.click();
-				result.clicked = true;
-				await wait(1500);
+			if (submitButton.disabled) {
+				for (let i = 0; i < %d && submitButton.disabled; i++) {
+					await wait(500);
+					const refreshedButtons = Array.from(document.querySelectorAll('button')).filter(visible);
+					submitButton = refreshedButtons.find((button) => {
+						const text = textOf(button).toLowerCase();
+						return text.includes('link and pay') || text.includes('hubungkan') || text.includes('bayar') || text.includes('continue') || text.includes('lanjut') || text.includes('pay');
+					}) || submitButton;
+				}
+				result.button_disabled_after_wait = !!submitButton.disabled;
 			}
+			if (submitButton.disabled) {
+				result.click_attempts.push({ attempt, action: 'button_disabled' });
+				break;
+			}
+			if (!countryVerified()) {
+				Object.assign(result, snapshotPage(), { stage: 'midtrans_country_code_not_selected' });
+				return JSON.stringify(result);
+			}
+			clickElement(submitButton);
+			result.clicked = true;
+			result.clicked_attempts = (result.clicked_attempts || 0) + 1;
+			const postClickState = await waitForPostClickState();
+			result.click_attempts.push({ attempt, action: 'click_link_and_pay', state: postClickState, url: window.location.href, snippet: pageText().slice(0, 240) });
+			if (postClickState === 'next_step' || postClickState === 'navigated') break;
+			if (postClickState === 'technical_error') continue;
+			if (postClickState === 'still_linking' && aggressiveRetry) continue;
+			break;
 		}
 		result.after_url = window.location.href;
 		result.page_text_snippet = ((document.body?.innerText || document.body?.textContent || '')).replace(/\s+/g, ' ').trim().slice(0, 1000);
+		result.aggressive_retry = aggressiveRetry;
+		networkDiagnostics.ended_at = new Date().toISOString();
+		networkDiagnostics.final_state = {
+			has_technical_error: hasTechnicalError(),
+			has_next_step: hasNextStep(),
+			entry_count: networkDiagnostics.entries.length,
+			dropped_entries: networkDiagnostics.dropped_entries,
+		};
+		if (hasTechnicalError()) {
+			result.stage = 'midtrans_linking_technical_error';
+		}
 		return JSON.stringify(result);
-	})()`, countryJSON, phoneJSON, accountID))
+	})()`, countryJSON, phoneJSON, req.AggressiveRetry, accountID, retryProfile.PostClickWaitCycles, retryProfile.PostClickWaitMs, retryProfile.RecoveryWaitMs, retryProfile.MaxClickAttempts, retryProfile.ButtonWaitCycles))
 	if execErr != nil {
 		writeJSON(w, http.StatusOK, map[string]any{"ok": false, "stage": "midtrans_linking_fill_failed", "account_id": accountID, "error": execErr.Error()})
 		return
@@ -6475,22 +7436,41 @@ func handleGopayMidtransLinkingFill(w http.ResponseWriter, r *http.Request) {
 	if resultJSON != "" {
 		_ = json.Unmarshal([]byte(resultJSON), &result)
 	}
+	sanitizeMidtransNetworkDiagnostics(result)
+	var debugArtifact map[string]any
+	var debugErr error
+	if req.DebugNetwork {
+		debugArtifact, debugErr = writeMidtransNetworkDebugArtifact(midtransNetworkDebugDir, accountID, req, result)
+	}
 	ok, stage := midtransLinkingFillOutcome(result)
 	claimed := false
 	if ok && req.CheckoutURL != "" {
 		claimed = claimGopayAutoTrigger(req.CheckoutURL)
 	}
-	writeJSON(w, http.StatusOK, map[string]any{
-		"ok":              ok,
-		"stage":           stage,
-		"account_id":      accountID,
-		"target_url":      req.TargetURL,
-		"checkout_url":    req.CheckoutURL,
-		"country_code":    req.CountryCode,
-		"phone_number":    req.PhoneNumber,
-		"trigger_claimed": claimed,
-		"browser_result":  result,
-	})
+	response := map[string]any{
+		"ok":               ok,
+		"stage":            stage,
+		"account_id":       accountID,
+		"target_url":       req.TargetURL,
+		"checkout_url":     req.CheckoutURL,
+		"country_code":     req.CountryCode,
+		"phone_number":     req.PhoneNumber,
+		"aggressive_retry": req.AggressiveRetry,
+		"trigger_claimed":  claimed,
+		"browser_result":   result,
+	}
+	if result != nil {
+		if diagnostics, ok := result["network_diagnostics"]; ok {
+			response["network_diagnostics"] = diagnostics
+		}
+	}
+	if debugArtifact != nil {
+		response["network_debug_artifact"] = debugArtifact
+	}
+	if debugErr != nil {
+		response["network_debug_error"] = debugErr.Error()
+	}
+	writeJSON(w, http.StatusOK, response)
 }
 
 func handleGopayForceLink(w http.ResponseWriter, r *http.Request) {
@@ -6925,6 +7905,7 @@ func handleGopayCDPOTP(w http.ResponseWriter, r *http.Request) {
 	defer r.Body.Close()
 	var req struct {
 		OTP string `json:"otp,omitempty"`
+		PIN string `json:"pin,omitempty"`
 	}
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<17)).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid json")
@@ -6947,9 +7928,18 @@ func handleGopayCDPOTP(w http.ResponseWriter, r *http.Request) {
 		return ""
 	}
 
-	target, err := findAnyTarget(cdpDebuggingPort, "merchants-gws-app.gopayapi.com")
-	if err != nil {
-		target, err = findAnyTarget(cdpDebuggingPort, "midtrans.com")
+	var target *cdpTarget
+	var err error
+	targetPatterns := []string{
+		"pin-web-client.gopayapi.com",
+		"merchants-gws-app.gopayapi.com",
+		"midtrans.com",
+	}
+	for _, pattern := range targetPatterns {
+		target, err = findAnyTarget(cdpDebuggingPort, pattern)
+		if err == nil {
+			break
+		}
 	}
 	if err != nil {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"ok": false, "error": err.Error()})
@@ -6962,48 +7952,7 @@ func handleGopayCDPOTP(w http.ResponseWriter, r *http.Request) {
 	}
 	defer conn.Close()
 
-	otp := strings.TrimSpace(req.OTP)
-	escapedOTP := strconv.Quote(otp)
-	resultJSON, _ := executeCDPScript(conn, fmt.Sprintf(`(async () => {
-		const fallbackOtp = %s;
-		const pageText = ((document.body && document.body.innerText) || document.documentElement.innerText || '').replace(/\s+/g, ' ').trim();
-		const htmlText = ((document.body && document.body.textContent) || '').replace(/\s+/g, ' ').trim();
-		const inputs = Array.from(document.querySelectorAll('input'));
-		const otpInput = inputs.find(el => el.type === 'number' || el.inputMode === 'numeric' || /otp|kode|code/i.test((el.placeholder || '') + ' ' + (el.name || '') + ' ' + (el.id || '')));
-		const findOtp = (text) => {
-			const match = String(text || '').match(/\b(\d{6})\b/);
-			return match ? match[1] : '';
-		};
-		const detected = findOtp(pageText) || findOtp(htmlText) || findOtp(inputs.map(el => el.value || '').join(' '));
-		let autoFilled = false;
-		let submitted = false;
-		let usedOtp = detected || fallbackOtp;
-		if (otpInput && usedOtp) {
-			const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set;
-			setter.call(otpInput, usedOtp);
-			otpInput.dispatchEvent(new Event('input', { bubbles: true }));
-			otpInput.dispatchEvent(new Event('change', { bubbles: true }));
-			autoFilled = true;
-			const btns = Array.from(document.querySelectorAll('button'));
-			const submitBtn = btns.find(b => {
-				const t = (b.textContent || '').toLowerCase();
-				return t.includes('verify') || t.includes('submit') || t.includes('kirim') || t.includes('lanjut') || t.includes('continue');
-			});
-			if (submitBtn && !submitBtn.disabled && detected) {
-				submitBtn.click();
-				submitted = true;
-			}
-		}
-		return JSON.stringify({
-			hasOTPField: !!otpInput,
-			detected_otp: detected,
-			used_otp: usedOtp,
-			auto_filled: autoFilled,
-			auto_submitted: submitted,
-			url: window.location.href,
-			page_text_snippet: pageText.slice(0, 1000)
-		});
-	})()`, escapedOTP))
+	resultJSON, _ := executeCDPScript(conn, gopayCDPFlowScript(strings.TrimSpace(req.PIN)))
 	var result map[string]any
 	if resultJSON != "" {
 		json.Unmarshal([]byte(resultJSON), &result)
@@ -7015,7 +7964,277 @@ func handleGopayCDPOTP(w http.ResponseWriter, r *http.Request) {
 			result["detected_otp"] = detected
 		}
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "result": result})
+	response := map[string]any{
+		"ok":                     true,
+		"stage":                  firstNonEmpty(stringifyJSONValue(result["page_stage"]), "page_observed"),
+		"pin_stage":              stringifyJSONValue(result["pin_stage"]),
+		"pin_auto_filled":        boolMapValue(result, "pin_auto_filled"),
+		"pin_auto_submitted":     boolMapValue(result, "pin_auto_submitted"),
+		"pin_input_strategy":     stringifyJSONValue(result["pin_input_strategy"]),
+		"balance_amount":         result["balance_amount"],
+		"balance_state":          stringifyJSONValue(result["balance_state"]),
+		"hubungkan_auto_clicked": boolMapValue(result, "hubungkan_auto_clicked"),
+		"pay_now_auto_clicked":   boolMapValue(result, "pay_now_auto_clicked"),
+		"auto_action_paused":     boolMapValue(result, "auto_action_paused"),
+		"auto_action_stage":      stringifyJSONValue(result["auto_action_stage"]),
+		"otp_manual_required":    boolMapValue(result, "otp_manual_required"),
+		"has_otp_field":          boolMapValue(result, "has_otp_field"),
+		"has_pin_field":          boolMapValue(result, "has_pin_field"),
+		"cdp_url_host":           stringifyJSONValue(result["cdp_url_host"]),
+		"cdp_url_path":           stringifyJSONValue(result["cdp_url_path"]),
+		"result":                 result,
+	}
+	writeJSON(w, http.StatusOK, response)
+}
+
+func gopayCDPFlowScript(preferredPIN string) string {
+	return fmt.Sprintf(`(async () => {
+		const preferredPin = %s;
+		const currentURL = window.location.href || '';
+		const parsedURL = (() => { try { return new URL(currentURL); } catch (_err) { return null; } })();
+		const urlHost = (parsedURL?.host || '').toLowerCase();
+		const urlPath = (parsedURL?.pathname || '').toLowerCase();
+		const actionScope = urlHost + urlPath;
+		const result = {
+			url: currentURL,
+			cdp_url_host: urlHost,
+			cdp_url_path: urlPath,
+			page_stage: 'page_observed',
+			pin_stage: '',
+			has_otp_field: false,
+			has_pin_field: false,
+			pin_auto_filled: false,
+			pin_auto_submitted: false,
+			pin_input_strategy: '',
+			balance_amount: null,
+			balance_state: '',
+			hubungkan_auto_clicked: false,
+			pay_now_auto_clicked: false,
+			auto_action_paused: false,
+			auto_action_stage: '',
+			otp_manual_required: false,
+			detected_otp: '',
+			page_text_snippet: '',
+			already_handled: false,
+		};
+		const visible = (el) => !!el && !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length);
+		const wait = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+		const normalizeText = (value) => String(value || '').replace(/\s+/g, ' ').trim();
+		const pageText = normalizeText((document.body && document.body.innerText) || document.documentElement.innerText || '');
+		const lowerText = pageText.toLowerCase();
+		result.page_text_snippet = pageText.slice(0, 1000);
+		const allInputs = Array.from(document.querySelectorAll('input')).filter((el) => visible(el) && el.type !== 'hidden');
+		const allButtons = Array.from(document.querySelectorAll('button')).filter(visible);
+		const allActionElements = Array.from(document.querySelectorAll('button, [role="button"]')).filter(visible);
+		const metaText = (el) => normalizeText([
+			el?.type,
+			el?.inputMode,
+			el?.name,
+			el?.id,
+			el?.placeholder,
+			el?.autocomplete,
+			el?.getAttribute?.('aria-label'),
+			el?.getAttribute?.('data-testid'),
+			el?.getAttribute?.('data-test')
+		].join(' ')).toLowerCase();
+		const isDisabled = (el) => !!el && (
+			!!el.disabled ||
+			el.getAttribute?.('aria-disabled') === 'true' ||
+			!!el.closest?.('[aria-disabled="true"]')
+		);
+		const elementLabel = (el) => {
+			for (const value of [
+				el?.innerText,
+				el?.textContent,
+				el?.value,
+				el?.getAttribute?.('aria-label'),
+				el?.getAttribute?.('title')
+			]) {
+				const text = normalizeText(value);
+				if (text) return text;
+			}
+			return '';
+		};
+		const setNativeValue = (el, value) => {
+			const proto = el instanceof HTMLInputElement ? HTMLInputElement.prototype : HTMLElement.prototype;
+			const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
+			if (setter) {
+				setter.call(el, value);
+			} else {
+				el.value = value;
+			}
+			el.dispatchEvent(new Event('input', { bubbles: true }));
+			el.dispatchEvent(new Event('change', { bubbles: true }));
+		};
+		const clickElement = (el) => {
+			if (!el || isDisabled(el)) return false;
+			el.focus();
+			el.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
+			el.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
+			el.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+			return true;
+		};
+		const storageGet = (key) => {
+			try { return window.sessionStorage?.getItem(key) === '1'; } catch (_err) { return false; }
+		};
+		const storageSet = (key) => {
+			try { window.sessionStorage?.setItem(key, '1'); } catch (_err) {}
+		};
+		const storageSetNow = (key) => {
+			try { window.sessionStorage?.setItem(key, String(Date.now())); } catch (_err) {}
+		};
+		const storageFresh = (key, ttlMs) => {
+			try {
+				const value = Number(window.sessionStorage?.getItem(key) || 0);
+				return Number.isFinite(value) && value > 0 && Date.now() - value < ttlMs;
+			} catch (_err) {
+				return false;
+			}
+		};
+		const findOtp = (text) => {
+			const match = String(text || '').match(/\b(\d{6})\b/);
+			return match ? match[1] : '';
+		};
+		const findActionByExactText = (labels) => {
+			const wanted = labels.map((label) => normalizeText(label).toLowerCase());
+			return allActionElements.find((el) => !isDisabled(el) && wanted.includes(elementLabel(el).toLowerCase()));
+		};
+		const findStableActionByExactText = async (labels) => {
+			const first = findActionByExactText(labels);
+			if (!first) return null;
+			await wait(350);
+			return findActionByExactText(labels);
+		};
+		const parseIDRAmount = (text) => {
+			const match = String(text || '').match(/\bRp\s*([0-9][0-9.,]*)\b/i);
+			if (!match) return null;
+			const digits = match[1].replace(/[^\d]/g, '');
+			if (!digits) return null;
+			const amount = Number(digits);
+			return Number.isFinite(amount) ? amount : null;
+		};
+		const findBalanceAmount = () => {
+			const labeledBalance = pageText.match(/(?:balance|saldo|available|gopay)[\s\S]{0,80}\bRp\s*[0-9][0-9.,]*\b/i) ||
+				pageText.match(/\bRp\s*[0-9][0-9.,]*\b[\s\S]{0,80}(?:balance|saldo|available|gopay)/i);
+			if (labeledBalance) {
+				const amount = parseIDRAmount(labeledBalance[0]);
+				if (amount !== null) return amount;
+			}
+			const pageMatches = Array.from(pageText.matchAll(/\bRp\s*([0-9][0-9.,]*)\b/gi));
+			if (pageMatches.length === 1) {
+				return parseIDRAmount(pageMatches[0][0]);
+			}
+			return null;
+		};
+		const otpInput = allInputs.find((el) => {
+			const meta = metaText(el);
+			return meta.includes('otp') || meta.includes('kode') || meta.includes('verification code') || meta.includes('one time');
+		});
+		result.has_otp_field = !!otpInput;
+		result.detected_otp = findOtp(pageText) || findOtp(allInputs.map((el) => el.value || '').join(' '));
+		const pinKeyword = (meta) => meta.includes('pin') || meta.includes('passcode') || meta.includes('security code');
+		const otpKeyword = (meta) => meta.includes('otp') || meta.includes('kode') || meta.includes('verification code');
+		const pinInputs = allInputs.filter((el) => {
+			const meta = metaText(el);
+			if (otpKeyword(meta)) return false;
+			if (pinKeyword(meta)) return true;
+			if (el.type === 'password') return true;
+			if ((el.inputMode || '').toLowerCase() === 'numeric' && Number(el.maxLength || 0) === 1) return true;
+			return false;
+		});
+		result.has_pin_field = pinInputs.length > 0;
+
+		const otpPage = urlPath.includes('/linking/otp') || lowerText.includes('otp') || lowerText.includes('verification code');
+		const pinPage = urlHost.includes('pin-web-client.gopayapi.com') || lowerText.includes('pin kamu') || lowerText.includes('masukkan pin') || lowerText.includes('enter your pin');
+		const paymentContext = lowerText.includes('payment') || lowerText.includes('bayar') || lowerText.includes('pembayaran') || lowerText.includes('total') || lowerText.includes('subscribe') || lowerText.includes('subscription');
+		const bindingContext = lowerText.includes('link') || lowerText.includes('hubungkan') || lowerText.includes('authorize') || lowerText.includes('otorisasi') || lowerText.includes('account') || lowerText.includes('akun');
+
+		if (otpPage) {
+			result.page_stage = 'otp_entry';
+			result.otp_manual_required = true;
+		} else if (pinPage) {
+			result.pin_stage = paymentContext && !bindingContext ? 'payment' : 'binding';
+			result.page_stage = result.pin_stage === 'payment' ? 'pin_entry_payment' : 'pin_entry_binding';
+		}
+
+		const isGoPayActionPage = urlHost.includes('gopayapi.com') ||
+			(urlHost.includes('midtrans.com') && (lowerText.includes('gopay') || lowerText.includes('go pay'))) ||
+			(lowerText.includes('openai llc') && (lowerText.includes('gopay') || lowerText.includes('go pay')));
+		if (isGoPayActionPage) {
+			const balanceAmount = findBalanceAmount();
+			if (balanceAmount !== null) {
+				result.balance_amount = balanceAmount;
+				result.balance_state = balanceAmount === 0 ? 'rp0' : (balanceAmount === 1 ? 'rp1' : 'other');
+			}
+		}
+
+		if (isGoPayActionPage && result.balance_state === 'rp0') {
+			result.page_stage = 'balance_wait_rp0';
+			result.auto_action_paused = true;
+			result.auto_action_stage = 'balance_wait_rp0';
+		} else if (isGoPayActionPage) {
+			const hubungkanButton = await findStableActionByExactText(['Hubungkan']);
+			const hubungkanKey = 'gopay_cdp_hubungkan_' + actionScope;
+			const hubungkanCooldownKey = 'gopay_cdp_hubungkan_cooldown_' + actionScope;
+			if (hubungkanButton && !storageGet(hubungkanKey) && !storageFresh(hubungkanCooldownKey, 10000)) {
+				storageSet(hubungkanKey);
+				storageSetNow(hubungkanCooldownKey);
+				clickElement(hubungkanButton);
+				result.page_stage = 'gopay_consent_hubungkan';
+				result.hubungkan_auto_clicked = true;
+				result.auto_action_stage = 'gopay_consent_hubungkan';
+			} else if (result.balance_state === 'rp1') {
+				const payNowButton = await findStableActionByExactText(['Pay now']);
+				const payNowKey = 'gopay_cdp_pay_now_rp1_' + actionScope;
+				const payNowCooldownKey = 'gopay_cdp_pay_now_cooldown_' + actionScope;
+				if (payNowButton && !storageGet(payNowKey) && !storageFresh(payNowCooldownKey, 10000)) {
+					storageSet(payNowKey);
+					storageSetNow(payNowCooldownKey);
+					clickElement(payNowButton);
+					result.page_stage = 'pay_now_rp1';
+					result.pay_now_auto_clicked = true;
+					result.auto_action_stage = 'pay_now_rp1';
+				} else {
+					result.page_stage = 'balance_rp1_observed';
+					result.auto_action_stage = 'balance_rp1_observed';
+				}
+			}
+		}
+
+		const handledKey = 'gopay_cdp_handled_' + result.page_stage + '_' + actionScope;
+		result.already_handled = storageGet(handledKey);
+
+		const singlePinInput = pinInputs.find((el) => Number(el.maxLength || 0) >= 6 || Number(el.maxLength || 0) === 0 || el.type === 'password');
+		const splitPinInputs = pinInputs.filter((el) => Number(el.maxLength || 0) === 1).slice(0, 6);
+		if (!result.auto_action_paused && result.page_stage.startsWith('pin_entry_') && preferredPin && preferredPin.length === 6 && !result.already_handled) {
+			if (singlePinInput) {
+				setNativeValue(singlePinInput, preferredPin);
+				result.pin_auto_filled = true;
+				result.pin_input_strategy = 'single_input';
+			} else if (splitPinInputs.length >= 6) {
+				preferredPin.split('').slice(0, 6).forEach((digit, index) => {
+					setNativeValue(splitPinInputs[index], digit);
+				});
+				result.pin_auto_filled = true;
+				result.pin_input_strategy = 'split_inputs';
+			}
+			if (result.pin_auto_filled) {
+				const actionButton = allButtons.find((button) => {
+					const text = normalizeText(button.textContent).toLowerCase();
+					return text.includes('verify') || text.includes('continue') || text.includes('lanjut') || text.includes('confirm') || text.includes('pay') || text.includes('bayar') || text.includes('submit');
+				});
+				if (actionButton && !actionButton.disabled) {
+					clickElement(actionButton);
+					result.pin_auto_submitted = true;
+				}
+				if (result.pin_auto_submitted) {
+					storageSet(handledKey);
+				}
+			}
+		}
+
+		return JSON.stringify(result);
+	})()`, strconv.Quote(strings.TrimSpace(preferredPIN)))
 }
 
 func handleGopaySnapProbe(w http.ResponseWriter, r *http.Request) {

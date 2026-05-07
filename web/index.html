@@ -6,7 +6,7 @@
     <meta name="description" content="OpenAI 支付长链接生成器">
     <title>Checkout Workbench</title>
     <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%2308745f'/%3E%3Cpath d='M8 10h16v4H8zM8 18h11v4H8z' fill='white'/%3E%3C/svg%3E">
-    <link rel="stylesheet" href="/styles.css?v=20260507b">
+    <link rel="stylesheet" href="/styles.css?v=20260508a">
   </head>
   <body>
     <main class="shell">
@@ -41,6 +41,7 @@
       </nav>
 
       <section class="workspace">
+        <div class="left-column">
         <div class="panel form-panel">
           <div class="panel-head">
             <div>
@@ -95,7 +96,152 @@
           </form>
         </div>
 
-        <div class="panel result-panel" id="resultPanel">
+          <div class="panel gopay-panel" id="gopayPanel">
+          <div class="panel-head">
+            <h2>GoPay 一键绑定</h2>
+            <span id="gopayBadge" class="badge neutral">就绪</span>
+          </div>
+
+          <div class="gopay-form">
+            <div class="gopay-field-row">
+              <label class="gopay-field">
+                <span>Account ID</span>
+                <input id="gopayAccountId" placeholder="从支付链接 URL 提取的 gopay_guid" autocomplete="off">
+              </label>
+            </div>
+            <div class="gopay-field-row gopay-two-col">
+              <label class="gopay-field">
+                <span>手机号</span>
+                <input id="gopayPhone" value="18120322232" placeholder="18120322232" autocomplete="off">
+              </label>
+              <label class="gopay-field">
+                <span>6 位 OTP 验证码</span>
+                <input id="gopayOTP" type="text" inputmode="numeric" maxlength="6" placeholder="输入收到的 OTP" autocomplete="off">
+              </label>
+            </div>
+            <details class="section-box compact-options">
+              <summary class="section-title">
+                <span>GoPay 高级选项</span>
+                <small>国家码 / 通道 / PIN / 监控</small>
+              </summary>
+              <div class="gopay-field-row gopay-two-col">
+                <label class="gopay-field">
+                  <span>国家码</span>
+                  <input id="gopayCountryCode" value="86" placeholder="86" autocomplete="off">
+                </label>
+                <label class="gopay-field">
+                  <span>OTP 通道</span>
+                  <select id="gopayOTPChannel">
+                    <option value="whatsapp" selected>WhatsApp</option>
+                    <option value="sms">SMS</option>
+                  </select>
+                </label>
+              </div>
+              <div class="gopay-field-row">
+                <label class="gopay-field">
+                  <span>6 位 GoPay PIN（记住上次值，用于绑定授权 PIN 和支付确认 PIN）</span>
+                  <input id="gopayPINCode" type="password" inputmode="numeric" maxlength="6" placeholder="输入 GoPay PIN，将默认记住上次值（仅当前浏览器）" autocomplete="off">
+                </label>
+              </div>
+              <div class="gopay-field-row">
+                <label class="gopay-check">
+                  <input id="gopayAggressiveRetry" type="checkbox">
+                  <span>支付页遇到弹窗/延迟时，开启保守连续重试 Link and pay</span>
+                </label>
+              </div>
+            </details>
+            <div class="gopay-toolbar">
+              <button id="gopayLinkBtn" type="button">GoPay 一键绑定</button>
+              <button id="gopayMonitorBtn" type="button" class="secondary-button">开始流程监控</button>
+            </div>
+          </div>
+
+          <div id="gopayStepFlow" class="step-flow" hidden>
+            <div class="step-flow-item" data-gopay-step="linking">
+              <span class="step-dot"></span>
+              <div>
+                <strong>Linking</strong>
+                <p id="gopayLinkingText">等待提交</p>
+              </div>
+            </div>
+            <div class="step-flow-item" data-gopay-step="reference">
+              <span class="step-dot"></span>
+              <div>
+                <strong>验证引用</strong>
+                <p id="gopayReferenceText">等待提交</p>
+              </div>
+            </div>
+            <div class="step-flow-item" data-gopay-step="consent">
+              <span class="step-dot"></span>
+              <div>
+                <strong>触发 OTP</strong>
+                <p id="gopayConsentText">等待提交</p>
+              </div>
+            </div>
+            <div class="step-flow-item" data-gopay-step="otp">
+              <span class="step-dot"></span>
+              <div>
+                <strong>验证 OTP</strong>
+                <p id="gopayOTPText">等待提交</p>
+              </div>
+            </div>
+            <div class="step-flow-item" data-gopay-step="pin">
+              <span class="step-dot"></span>
+              <div>
+                <strong>PIN 验证</strong>
+                <p id="gopayPINText">等待提交</p>
+              </div>
+            </div>
+            <div class="step-flow-item" data-gopay-step="success">
+              <span class="step-dot"></span>
+              <div>
+                <strong>绑定完成</strong>
+                <p id="gopaySuccessText">等待提交</p>
+              </div>
+            </div>
+          </div>
+
+          <div id="gopayResult" class="gopay-result" hidden>
+            <div class="gopay-result-grid">
+              <div>
+                <span class="metric-label">Link 状态</span>
+                <strong id="gopayLinkStatus">-</strong>
+              </div>
+              <div>
+                <span class="metric-label">Reference ID</span>
+                <strong id="gopayRefID">-</strong>
+              </div>
+              <div>
+                <span class="metric-label">耗时</span>
+                <strong id="gopayLatency">-</strong>
+              </div>
+            </div>
+            <pre id="gopayOutput">{}</pre>
+          </div>
+          </div>
+        </div>
+
+        <div class="center-column">
+          <div class="panel monitor-panel">
+            <div id="gopayMonitor" class="gopay-monitor">
+              <div class="monitor-head">
+                <h3>流程监控</h3>
+                <span id="monitorBadge" class="badge neutral">空闲</span>
+              </div>
+              <div class="monitor-summary" id="monitorSummary" hidden>
+                <span>网络请求: <strong id="monitorNetCount">0</strong></span>
+                <span>页面跳转: <strong id="monitorPageCount">0</strong></span>
+                <span>API 调用: <strong id="monitorAPICount">0</strong></span>
+                <span>JS 错误: <strong id="monitorErrorCount">0</strong></span>
+              </div>
+              <div class="monitor-log" id="monitorLog">
+                <div class="monitor-empty">点击「开始流程监控」抓取页面全流程数据</div>
+              </div>
+              <pre id="monitorOutput" hidden>{}</pre>
+            </div>
+          </div>
+
+          <div class="panel result-panel" id="resultPanel">
           <div class="panel-head">
             <h2>生成结果</h2>
             <span id="latency" class="badge neutral">空闲</span>
@@ -200,147 +346,13 @@
             <pre id="output">{}</pre>
           </details>
         </div>
+        </div>
 
         <div class="tools-column">
           <div class="tool-tabs" role="tablist" aria-label="工具面板切换">
             <a class="tool-tab" href="#gopayPanel">GoPay</a>
             <a class="tool-tab" href="#browserUsePanel">Browser Use</a>
           </div>
-
-          <div class="panel gopay-panel" id="gopayPanel">
-          <div class="panel-head">
-            <h2>GoPay 一键绑定</h2>
-            <span id="gopayBadge" class="badge neutral">就绪</span>
-          </div>
-
-          <div class="gopay-form">
-            <div class="gopay-field-row">
-              <label class="gopay-field">
-                <span>Account ID</span>
-                <input id="gopayAccountId" placeholder="从支付链接 URL 提取的 gopay_guid" autocomplete="off">
-              </label>
-            </div>
-            <div class="gopay-field-row gopay-two-col">
-              <label class="gopay-field">
-                <span>手机号</span>
-                <input id="gopayPhone" value="18120322232" placeholder="18120322232" autocomplete="off">
-              </label>
-              <label class="gopay-field">
-                <span>6 位 OTP 验证码</span>
-                <input id="gopayOTP" type="text" inputmode="numeric" maxlength="6" placeholder="输入收到的 OTP" autocomplete="off">
-              </label>
-            </div>
-            <details class="section-box compact-options">
-              <summary class="section-title">
-                <span>GoPay 高级选项</span>
-                <small>国家码 / 通道 / PIN / 监控</small>
-              </summary>
-              <div class="gopay-field-row gopay-two-col">
-                <label class="gopay-field">
-                  <span>国家码</span>
-                  <input id="gopayCountryCode" value="86" placeholder="86" autocomplete="off">
-                </label>
-                <label class="gopay-field">
-                  <span>OTP 通道</span>
-                  <select id="gopayOTPChannel">
-                    <option value="whatsapp" selected>WhatsApp</option>
-                    <option value="sms">SMS</option>
-                  </select>
-                </label>
-              </div>
-              <div class="gopay-field-row">
-                <label class="gopay-field">
-                  <span>6 位 GoPay PIN（复用已绑定账号或支付阶段使用）</span>
-                  <input id="gopayPINCode" type="password" inputmode="numeric" maxlength="6" placeholder="输入 GoPay PIN，不会保存在本地" autocomplete="off">
-                </label>
-              </div>
-            </details>
-            <div class="gopay-toolbar">
-              <button id="gopayLinkBtn" type="button">GoPay 一键绑定</button>
-              <button id="gopayMonitorBtn" type="button" class="secondary-button">开始流程监控</button>
-            </div>
-          </div>
-
-          <div id="gopayStepFlow" class="step-flow" hidden>
-            <div class="step-flow-item" data-gopay-step="linking">
-              <span class="step-dot"></span>
-              <div>
-                <strong>Linking</strong>
-                <p id="gopayLinkingText">等待提交</p>
-              </div>
-            </div>
-            <div class="step-flow-item" data-gopay-step="reference">
-              <span class="step-dot"></span>
-              <div>
-                <strong>验证引用</strong>
-                <p id="gopayReferenceText">等待提交</p>
-              </div>
-            </div>
-            <div class="step-flow-item" data-gopay-step="consent">
-              <span class="step-dot"></span>
-              <div>
-                <strong>触发 OTP</strong>
-                <p id="gopayConsentText">等待提交</p>
-              </div>
-            </div>
-            <div class="step-flow-item" data-gopay-step="otp">
-              <span class="step-dot"></span>
-              <div>
-                <strong>验证 OTP</strong>
-                <p id="gopayOTPText">等待提交</p>
-              </div>
-            </div>
-            <div class="step-flow-item" data-gopay-step="pin">
-              <span class="step-dot"></span>
-              <div>
-                <strong>PIN 验证</strong>
-                <p id="gopayPINText">等待提交</p>
-              </div>
-            </div>
-            <div class="step-flow-item" data-gopay-step="success">
-              <span class="step-dot"></span>
-              <div>
-                <strong>绑定完成</strong>
-                <p id="gopaySuccessText">等待提交</p>
-              </div>
-            </div>
-          </div>
-
-          <div id="gopayResult" class="gopay-result" hidden>
-            <div class="gopay-result-grid">
-              <div>
-                <span class="metric-label">Link 状态</span>
-                <strong id="gopayLinkStatus">-</strong>
-              </div>
-              <div>
-                <span class="metric-label">Reference ID</span>
-                <strong id="gopayRefID">-</strong>
-              </div>
-              <div>
-                <span class="metric-label">耗时</span>
-                <strong id="gopayLatency">-</strong>
-              </div>
-            </div>
-            <pre id="gopayOutput">{}</pre>
-          </div>
-
-          <div id="gopayMonitor" class="gopay-monitor" hidden>
-            <div class="monitor-head">
-              <h3>流程监控</h3>
-              <span id="monitorBadge" class="badge neutral">空闲</span>
-            </div>
-            <div class="monitor-summary" id="monitorSummary" hidden>
-              <span>网络请求: <strong id="monitorNetCount">0</strong></span>
-              <span>页面跳转: <strong id="monitorPageCount">0</strong></span>
-              <span>API 调用: <strong id="monitorAPICount">0</strong></span>
-              <span>JS 错误: <strong id="monitorErrorCount">0</strong></span>
-            </div>
-            <div class="monitor-log" id="monitorLog">
-              <div class="monitor-empty">点击「开始流程监控」抓取页面全流程数据</div>
-            </div>
-            <pre id="monitorOutput" hidden>{}</pre>
-          </div>
-        </div>
 
           <div class="panel browser-use-panel" id="browserUsePanel">
           <div class="panel-head">
@@ -466,7 +478,7 @@
       </div>
     </div>
 
-    <script src="/app.js?v=20260507a"></script>
+    <script src="/app.js?v=20260508a"></script>
     <script>
       const browserUseUrl = document.querySelector("#browserUseUrl");
       const browserUseTask = document.querySelector("#browserUseTask");
@@ -773,7 +785,7 @@
         prefillBrowserUseExample();
       });
 
-      void checkBrowserUseHealth();
+      window.setTimeout(checkBrowserUseHealth, 1800);
     </script>
   </body>
 </html>

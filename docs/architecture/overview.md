@@ -135,6 +135,21 @@ browser-use-service
   → 返回 stage、stages、summary、payment_voucher 等诊断信息
 ```
 
+### GoPay 自动触发快速路径
+
+支付页面点击“订阅”后，前端的 checkout 提交监听器会轮询 `/api/checkout/resolve-target`，一旦检测到当前 checkout 已提交并出现 Midtrans redirection/linking 页面，就调用 `/api/gopay/auto-trigger-check` 做条件判定；条件满足时立即调用 `/api/gopay/midtrans-linking-fill`。
+
+这条路径响应很快，主要来自以下设计：
+
+- 前端在自动填地址完成后就启动提交监听器，不再等用户手动点击工具里的“GoPay 一键绑定”。
+- 监听器只在检测到当前 checkout 已提交、且 Midtrans redirection 页面出现后触发，避免提前调用后端 full-link 管道。
+- 后端通过 Chrome CDP 直接连接已经打开的 Midtrans 页面，在页面上下文内选择国家码、填写手机号并点击 `Link and pay`，省掉新建浏览器会话和重新解析 checkout 的成本。
+- 自动触发使用 checkout key 做一次性去重，同一个 checkout 只触发一次，避免重复点击造成页面状态抖动。
+- 点击后采用状态驱动等待：如果进入 OTP/PIN/GoPay 下一步就立即返回；如果出现 `technical error`，会记录并进行有限恢复，不再把“已点击”误判为成功。
+- 点击窗口内会临时安装 fetch/XHR 诊断钩子，记录 Midtrans/GoPay 相关请求的状态码、耗时、header 摘要和响应诊断字段，便于后续从 `log/` 定位 4xx、5xx、风控或会话异常。
+
+因此，当前“Link and pay”自动触发的体感速度主要来自前端提前布置监听器和后端 CDP 原地注入的组合优化，而不是完整 GoPay full-link 后端流程变快。
+
 ### browser-use 自动化流程
 
 ```text
