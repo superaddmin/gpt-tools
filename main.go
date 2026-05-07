@@ -6414,32 +6414,32 @@ func midtransLinkingFillOutcome(result map[string]any) (bool, string) {
 }
 
 type midtransLinkingRetryProfile struct {
-	MaxClickAttempts    int
-	ButtonWaitCycles    int
-	PostClickWaitCycles int
-	PostClickWaitMs     int
-	RecoveryWaitMs      int
-	RetryStillLinking   bool
+	ButtonWaitCycles       int
+	PostClickWaitCycles    int
+	PostClickWaitMs        int
+	RecoveryWaitMs         int
+	RetryStillLinking      bool
+	UnboundedUntilNextStep bool
 }
 
 func midtransLinkingRetryConfig(aggressive bool) midtransLinkingRetryProfile {
 	if aggressive {
 		return midtransLinkingRetryProfile{
-			MaxClickAttempts:    5,
-			ButtonWaitCycles:    18,
-			PostClickWaitCycles: 24,
-			PostClickWaitMs:     900,
-			RecoveryWaitMs:      1400,
-			RetryStillLinking:   true,
+			ButtonWaitCycles:       18,
+			PostClickWaitCycles:    24,
+			PostClickWaitMs:        900,
+			RecoveryWaitMs:         1400,
+			RetryStillLinking:      true,
+			UnboundedUntilNextStep: true,
 		}
 	}
 	return midtransLinkingRetryProfile{
-		MaxClickAttempts:    3,
-		ButtonWaitCycles:    8,
-		PostClickWaitCycles: 18,
-		PostClickWaitMs:     500,
-		RecoveryWaitMs:      900,
-		RetryStillLinking:   false,
+		ButtonWaitCycles:       8,
+		PostClickWaitCycles:    18,
+		PostClickWaitMs:        500,
+		RecoveryWaitMs:         900,
+		RetryStillLinking:      true,
+		UnboundedUntilNextStep: true,
 	}
 }
 
@@ -6975,6 +6975,10 @@ func handleGopayMidtransLinkingFill(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer conn.Close()
+	go func() {
+		<-r.Context().Done()
+		_ = conn.Close()
+	}()
 	retryProfile := midtransLinkingRetryConfig(req.AggressiveRetry)
 	countryJSON := strconv.Quote(strings.TrimPrefix(req.CountryCode, "+"))
 	phoneJSON := strconv.Quote(req.PhoneNumber)
@@ -6982,6 +6986,12 @@ func handleGopayMidtransLinkingFill(w http.ResponseWriter, r *http.Request) {
 		const countryCode = %s;
 		const phoneNumber = %s;
 		const aggressiveRetry = %t;
+		const retryStillLinking = %t;
+		const postClickWaitCycles = %d;
+		const postClickWaitMs = %d;
+		const recoveryWaitMs = %d;
+		const buttonWaitCycles = %d;
+		const unboundedUntilNextStep = %t;
 		const wait = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 		const visible = (el) => !!el && !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length);
 		const textOf = (el) => ((el?.innerText || el?.textContent || '') + ' ' + (el?.getAttribute?.('aria-label') || '') + ' ' + (el?.getAttribute?.('title') || '')).replace(/\s+/g, ' ').trim();
@@ -7339,8 +7349,8 @@ func handleGopayMidtransLinkingFill(w http.ResponseWriter, r *http.Request) {
 				text.includes('pin kamu');
 		};
 		const waitForPostClickState = async () => {
-			for (let i = 0; i < %d; i++) {
-				await wait(%d);
+			for (let i = 0; i < postClickWaitCycles; i++) {
+				await wait(postClickWaitMs);
 				if (hasNextStep()) return 'next_step';
 				if (hasTechnicalError()) return 'technical_error';
 				if (!window.location.href.toLowerCase().includes('midtrans.com')) return 'navigated';
@@ -7354,22 +7364,48 @@ func handleGopayMidtransLinkingFill(w http.ResponseWriter, r *http.Request) {
 			result.technical_error_back_button = backButton ? textOf(backButton).slice(0, 80) : '';
 			if (!backButton) return false;
 			clickElement(backButton);
-			await wait(%d);
+			await wait(recoveryWaitMs);
 			for (let i = 0; i < 10; i++) {
 				if (looksLikeLinkingPage() && !hasTechnicalError()) return true;
 				await wait(500);
 			}
-			return looksLikeLinkingPage();
+			return looksLikeLinkingPage() && !hasTechnicalError();
 		};
 
 		result.click_attempts = [];
-		for (let attempt = 1; attempt <= %d; attempt++) {
+		result.technical_error_back_loop = true;
+		result.unbounded_until_next_step = unboundedUntilNextStep;
+		result.total_click_attempts = 0;
+		const recordClickAttempt = (entry) => {
+			result.total_click_attempts += 1;
+			result.last_click_attempt = entry;
+			if (result.click_attempts.length < 80) {
+				result.click_attempts.push(entry);
+			} else {
+				result.click_attempts_truncated = true;
+			}
+		};
+		let attempt = 0;
+		while (true) {
 			if (hasNextStep()) break;
+			if (!looksLikeLinkingPage() && !hasTechnicalError()) {
+				recordClickAttempt({ attempt: attempt + 1, action: 'not_linking_state', url: window.location.href, snippet: pageText().slice(0, 240) });
+				break;
+			}
+			attempt += 1;
 			if (hasTechnicalError()) {
 				const recovered = await clickBackFromTechnicalError();
-				result.click_attempts.push({ attempt, action: 'recover_technical_error', recovered });
-				if (!recovered) break;
+				recordClickAttempt({ attempt, action: 'recover_technical_error', recovered });
+				if (!recovered) {
+					await wait(recoveryWaitMs);
+					continue;
+				}
 				await wait(700);
+				if (hasNextStep()) break;
+				if (hasTechnicalError()) {
+					await wait(recoveryWaitMs);
+					continue;
+				}
 			}
 			const buttons = Array.from(document.querySelectorAll('button')).filter(visible);
 			result.buttons = buttons.map((button) => ({ text: textOf(button).slice(0, 80), disabled: !!button.disabled })).slice(0, 8);
@@ -7378,14 +7414,15 @@ func handleGopayMidtransLinkingFill(w http.ResponseWriter, r *http.Request) {
 				return text.includes('link and pay') || text.includes('hubungkan') || text.includes('bayar') || text.includes('continue') || text.includes('lanjut') || text.includes('pay');
 			});
 			if (!submitButton) {
-				result.click_attempts.push({ attempt, action: 'missing_button' });
-				break;
+				recordClickAttempt({ attempt, action: 'missing_button', url: window.location.href, snippet: pageText().slice(0, 240) });
+				await wait(postClickWaitMs);
+				continue;
 			}
 			result.found.button = true;
 			result.button_text = textOf(submitButton).slice(0, 100);
 			result.button_disabled = !!submitButton.disabled;
 			if (submitButton.disabled) {
-				for (let i = 0; i < %d && submitButton.disabled; i++) {
+				for (let i = 0; i < buttonWaitCycles && submitButton.disabled; i++) {
 					await wait(500);
 					const refreshedButtons = Array.from(document.querySelectorAll('button')).filter(visible);
 					submitButton = refreshedButtons.find((button) => {
@@ -7396,8 +7433,9 @@ func handleGopayMidtransLinkingFill(w http.ResponseWriter, r *http.Request) {
 				result.button_disabled_after_wait = !!submitButton.disabled;
 			}
 			if (submitButton.disabled) {
-				result.click_attempts.push({ attempt, action: 'button_disabled' });
-				break;
+				recordClickAttempt({ attempt, action: 'button_disabled' });
+				await wait(postClickWaitMs);
+				continue;
 			}
 			if (!countryVerified()) {
 				Object.assign(result, snapshotPage(), { stage: 'midtrans_country_code_not_selected' });
@@ -7407,15 +7445,19 @@ func handleGopayMidtransLinkingFill(w http.ResponseWriter, r *http.Request) {
 			result.clicked = true;
 			result.clicked_attempts = (result.clicked_attempts || 0) + 1;
 			const postClickState = await waitForPostClickState();
-			result.click_attempts.push({ attempt, action: 'click_link_and_pay', state: postClickState, url: window.location.href, snippet: pageText().slice(0, 240) });
+			recordClickAttempt({ attempt, action: 'click_link_and_pay', state: postClickState, url: window.location.href, snippet: pageText().slice(0, 240) });
 			if (postClickState === 'next_step' || postClickState === 'navigated') break;
 			if (postClickState === 'technical_error') continue;
-			if (postClickState === 'still_linking' && aggressiveRetry) continue;
+			if (postClickState === 'still_linking' && retryStillLinking) {
+				await wait(postClickWaitMs);
+				continue;
+			}
 			break;
 		}
 		result.after_url = window.location.href;
 		result.page_text_snippet = ((document.body?.innerText || document.body?.textContent || '')).replace(/\s+/g, ' ').trim().slice(0, 1000);
 		result.aggressive_retry = aggressiveRetry;
+		result.retry_still_linking = retryStillLinking;
 		networkDiagnostics.ended_at = new Date().toISOString();
 		networkDiagnostics.final_state = {
 			has_technical_error: hasTechnicalError(),
@@ -7427,7 +7469,7 @@ func handleGopayMidtransLinkingFill(w http.ResponseWriter, r *http.Request) {
 			result.stage = 'midtrans_linking_technical_error';
 		}
 		return JSON.stringify(result);
-	})()`, countryJSON, phoneJSON, req.AggressiveRetry, accountID, retryProfile.PostClickWaitCycles, retryProfile.PostClickWaitMs, retryProfile.RecoveryWaitMs, retryProfile.MaxClickAttempts, retryProfile.ButtonWaitCycles))
+	})()`, countryJSON, phoneJSON, req.AggressiveRetry, retryProfile.RetryStillLinking, retryProfile.PostClickWaitCycles, retryProfile.PostClickWaitMs, retryProfile.RecoveryWaitMs, retryProfile.ButtonWaitCycles, retryProfile.UnboundedUntilNextStep, accountID))
 	if execErr != nil {
 		writeJSON(w, http.StatusOK, map[string]any{"ok": false, "stage": "midtrans_linking_fill_failed", "account_id": accountID, "error": execErr.Error()})
 		return

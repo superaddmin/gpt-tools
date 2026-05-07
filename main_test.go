@@ -765,8 +765,8 @@ func TestMidtransLinkingFillOutcomeRejectsTechnicalErrorAfterClick(t *testing.T)
 func TestMidtransLinkingRetryConfigDefault(t *testing.T) {
 	cfg := midtransLinkingRetryConfig(false)
 
-	if cfg.MaxClickAttempts != 3 {
-		t.Fatalf("MaxClickAttempts = %d, want 3", cfg.MaxClickAttempts)
+	if !cfg.UnboundedUntilNextStep {
+		t.Fatal("UnboundedUntilNextStep = false, want true")
 	}
 	if cfg.ButtonWaitCycles != 8 {
 		t.Fatalf("ButtonWaitCycles = %d, want 8", cfg.ButtonWaitCycles)
@@ -774,19 +774,16 @@ func TestMidtransLinkingRetryConfigDefault(t *testing.T) {
 	if cfg.PostClickWaitCycles != 18 {
 		t.Fatalf("PostClickWaitCycles = %d, want 18", cfg.PostClickWaitCycles)
 	}
-	if cfg.RetryStillLinking {
-		t.Fatal("RetryStillLinking = true, want false")
+	if !cfg.RetryStillLinking {
+		t.Fatal("RetryStillLinking = false, want true")
 	}
 }
 
 func TestMidtransLinkingRetryConfigAggressive(t *testing.T) {
 	cfg := midtransLinkingRetryConfig(true)
 
-	if cfg.MaxClickAttempts <= 3 {
-		t.Fatalf("MaxClickAttempts = %d, want > 3", cfg.MaxClickAttempts)
-	}
-	if cfg.MaxClickAttempts > 5 {
-		t.Fatalf("MaxClickAttempts = %d, want <= 5 to avoid rate-limit bursts", cfg.MaxClickAttempts)
+	if !cfg.UnboundedUntilNextStep {
+		t.Fatal("UnboundedUntilNextStep = false, want true")
 	}
 	if cfg.ButtonWaitCycles <= 8 {
 		t.Fatalf("ButtonWaitCycles = %d, want > 8", cfg.ButtonWaitCycles)
@@ -799,6 +796,35 @@ func TestMidtransLinkingRetryConfigAggressive(t *testing.T) {
 	}
 	if !cfg.RetryStillLinking {
 		t.Fatal("RetryStillLinking = false, want true")
+	}
+}
+
+func TestMidtransLinkingFillScriptUsesUnboundedTechnicalErrorRecoveryLoop(t *testing.T) {
+	source, err := os.ReadFile("main.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	script := string(source)
+
+	for _, want := range []string{
+		"technical_error_back_loop",
+		"unbounded_until_next_step",
+		"while (true)",
+		"if (hasNextStep()) break;",
+		"recover_technical_error",
+		"await wait(recoveryWaitMs)",
+	} {
+		if !strings.Contains(script, want) {
+			t.Fatalf("midtrans linking script missing %q", want)
+		}
+	}
+	for _, forbidden := range []string{
+		"MaxClickAttempts",
+		"attempt <= %d",
+	} {
+		if strings.Contains(script, forbidden) {
+			t.Fatalf("midtrans linking script should not use fixed click limit; found %q", forbidden)
+		}
 	}
 }
 
