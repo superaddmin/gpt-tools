@@ -1008,12 +1008,15 @@ autoFillCheckoutBtn?.addEventListener("click", async () => {
     if (resp.ok && data.ok) {
       var a = data.address;
       var fields = data.filled || {};
+      var validation = data.address_validation || fields.validation || {};
       var msg = "随机美国地址已填入：" + "\n" +
         "姓名: " + (a.first_name || "") + " " + (a.last_name || "") + "\n" +
         "地址: " + (a.line1 || "") + "\n" +
         "城市: " + (a.city || "") + ", " + (a.state || "") + " " + (a.zip_code || "") + "\n\n" +
+        "GoPay: " + (data.gopay_selected ? "已选择" : "已保持当前选择") + "\n" +
+        "地址校验: " + (validation.ok === false ? "未通过" : "通过") + "\n" +
         "填入结果: " + JSON.stringify(fields);
-      showAutoFillNotice("自动填地址完成", "成功", msg, "本次只填写表单。请在支付页面点击订阅，系统会在提交后自动触发 GoPay 一键绑定。", "");
+      showAutoFillNotice("安全辅助完成", "成功", msg, "请你本人在支付页面确认条款复选框，并手动点击订阅。系统会在提交后自动触发 GoPay 一键绑定。", "");
       setText(autoFillCheckoutBtn, "已填入 ✓");
       startCheckoutSubmitWatcher(data);
     } else {

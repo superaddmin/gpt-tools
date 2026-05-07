@@ -1368,6 +1368,16 @@ func TestCheckoutAutoFillActionActivatesGopayWhenChoiceVisible(t *testing.T) {
 	}
 }
 
+func TestCheckoutAutoFillActionActivatesGopayBeforeFillingAddress(t *testing.T) {
+	probe := map[string]any{
+		"inputCount": float64(9),
+		"text":       "支付方式 银行卡 GoPay Billing address",
+	}
+	if got := checkoutAutoFillAction(probe, false); got != "activate_gopay" {
+		t.Fatalf("checkoutAutoFillAction = %q, want activate_gopay", got)
+	}
+}
+
 func TestCheckoutAutoFillActionNeedsManualWhenNoInputsAndNoGopay(t *testing.T) {
 	probe := map[string]any{
 		"inputCount": float64(0),
@@ -1375,6 +1385,84 @@ func TestCheckoutAutoFillActionNeedsManualWhenNoInputsAndNoGopay(t *testing.T) {
 	}
 	if got := checkoutAutoFillAction(probe, false); got != "manual" {
 		t.Fatalf("checkoutAutoFillAction = %q, want manual", got)
+	}
+}
+
+func TestCheckoutAutoFillRecognizesAdministrativeAreaStateSelect(t *testing.T) {
+	source, err := os.ReadFile("main.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(source)
+	start := strings.Index(text, "func handleCheckoutAutoFill")
+	if start < 0 {
+		t.Fatal("handleCheckoutAutoFill not found")
+	}
+	fn := text[start:]
+	for _, want := range []string{
+		"checkoutStateSelectValue",
+		"'administrative'",
+		"'address-level1'",
+	} {
+		if !strings.Contains(fn, want) {
+			t.Fatalf("handleCheckoutAutoFill missing %q", want)
+		}
+	}
+}
+
+func TestCheckoutAutoFillFallsBackToPageWhenActivatedStripeFrameIsBlank(t *testing.T) {
+	source, err := os.ReadFile("main.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(source)
+	start := strings.Index(text, "func handleCheckoutAutoFill")
+	if start < 0 {
+		t.Fatal("handleCheckoutAutoFill not found")
+	}
+	fn := text[start:]
+	for _, want := range []string{
+		"checkoutShouldReturnToPageTargetAfterActivation",
+		`target = pageTarget`,
+		`canonicalFillURL = canonicalURL`,
+	} {
+		if !strings.Contains(fn, want) {
+			t.Fatalf("handleCheckoutAutoFill missing blank iframe fallback %q", want)
+		}
+	}
+}
+
+func TestCheckoutAutoFillReportsManualConsentBoundary(t *testing.T) {
+	source, err := os.ReadFile("main.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(source)
+	start := strings.Index(text, "func handleCheckoutAutoFill")
+	if start < 0 {
+		t.Fatal("handleCheckoutAutoFill not found")
+	}
+	fn := text[start:]
+
+	for _, want := range []string{
+		`"manual_confirmation_required":`,
+		`"requires_manual_terms_confirmation":`,
+		`"requires_manual_subscription_click":`,
+		`"safe_checkout_assist":`,
+		`validation:validation`,
+	} {
+		if !strings.Contains(fn, want) {
+			t.Fatalf("handleCheckoutAutoFill missing %q", want)
+		}
+	}
+	for _, forbidden := range []string{
+		"checkbox.click()",
+		"submitButton.click()",
+		"text.includes('subscribe')",
+	} {
+		if strings.Contains(fn, forbidden) {
+			t.Fatalf("handleCheckoutAutoFill should not accept terms or submit checkout; found %q", forbidden)
+		}
 	}
 }
 

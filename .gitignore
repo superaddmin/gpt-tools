@@ -10,6 +10,7 @@ elements-session-response.json
 log/
 artifacts/network-debug/
 artifacts/*.log
+artifacts/*.png
 artifacts/perf-trace-*.json
 *.exe~
 .codex/runtime/browser-use-service/node_modules/

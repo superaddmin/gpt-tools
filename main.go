@@ -9255,13 +9255,20 @@ func checkoutProbeShowsGopayChoice(probe map[string]any) bool {
 }
 
 func checkoutAutoFillAction(probe map[string]any, isStripeFrame bool) string {
-	if hasFillableCheckoutInputs(probe) {
-		return "fill"
-	}
 	if !isStripeFrame && checkoutProbeShowsGopayChoice(probe) {
 		return "activate_gopay"
 	}
+	if hasFillableCheckoutInputs(probe) {
+		return "fill"
+	}
 	return "manual"
+}
+
+func checkoutShouldReturnToPageTargetAfterActivation(activated bool, targetType string, beforeProbe map[string]any, afterProbe map[string]any) bool {
+	return activated &&
+		strings.EqualFold(strings.TrimSpace(targetType), "iframe") &&
+		hasFillableCheckoutInputs(beforeProbe) &&
+		!hasFillableCheckoutInputs(afterProbe)
 }
 
 func handleCheckoutResolveTarget(w http.ResponseWriter, r *http.Request) {
@@ -9347,9 +9354,16 @@ func handleCheckoutAutoFill(w http.ResponseWriter, r *http.Request) {
 	}
 	addr := generateUSAddress()
 	response := map[string]any{
-		"address":      addr,
-		"expected_url": req.ExpectedURL,
-		"current_url":  canonicalURL,
+		"address":                            addr,
+		"expected_url":                       req.ExpectedURL,
+		"current_url":                        canonicalURL,
+		"safe_checkout_assist":               true,
+		"manual_confirmation_required":       true,
+		"requires_manual_terms_confirmation": true,
+		"requires_manual_subscription_click": true,
+		"terms_confirmation_auto_clicked":    false,
+		"subscription_submit_auto_clicked":   false,
+		"gopay_selected":                     false,
 		"page_target": map[string]any{
 			"id":   pageTarget.ID,
 			"type": pageTarget.Type,
@@ -9378,6 +9392,7 @@ func handleCheckoutAutoFill(w http.ResponseWriter, r *http.Request) {
 		json.Unmarshal([]byte(probeR), &probe)
 	}
 	response["probe"] = probe
+	initialProbe := probe
 	action := checkoutAutoFillAction(probe, isStripeFrame)
 	if action == "activate_gopay" {
 		clickR, _ := executeCDPScript(conn, `(async () => {
@@ -9397,6 +9412,7 @@ func handleCheckoutAutoFill(w http.ResponseWriter, r *http.Request) {
 			json.Unmarshal([]byte(clickR), &clickMap)
 		}
 		response["gopay_activation"] = clickMap
+		response["gopay_selected"] = boolMapValue(clickMap, "clicked")
 		updatedTargets, refreshErr := getCDPTargets(cdpDebuggingPort)
 		if refreshErr == nil {
 			if refreshedTarget, _, reselectErr := resolveCheckoutFillTarget(updatedTargets, req.ExpectedURL); reselectErr == nil {
@@ -9425,7 +9441,36 @@ func handleCheckoutAutoFill(w http.ResponseWriter, r *http.Request) {
 			json.Unmarshal([]byte(probeR), &probe)
 		}
 		response["probe_after_gopay"] = probe
-		action = checkoutAutoFillAction(probe, isStripeFrame)
+		if checkoutShouldReturnToPageTargetAfterActivation(boolMapValue(clickMap, "clicked"), target.Type, initialProbe, probe) {
+			response["blank_iframe_fallback"] = true
+			target = pageTarget
+			canonicalFillURL = canonicalURL
+			response["fill_target"] = map[string]any{
+				"id":   target.ID,
+				"type": target.Type,
+				"url":  target.URL,
+			}
+			conn.Close()
+			conn, _, err = websocket.DefaultDialer.Dial(target.WebSocketDebuggerURL, nil)
+			if err != nil {
+				writeError(w, http.StatusInternalServerError, "CDP failed: "+err.Error())
+				return
+			}
+			defer conn.Close()
+			sendCDPCommand(conn, "Runtime.enable", nil)
+			isStripeFrame = false
+			probeR, _ = executeCDPScript(conn, probeScript)
+			probe = map[string]any{}
+			if probeR != "" {
+				json.Unmarshal([]byte(probeR), &probe)
+			}
+			response["probe_after_blank_iframe_fallback"] = probe
+		}
+		if boolMapValue(clickMap, "clicked") && hasFillableCheckoutInputs(probe) {
+			action = "fill"
+		} else {
+			action = checkoutAutoFillAction(probe, isStripeFrame)
+		}
 	}
 	if action != "fill" {
 		updatedTargets, refreshErr := getCDPTargets(cdpDebuggingPort)
@@ -9474,12 +9519,73 @@ func handleCheckoutAutoFill(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, response)
 		return
 	}
-	fillR, _ := executeCDPScript(conn, fmt.Sprintf(`(async () => { function snv(el,v){const s=Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value').set;s.call(el,v);el.dispatchEvent(new Event('input',{bubbles:true}));el.dispatchEvent(new Event('change',{bubbles:true}));} function so(sel,v){const o=Array.from(sel.options).find(o=>o.value===v||o.text===v||o.text.includes(v));if(o){sel.value=o.value;sel.dispatchEvent(new Event('change',{bubbles:true}));return true}return false} function mf(el,ks){const s=(el.name+'|'+el.id+'|'+el.autocomplete+'|'+(el.placeholder||'')+'|'+(el.getAttribute('aria-label')||'')).toLowerCase();return ks.some(k=>s.includes(k))} const a={fn:%q,ln:%q,l1:%q,c:%q,s:%q,z:%q};const ins=document.querySelectorAll('input');const sls=document.querySelectorAll('select');let f={}; const fi=Array.from(ins).find(el=>mf(el,['first','given','fname','firstName','first_name','vorname']));if(fi){snv(fi,a.fn);f.first_name=true}else{const ni=Array.from(ins).find(el=>mf(el,['fullname','full_name','name']));if(ni){snv(ni,a.fn+' '+a.ln);f.full_name=true}} const li=Array.from(ins).find(el=>mf(el,['last','family','lname','lastName','surname','nachname']));if(li){snv(li,a.ln);f.last_name=true} const ai=Array.from(ins).find(el=>mf(el,['address-line1','address1','address','street','addr1','line1']));if(ai){snv(ai,a.l1);f.address=true} const ci=Array.from(ins).find(el=>mf(el,['city','town','locality','address-level2']));if(ci){snv(ci,a.c);f.city=true} const zi=Array.from(ins).find(el=>mf(el,['zip','postal','postcode','postal_code','zip_code']));if(zi){snv(zi,a.z);f.zip=true} const cs=Array.from(sls).find(el=>mf(el,['country']));if(cs){f.country=so(cs,'US'); await new Promise(r=>setTimeout(r,700));} const si=Array.from(ins).find(el=>mf(el,['state','region','province','address-level1']));const ss=Array.from(sls).find(el=>mf(el,['state','region','province']));if(ss){f.state=so(ss,a.s); if(!f.state){ await new Promise(r=>setTimeout(r,300)); f.state=so(ss,a.s); }}else if(si){snv(si,a.s);f.state=true} await new Promise(r=>setTimeout(r,600)); return JSON.stringify({url:window.location.href,filled:f,inputCount:ins.length}); })()`, addr.FirstName, addr.LastName, addr.Line1, addr.City, addr.State, addr.ZipCode))
+	fillR, _ := executeCDPScript(conn, fmt.Sprintf(`(async () => {
+		function snv(el,v){
+			const s=Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value').set;
+			if(s){s.call(el,v)}else{el.value=v}
+			el.dispatchEvent(new Event('input',{bubbles:true}));
+			el.dispatchEvent(new Event('change',{bubbles:true}));
+			el.dispatchEvent(new KeyboardEvent('keyup',{bubbles:true,key:String(v||'').slice(-1)||'1'}));
+		}
+		function so(sel,v){
+			const vals=Array.isArray(v)?v:[v];
+			const o=Array.from(sel.options).find(o=>vals.some(val=>o.value===val||o.text===val||o.text.includes(val)));
+			if(o){sel.value=o.value;sel.dispatchEvent(new Event('change',{bubbles:true}));return true}
+			return false
+		}
+		function norm(value){return String(value||'').replace(/\s+/g,' ').trim()}
+		function mf(el,ks){
+			const s=(el.name+'|'+el.id+'|'+el.autocomplete+'|'+(el.placeholder||'')+'|'+(el.getAttribute('aria-label')||'')).toLowerCase();
+			return ks.some(k=>s.includes(k))
+		}
+		const a={fn:%q,ln:%q,l1:%q,c:%q,s:%q,sn:%q,z:%q};
+		const ins=Array.from(document.querySelectorAll('input')).filter(el=>el.type!=='hidden'&&el.type!=='checkbox'&&el.type!=='radio');
+		const sls=Array.from(document.querySelectorAll('select'));
+		let f={};
+		const fi=ins.find(el=>mf(el,['first','given','fname','firstname','first_name','vorname']));
+		if(fi){snv(fi,a.fn);f.first_name=true}else{
+			const ni=ins.find(el=>mf(el,['fullname','full_name','name']));
+			if(ni){snv(ni,a.fn+' '+a.ln);f.full_name=true}
+		}
+		const li=ins.find(el=>mf(el,['last','family','lname','lastname','surname','nachname']));
+		if(li){snv(li,a.ln);f.last_name=true}
+		const ai=ins.find(el=>mf(el,['address-line1','address1','address','street','addr1','line1']));
+		if(ai){snv(ai,a.l1);f.address=true}
+		const ci=ins.find(el=>mf(el,['city','town','locality','address-level2']));
+		if(ci){snv(ci,a.c);f.city=true}
+		const zi=ins.find(el=>mf(el,['zip','postal','postcode','postal_code','zip_code']));
+		if(zi){snv(zi,a.z);f.zip=true}
+		const cs=sls.find(el=>mf(el,['country']));
+		if(cs){f.country=so(cs,'US'); await new Promise(r=>setTimeout(r,700))}
+		const si=ins.find(el=>mf(el,['state','region','province','administrative','address-level1']));
+		const ss=sls.find(el=>mf(el,['state','region','province','administrative','address-level1']));
+		if(ss){f.state=so(ss,[a.s,a.sn]); if(!f.state){await new Promise(r=>setTimeout(r,300)); f.state=so(ss,[a.s,a.sn])}}else if(si){snv(si,a.s);f.state=true}
+		await new Promise(r=>setTimeout(r,600));
+		const required=['address','city','state','zip'];
+		if(cs) required.push('country');
+		const validation={
+			ok:false,
+			required_fields:required,
+			missing_required:required.filter(k=>!f[k]),
+			filled_fields:f,
+			manual_terms_required:Array.from(document.querySelectorAll('input[type="checkbox"]')).some(el=>norm(el.closest('label')?.innerText||el.parentElement?.innerText||el.getAttribute('aria-label')).length>0),
+			manual_subscription_required:Array.from(document.querySelectorAll('button')).some(btn=>/subscribe|订阅/i.test(norm(btn.textContent))),
+		};
+		validation.ok=validation.missing_required.length===0;
+		return JSON.stringify({url:window.location.href,filled:f,inputCount:ins.length,validation:validation});
+	})()`, addr.FirstName, addr.LastName, addr.Line1, addr.City, addr.State, checkoutStateSelectValue(addr.State), addr.ZipCode))
 	var fillMap map[string]any
 	if fillR != "" {
 		json.Unmarshal([]byte(fillR), &fillMap)
 	}
 	response["filled"] = fillMap
+	validationOK := true
+	if fillMap != nil {
+		if validation, _ := fillMap["validation"].(map[string]any); validation != nil {
+			response["address_validation"] = validation
+			validationOK = boolMapValue(validation, "ok")
+		}
+	}
 	anyF := false
 	if fillMap != nil {
 		if fm, _ := fillMap["filled"].(map[string]any); fm != nil {
@@ -9494,6 +9600,12 @@ func handleCheckoutAutoFill(w http.ResponseWriter, r *http.Request) {
 	if !anyF {
 		response["ok"] = false
 		response["error"] = "地址表单已检测到，但没有任何字段被成功写入。"
+		writeJSON(w, http.StatusOK, response)
+		return
+	}
+	if !validationOK {
+		response["ok"] = false
+		response["error"] = "地址字段已写入，但必填地址校验未通过。"
 		writeJSON(w, http.StatusOK, response)
 		return
 	}
