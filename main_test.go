@@ -794,8 +794,16 @@ func TestMidtransLinkingRetryConfigAggressive(t *testing.T) {
 	if cfg.PostClickWaitMs < 800 {
 		t.Fatalf("PostClickWaitMs = %d, want >= 800 to avoid rapid repeated clicks", cfg.PostClickWaitMs)
 	}
-	if !cfg.RetryStillLinking {
-		t.Fatal("RetryStillLinking = false, want true")
+	if cfg.RetryStillLinking {
+		t.Fatal("RetryStillLinking = true, want false to avoid repeated Link and pay submissions")
+	}
+}
+
+func TestMidtransLinkingRetryConfigAggressiveDoesNotRepeatStillLinkingClicks(t *testing.T) {
+	cfg := midtransLinkingRetryConfig(true)
+
+	if cfg.RetryStillLinking {
+		t.Fatal("RetryStillLinking = true, want false to avoid repeated Link and pay submissions under blank-shell or rate-limit states")
 	}
 }
 
@@ -824,6 +832,48 @@ func TestMidtransLinkingFillScriptUsesUnboundedTechnicalErrorRecoveryLoop(t *tes
 	} {
 		if strings.Contains(script, forbidden) {
 			t.Fatalf("midtrans linking script should not use fixed click limit; found %q", forbidden)
+		}
+	}
+}
+
+func TestMidtransLinkingFillScriptDetectsBlankShellAndRateLimitCooldown(t *testing.T) {
+	source, err := os.ReadFile("main.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	script := string(source)
+
+	for _, want := range []string{
+		"looksLikeBlankLoadingShell",
+		"midtrans_linking_blank_shell",
+		"midtrans_linking_rate_limited",
+		"hasRateLimit",
+		"x-envoy-ratelimited",
+		"retry_after_ms",
+		"cooldown_ms",
+	} {
+		if !strings.Contains(script, want) {
+			t.Fatalf("midtrans linking script missing %q", want)
+		}
+	}
+}
+
+func TestCheckoutSubmitWatcherRespectsMidtransLinkingCooldown(t *testing.T) {
+	source, err := os.ReadFile("web/app.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	script := string(source)
+
+	for _, want := range []string{
+		"gopayMidtransRetryNotBefore",
+		"midtrans-linking-cooldown",
+		"retry_after_ms",
+		"cooldown_ms",
+		"Math.max(retryAfterMs",
+	} {
+		if !strings.Contains(script, want) {
+			t.Fatalf("checkout watcher missing cooldown guard %q", want)
 		}
 	}
 }

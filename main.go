@@ -6429,7 +6429,7 @@ func midtransLinkingRetryConfig(aggressive bool) midtransLinkingRetryProfile {
 			PostClickWaitCycles:    24,
 			PostClickWaitMs:        900,
 			RecoveryWaitMs:         1400,
-			RetryStillLinking:      true,
+			RetryStillLinking:      false,
 			UnboundedUntilNextStep: true,
 		}
 	}
@@ -7012,15 +7012,16 @@ func handleGopayMidtransLinkingFill(w http.ResponseWriter, r *http.Request) {
 			found: { country: false, phone: false, button: false },
 		};
 		const loadingShellReloadKey = 'gopay_midtrans_loading_reload_' + result.account_id;
-		const scheduleLoadingShellReload = () => {
+		const scheduleLoadingShellReload = (minIntervalMs = 30000) => {
+			const cooldownMs = Number.isFinite(Number(minIntervalMs)) ? Number(minIntervalMs) : 30000;
 			try {
 				const last = Number(window.sessionStorage?.getItem(loadingShellReloadKey) || 0);
-				if (Number.isFinite(last) && last > 0 && Date.now() - last < 15000) return false;
+				if (Number.isFinite(last) && last > 0 && Date.now() - last < cooldownMs) return false;
 				window.sessionStorage?.setItem(loadingShellReloadKey, String(Date.now()));
-				window.setTimeout(() => window.location.reload(), 250);
+				window.setTimeout(() => window.location.reload(), 1200);
 				return true;
 			} catch (_) {
-				window.setTimeout(() => window.location.reload(), 250);
+				window.setTimeout(() => window.location.reload(), 1200);
 				return true;
 			}
 		};
@@ -7197,13 +7198,42 @@ func handleGopayMidtransLinkingFill(w http.ResponseWriter, r *http.Request) {
 		};
 		installNetworkDiagnostics();
 		const pageText = () => ((document.body?.innerText || document.body?.textContent || '')).replace(/\s+/g, ' ').trim();
+		const visibleInputs = () => Array.from(document.querySelectorAll('input')).filter((el) => visible(el) && el.type !== 'hidden');
+		const visibleButtons = () => Array.from(document.querySelectorAll('button')).filter(visible);
 		const snapshotPage = () => ({
 			url: window.location.href,
 			title: document.title,
 			page_text_snippet: pageText().slice(0, 1000),
-			input_count: Array.from(document.querySelectorAll('input')).filter((el) => visible(el) && el.type !== 'hidden').length,
-			buttons: Array.from(document.querySelectorAll('button')).filter(visible).map((button) => ({ text: textOf(button).slice(0, 80), disabled: !!button.disabled })).slice(0, 8),
+			input_count: visibleInputs().length,
+			buttons: visibleButtons().map((button) => ({ text: textOf(button).slice(0, 80), disabled: !!button.disabled })).slice(0, 8),
 		});
+		const looksLikeBlankLoadingShell = () => {
+			const href = window.location.href.toLowerCase();
+			if (!href.includes('gopay-tokenization/linking')) return false;
+			return pageText().length === 0 && visibleInputs().length === 0 && visibleButtons().length === 0;
+		};
+		const headerText = (headers) => {
+			try { return JSON.stringify(headers || {}).toLowerCase(); } catch (_) { return String(headers || '').toLowerCase(); }
+		};
+		const hasRateLimit = () => networkDiagnostics.entries.some((entry) =>
+			Number(entry.status) === 429 ||
+			headerText(entry.response_headers).includes('x-envoy-ratelimited') ||
+			headerText(entry.response_headers).includes('ratelimited')
+		);
+		const markCooldownState = (stage, retryAfterMs, options = {}) => {
+			const waitMs = Number.isFinite(Number(retryAfterMs)) ? Number(retryAfterMs) : 30000;
+			Object.assign(result, snapshotPage(), {
+				stage,
+				retry_after_ms: waitMs,
+				cooldown_ms: waitMs,
+				loading_shell: stage === 'midtrans_linking_blank_shell' || stage === 'midtrans_linking_loading_stuck',
+				rate_limited: stage === 'midtrans_linking_rate_limited',
+			});
+			if (options.reload) {
+				result.loading_shell_reload_scheduled = scheduleLoadingShellReload(waitMs);
+			}
+			return JSON.stringify(result);
+		};
 		const looksLikeLinkingPage = () => {
 			const href = window.location.href.toLowerCase();
 			const text = pageText().toLowerCase();
@@ -7217,6 +7247,12 @@ func handleGopayMidtransLinkingFill(w http.ResponseWriter, r *http.Request) {
 		if (!looksLikeLinkingPage()) {
 			Object.assign(result, snapshotPage(), { stage: 'midtrans_not_linking_current_state' });
 			return JSON.stringify(result);
+		}
+		for (let i = 0; i < 12 && looksLikeBlankLoadingShell(); i++) {
+			await wait(500);
+		}
+		if (looksLikeBlankLoadingShell()) {
+			return markCooldownState('midtrans_linking_blank_shell', 30000, { reload: true });
 		}
 		const phoneCountryCode = () => {
 			const text = pageText();
@@ -7324,6 +7360,9 @@ func handleGopayMidtransLinkingFill(w http.ResponseWriter, r *http.Request) {
 		result.country_verified = countryVerified();
 		result.detected_phone_country_code = phoneCountryCode();
 		if (!result.country_verified) {
+			if (looksLikeBlankLoadingShell()) {
+				return markCooldownState('midtrans_linking_blank_shell', 30000, { reload: true });
+			}
 			Object.assign(result, snapshotPage(), { stage: 'midtrans_country_code_not_selected' });
 			return JSON.stringify(result);
 		}
@@ -7447,9 +7486,19 @@ func handleGopayMidtransLinkingFill(w http.ResponseWriter, r *http.Request) {
 				result.buttons_after_loading_wait = buttons.map((button) => ({ text: textOf(button).slice(0, 80), disabled: !!button.disabled })).slice(0, 8);
 			}
 			if (!submitButton) {
+				if (looksLikeBlankLoadingShell()) {
+					result.stage = 'midtrans_linking_blank_shell';
+					result.retry_after_ms = 30000;
+					result.cooldown_ms = 30000;
+					result.loading_shell_reload_scheduled = scheduleLoadingShellReload(30000);
+					recordClickAttempt({ attempt, action: 'blank_loading_shell', reload_scheduled: result.loading_shell_reload_scheduled, url: window.location.href });
+					break;
+				}
 				if (hasLoadingActionButton()) {
 					result.stage = 'midtrans_linking_loading_stuck';
-					result.loading_shell_reload_scheduled = scheduleLoadingShellReload();
+					result.retry_after_ms = 30000;
+					result.cooldown_ms = 30000;
+					result.loading_shell_reload_scheduled = scheduleLoadingShellReload(30000);
 					recordClickAttempt({ attempt, action: 'loading_button', reload_scheduled: result.loading_shell_reload_scheduled, url: window.location.href, snippet: pageText().slice(0, 240) });
 					break;
 				}
@@ -7482,6 +7531,13 @@ func handleGopayMidtransLinkingFill(w http.ResponseWriter, r *http.Request) {
 			result.clicked_attempts = (result.clicked_attempts || 0) + 1;
 			const postClickState = await waitForPostClickState();
 			recordClickAttempt({ attempt, action: 'click_link_and_pay', state: postClickState, url: window.location.href, snippet: pageText().slice(0, 240) });
+			if (hasRateLimit()) {
+				result.stage = 'midtrans_linking_rate_limited';
+				result.retry_after_ms = 90000;
+				result.cooldown_ms = 90000;
+				recordClickAttempt({ attempt, action: 'rate_limited', retry_after_ms: result.retry_after_ms });
+				break;
+			}
 			if (postClickState === 'next_step' || postClickState === 'navigated') break;
 			if (postClickState === 'technical_error') continue;
 			if (postClickState === 'still_linking' && retryStillLinking) {
@@ -7498,10 +7554,16 @@ func handleGopayMidtransLinkingFill(w http.ResponseWriter, r *http.Request) {
 		networkDiagnostics.final_state = {
 			has_technical_error: hasTechnicalError(),
 			has_next_step: hasNextStep(),
+			has_rate_limit: hasRateLimit(),
 			entry_count: networkDiagnostics.entries.length,
 			dropped_entries: networkDiagnostics.dropped_entries,
 		};
-		if (hasTechnicalError()) {
+		if (hasRateLimit()) {
+			result.stage = 'midtrans_linking_rate_limited';
+			result.retry_after_ms = result.retry_after_ms || 90000;
+			result.cooldown_ms = result.cooldown_ms || 90000;
+			result.rate_limited = true;
+		} else if (hasTechnicalError()) {
 			result.stage = 'midtrans_linking_technical_error';
 		}
 		return JSON.stringify(result);

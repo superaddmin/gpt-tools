@@ -1053,6 +1053,8 @@ let gopayAutoTriggerRunning = false;
 let gopayCheckoutWatcherActive = false;
 let stopGopayOTPAutoCapture = null;
 let checkoutSubmitWatcherId = 0;
+let gopayMidtransRetryNotBefore = 0;
+let gopayMidtransCooldownNoticeKey = "";
 const gopayAutoTriggeredCheckoutKeys = new Set();
 
 const gopayStepItems = Array.from(document.querySelectorAll("[data-gopay-step]"));
@@ -1559,12 +1561,27 @@ function startCheckoutSubmitWatcher(autoFillData) {
               monitorBadge.className = "badge neutral";
             }
           } else if (!gopayAutoTriggerRunning) {
+            var cooldownRemainingMs = gopayMidtransRetryNotBefore - Date.now();
+            if (cooldownRemainingMs > 0) {
+              var cooldownSeconds = Math.ceil(cooldownRemainingMs / 1000);
+              var cooldownKey = linkingURL + "|" + Math.ceil(gopayMidtransRetryNotBefore / 5000);
+              if (cooldownKey !== gopayMidtransCooldownNoticeKey) {
+                gopayMidtransCooldownNoticeKey = cooldownKey;
+                appendCheckoutWatcherEvent("midtrans-linking-cooldown", "Midtrans 页面冷却中，约 " + cooldownSeconds + " 秒后再尝试");
+              }
+              if (monitorBadge) {
+                monitorBadge.textContent = "冷却中";
+                monitorBadge.className = "badge neutral";
+              }
+            } else {
             appendCheckoutWatcherEvent("auto-trigger-ready", "条件满足，填写当前 Midtrans GoPay 页面：" + midtransRedirectionAccountID(linkingURL));
             gopayAutoTriggerRunning = true;
             try {
               var fillResult = await fillCurrentMidtransLinkingPage(linkingURL, checkoutURL);
               if (gopayOutput) setText(gopayOutput, JSON.stringify(fillResult, null, 2));
               if (fillResult.ok) {
+                gopayMidtransRetryNotBefore = 0;
+                gopayMidtransCooldownNoticeKey = "";
                 gopayAutoTriggeredCheckoutKeys.add(checkoutKey);
                 appendCheckoutWatcherEvent("midtrans-linking-fill", "已填写 +" + (fillResult.country_code || "86") + " / " + (fillResult.phone_number || "18120322232") + " 并提交 Link and pay");
                 if (monitorBadge) {
@@ -1575,15 +1592,31 @@ function startCheckoutSubmitWatcher(autoFillData) {
                 finishWatcher();
                 return;
               } else {
-                var retryHint = fillResult.aggressive_retry ? "（连续重试已开启）" : "";
-                appendCheckoutWatcherEvent("midtrans-linking-fill", "页面填充未完成：" + (fillResult.stage || fillResult.error || "unknown") + retryHint);
+                var retryHint = fillResult.aggressive_retry ? "（保守恢复已开启）" : "";
+                var fillStage = fillResult.stage || fillResult.error || "unknown";
+                var retryAfterMs = Number(fillResult.retry_after_ms || fillResult.cooldown_ms || 0);
+                if (!Number.isFinite(retryAfterMs)) retryAfterMs = 0;
+                if (!retryAfterMs && fillStage === "midtrans_linking_rate_limited") retryAfterMs = 90000;
+                if (!retryAfterMs && (fillStage === "midtrans_linking_blank_shell" || fillStage === "midtrans_linking_loading_stuck")) retryAfterMs = 30000;
+                if (retryAfterMs > 0) {
+                  retryAfterMs = Math.min(Math.max(retryAfterMs, 5000), 120000);
+                  gopayMidtransRetryNotBefore = Date.now() + retryAfterMs;
+                  gopayMidtransCooldownNoticeKey = "";
+                  appendCheckoutWatcherEvent("midtrans-linking-cooldown", "页面处于 " + fillStage + "，冷却 " + Math.ceil(retryAfterMs / 1000) + " 秒后再尝试");
+                  if (monitorBadge) {
+                    monitorBadge.textContent = fillStage === "midtrans_linking_rate_limited" ? "已限流" : "加载中";
+                    monitorBadge.className = "badge neutral";
+                  }
+                }
+                appendCheckoutWatcherEvent("midtrans-linking-fill", "页面填充未完成：" + fillStage + retryHint);
                 if (monitorBadge) {
-                  monitorBadge.textContent = "继续等待";
+                  monitorBadge.textContent = retryAfterMs > 0 ? "冷却中" : "继续等待";
                   monitorBadge.className = "badge neutral";
                 }
               }
             } finally {
               gopayAutoTriggerRunning = false;
+            }
             }
           }
           if (gopayAutoTriggeredCheckoutKeys.has(checkoutKey)) return;
