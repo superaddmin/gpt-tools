@@ -87,6 +87,7 @@ Go 服务默认使用编译嵌入的 `config.json`。如设置 `APP_CONFIG`，�
 | `midtrans_linking_cookie` | `MIDTRANS_LINKING_COOKIE` | Midtrans linking Cookie |
 | `midtrans_charge_cookie` | `MIDTRANS_CHARGE_COOKIE` | Midtrans charge Cookie |
 | `proxy_test_urls` | `PROXY_TEST_URLS` | 代理测试目标 URL 列表 |
+| `enable_redteam_apis` | `ENABLE_REDTEAM_APIS` | 是否启用本地 redteam 模拟接口；默认关闭，且接口仅允许 loopback 访问 |
 
 browser-use 服务配置：
 
@@ -119,6 +120,20 @@ python -m json.tool .codex\skillsets\playwright-ai.json > $null
 ### 页面诊断
 
 在修改 `web/index.html`、`web/app.js`、`web/styles.css` 后，应检查 IDE 诊断，并至少运行 `go test ./...`。如果修改 browser-use runtime，应运行 `npm run check`。
+
+### 本地 redteam 调试
+
+如果需要使用 `/api/redteam/*` 进行本地防御模拟，请先显式设置：
+
+```powershell
+$env:ENABLE_REDTEAM_APIS = "true"
+```
+
+注意事项：
+
+- redteam 接口默认关闭。
+- 即使已开启，也仅允许 `127.0.0.1` / loopback 请求访问。
+- 这些接口只用于 defensive simulation 和只读摘要分析，不执行真实支付。
 
 ## 代码维护约定
 

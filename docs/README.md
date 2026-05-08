@@ -13,6 +13,7 @@
 | [开发指南](development/guide.md) | 本地运行、验证命令、配置项、脚本和文档维护规范 |
 | [文档一致性审计](audit/docs-code-consistency.md) | 本次代码与文档一致性检查结果、已修正偏差和遗留注意事项 |
 | [Checkout 支付完成链路分析与报错日志方案](audit/checkout-payment-flow-analysis.md) | Checkout 到 GoPay 支付完成链路、异常路径和账号维度日志字段方案 |
+| [GoPay 红黑测试与安全加固报告](audit/gopay-redteam-hardening-report.md) | 本地红黑测试覆盖结果、风险发现、已落地的 redteam 保护与 monitor 限制 |
 | [Checkout Auto-Fill Target Lock Design](superpowers/specs/2026-05-06-checkout-auto-fill-target-lock-design.md) | 自动填地址目标锁定设计规格 |
 | [三栏工作台 UI 优化设计](superpowers/specs/2026-05-07-three-column-workbench-ui-design.md) | 当前三栏工作台 UI 设计规格 |
 

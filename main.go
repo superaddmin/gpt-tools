@@ -50,6 +50,7 @@ type appConfig struct {
 	MidtransLinkingCookie        string   `json:"midtrans_linking_cookie"`
 	MidtransChargeCookie         string   `json:"midtrans_charge_cookie"`
 	ProxyTestURLs                []string `json:"proxy_test_urls"`
+	EnableRedteamAPIs            bool     `json:"enable_redteam_apis"`
 }
 
 var config appConfig
@@ -160,6 +161,31 @@ type gopayPINRequest struct {
 	ChallengeID string `json:"challenge_id"`
 	GopayGUID   string `json:"gopay_guid"`
 	PIN         string `json:"pin"`
+}
+
+type eligibilityReplaySimulationRequest struct {
+	Mode                    string `json:"mode"`
+	CurrentAccountID        string `json:"current_account_id"`
+	CurrentSessionID        string `json:"current_session_id"`
+	CurrentTokenFingerprint string `json:"current_token_fingerprint"`
+	PreviousAccountID       string `json:"previous_account_id"`
+	PreviousTrialReference  string `json:"previous_trial_reference"`
+}
+
+type paymentReplaySimulationRequest struct {
+	Mode                       string `json:"mode"`
+	CurrentAccountID           string `json:"current_account_id"`
+	CurrentCheckoutSessionID   string `json:"current_checkout_session_id"`
+	CurrentRequestNonce        string `json:"current_request_nonce"`
+	CurrentAmount              string `json:"current_amount"`
+	CurrentCurrency            string `json:"current_currency"`
+	PreviousAccountID          string `json:"previous_account_id"`
+	PreviousCheckoutSessionID  string `json:"previous_checkout_session_id"`
+	PreviousPaymentReferenceID string `json:"previous_payment_reference_id"`
+	PreviousTransactionID      string `json:"previous_transaction_id"`
+	PreviousRequestNonce       string `json:"previous_request_nonce"`
+	PreviousAmount             string `json:"previous_amount"`
+	PreviousCurrency           string `json:"previous_currency"`
 }
 
 type proxyTestAttempt struct {
@@ -696,14 +722,18 @@ func auditCorrelationIdentifiers(sources ...map[string]any) map[string]any {
 	identifiers := make(map[string]any)
 	for _, source := range sources {
 		copyAuditIdentifier(identifiers, source, "checkout_session_id")
+		copyAuditIdentifier(identifiers, source, "current_checkout_session_id")
+		copyAuditIdentifier(identifiers, source, "previous_checkout_session_id")
 		copyAuditIdentifier(identifiers, source, "checkout_key")
 		copyAuditIdentifier(identifiers, source, "target_url")
 		copyAuditIdentifier(identifiers, source, "account_id")
 		copyAuditIdentifier(identifiers, source, "reference_id")
 		copyAuditIdentifier(identifiers, source, "linking_reference_id")
 		copyAuditIdentifier(identifiers, source, "payment_reference_id")
+		copyAuditIdentifier(identifiers, source, "previous_payment_reference_id")
 		copyAuditIdentifier(identifiers, source, "gopay_payment_reference_id")
 		copyAuditIdentifier(identifiers, source, "transaction_id")
+		copyAuditIdentifier(identifiers, source, "previous_transaction_id")
 	}
 	if len(identifiers) == 0 {
 		return nil
@@ -753,6 +783,7 @@ func auditOperationFlow(response map[string]any) map[string]any {
 	keys := []string{
 		"ok",
 		"stage",
+		"decision",
 		"ready",
 		"reason",
 		"strategy",
@@ -767,12 +798,26 @@ func auditOperationFlow(response map[string]any) map[string]any {
 		"reference_id",
 		"linking_reference_id",
 		"payment_reference_id",
+		"previous_payment_reference_id",
 		"gopay_payment_reference_id",
 		"transaction_id",
+		"previous_transaction_id",
 		"reused_existing",
 		"already_triggered",
 		"checkout_key",
+		"source_file",
+		"current_checkout_session_id",
+		"previous_checkout_session_id",
+		"current_amount",
+		"previous_amount",
+		"current_currency",
+		"previous_currency",
+		"redirect_status",
+		"redirect_pm_type",
+		"setup_intent",
 		"conditions",
+		"controls",
+		"evidence",
 		"conflict_reason",
 		"request",
 		"diagnostics",
@@ -986,6 +1031,9 @@ func main() {
 	mux.HandleFunc("/api/checkout/start", handleCheckout)
 	mux.HandleFunc("/api/incognito/open", handleIncognitoOpen)
 	mux.HandleFunc("/api/session/fetch", handleSessionFetch)
+	mux.HandleFunc("/api/redteam/eligibility-replay-simulate", handleEligibilityReplaySimulate)
+	mux.HandleFunc("/api/redteam/payment-replay-last", handlePaymentReplayLast)
+	mux.HandleFunc("/api/redteam/payment-replay-simulate", handlePaymentReplaySimulate)
 	mux.HandleFunc("/api/gopay/force-link", handleGopayForceLink)
 	mux.HandleFunc("/api/gopay/auto-link", handleGopayAutoLink)
 	mux.HandleFunc("/api/gopay/cdp-otp", handleGopayCDPOTP)
@@ -1139,6 +1187,490 @@ func jsonArrayLength(value any) int {
 	return 0
 }
 
+func handleEligibilityReplaySimulate(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	if !ensureRedteamAccess(w, r) {
+		return
+	}
+	defer r.Body.Close()
+
+	var req eligibilityReplaySimulationRequest
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 64<<10)).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json")
+		return
+	}
+
+	normalizeEligibilityReplaySimulationRequest(&req)
+	if err := validateEligibilityReplaySimulationRequest(req); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	writeJSON(w, http.StatusOK, evaluateEligibilityReplaySimulation(req))
+}
+
+func normalizeEligibilityReplaySimulationRequest(req *eligibilityReplaySimulationRequest) {
+	req.Mode = strings.ToLower(strings.TrimSpace(req.Mode))
+	req.CurrentAccountID = strings.TrimSpace(req.CurrentAccountID)
+	req.CurrentSessionID = strings.TrimSpace(req.CurrentSessionID)
+	req.CurrentTokenFingerprint = strings.TrimSpace(req.CurrentTokenFingerprint)
+	req.PreviousAccountID = strings.TrimSpace(req.PreviousAccountID)
+	req.PreviousTrialReference = strings.TrimSpace(req.PreviousTrialReference)
+}
+
+func validateEligibilityReplaySimulationRequest(req eligibilityReplaySimulationRequest) error {
+	if req.Mode != "defensive_simulation" {
+		return errors.New("mode must be defensive_simulation")
+	}
+	if req.CurrentAccountID == "" {
+		return errors.New("current_account_id required")
+	}
+	if req.CurrentSessionID == "" {
+		return errors.New("current_session_id required")
+	}
+	if req.CurrentTokenFingerprint == "" {
+		return errors.New("current_token_fingerprint required")
+	}
+	if req.PreviousAccountID == "" {
+		return errors.New("previous_account_id required")
+	}
+	if req.PreviousTrialReference == "" {
+		return errors.New("previous_trial_reference required")
+	}
+	return nil
+}
+
+func evaluateEligibilityReplaySimulation(req eligibilityReplaySimulationRequest) map[string]any {
+	accountMatch := strings.EqualFold(req.CurrentAccountID, req.PreviousAccountID)
+	sessionPresent := req.CurrentSessionID != ""
+	tokenFingerprintPresent := req.CurrentTokenFingerprint != ""
+
+	response := map[string]any{
+		"ok":                  accountMatch && sessionPresent && tokenFingerprintPresent,
+		"mode":                req.Mode,
+		"current_account_id":  req.CurrentAccountID,
+		"previous_account_id": req.PreviousAccountID,
+		"controls": []string{
+			"local_simulation_only",
+			"account_binding",
+			"session_binding",
+			"token_fingerprint_binding",
+		},
+		"evidence": map[string]any{
+			"account_match":                    accountMatch,
+			"session_present":                  sessionPresent,
+			"token_fingerprint_present":        tokenFingerprintPresent,
+			"previous_trial_reference_present": req.PreviousTrialReference != "",
+			"cross_account_replay":             !accountMatch,
+		},
+		"current_session_id_summary":        sensitiveValueDigestSummary(req.CurrentSessionID),
+		"current_token_fingerprint_summary": sensitiveValueDigestSummary(req.CurrentTokenFingerprint),
+		"previous_trial_reference_summary":  sensitiveValueDigestSummary(req.PreviousTrialReference),
+	}
+
+	if accountMatch && sessionPresent && tokenFingerprintPresent {
+		response["stage"] = "eligibility_context_verified"
+		response["decision"] = "matched_subject"
+		response["reason"] = "same_account_context"
+		response["message"] = "本地模拟确认当前上下文仍属于同一账号主体，但不会生成真实试用会话。"
+		return response
+	}
+
+	response["stage"] = "eligibility_replay_rejected"
+	response["decision"] = "rejected"
+	response["reason"] = "eligibility_bound_to_account_session"
+	response["message"] = "本地模拟拒绝了跨账号资格复用尝试，说明资格必须绑定当前账号、会话和 token 指纹。"
+	return response
+}
+
+func sensitiveValueDigestSummary(value string) map[string]any {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return map[string]any{
+			"present": false,
+			"length":  0,
+		}
+	}
+	summary := networkDiagnosticFingerprint(value)
+	summary["tail4"] = lastNRunes(value, 4)
+	return summary
+}
+
+func redteamAPIsEnabled() bool {
+	return configBool("ENABLE_REDTEAM_APIS", config.EnableRedteamAPIs)
+}
+
+func isLoopbackRequest(r *http.Request) bool {
+	ip := strings.TrimSpace(extractClientIP(r))
+	if ip == "" {
+		return false
+	}
+	parsed := net.ParseIP(ip)
+	if parsed == nil {
+		return false
+	}
+	return parsed.IsLoopback()
+}
+
+func ensureRedteamAccess(w http.ResponseWriter, r *http.Request) bool {
+	if !redteamAPIsEnabled() {
+		writeJSON(w, http.StatusForbidden, map[string]any{
+			"ok":    false,
+			"stage": "redteam_disabled",
+			"error": "redteam APIs are disabled",
+		})
+		return false
+	}
+	if !isLoopbackRequest(r) {
+		writeJSON(w, http.StatusForbidden, map[string]any{
+			"ok":    false,
+			"stage": "redteam_loopback_required",
+			"error": "redteam APIs require loopback access",
+		})
+		return false
+	}
+	return true
+}
+
+var errPaymentReplaySummaryNotFound = errors.New("payment replay summary not found")
+
+func handlePaymentReplayLast(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	if !ensureRedteamAccess(w, r) {
+		return
+	}
+
+	summary, err := findLatestPaymentReplaySummaryFromLogs(filepath.Join(".", "log"))
+	if err != nil {
+		if errors.Is(err, errPaymentReplaySummaryNotFound) {
+			writeJSON(w, http.StatusNotFound, map[string]any{
+				"ok":    false,
+				"stage": "payment_replay_summary_missing",
+				"error": "未在 log/ 中找到最近一次成功支付摘要",
+			})
+			return
+		}
+		writeJSON(w, http.StatusInternalServerError, map[string]any{
+			"ok":    false,
+			"stage": "payment_replay_summary_failed",
+			"error": err.Error(),
+		})
+		return
+	}
+
+	summary["ok"] = true
+	summary["stage"] = "payment_replay_summary_loaded"
+	writeJSON(w, http.StatusOK, summary)
+}
+
+func handlePaymentReplaySimulate(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	if !ensureRedteamAccess(w, r) {
+		return
+	}
+	defer r.Body.Close()
+
+	var req paymentReplaySimulationRequest
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 64<<10)).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json")
+		return
+	}
+
+	normalizePaymentReplaySimulationRequest(&req)
+	if err := validatePaymentReplaySimulationRequest(req); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	writeJSON(w, http.StatusOK, evaluatePaymentReplaySimulation(req))
+}
+
+func normalizePaymentReplaySimulationRequest(req *paymentReplaySimulationRequest) {
+	req.Mode = strings.ToLower(strings.TrimSpace(req.Mode))
+	req.CurrentAccountID = strings.TrimSpace(req.CurrentAccountID)
+	req.CurrentCheckoutSessionID = strings.TrimSpace(req.CurrentCheckoutSessionID)
+	req.CurrentRequestNonce = strings.TrimSpace(req.CurrentRequestNonce)
+	req.CurrentAmount = normalizeReplayAmount(req.CurrentAmount)
+	req.CurrentCurrency = strings.ToUpper(strings.TrimSpace(req.CurrentCurrency))
+	req.PreviousAccountID = strings.TrimSpace(req.PreviousAccountID)
+	req.PreviousCheckoutSessionID = strings.TrimSpace(req.PreviousCheckoutSessionID)
+	req.PreviousPaymentReferenceID = strings.TrimSpace(req.PreviousPaymentReferenceID)
+	req.PreviousTransactionID = strings.TrimSpace(req.PreviousTransactionID)
+	req.PreviousRequestNonce = strings.TrimSpace(req.PreviousRequestNonce)
+	req.PreviousAmount = normalizeReplayAmount(req.PreviousAmount)
+	req.PreviousCurrency = strings.ToUpper(strings.TrimSpace(req.PreviousCurrency))
+}
+
+func validatePaymentReplaySimulationRequest(req paymentReplaySimulationRequest) error {
+	if req.Mode != "defensive_simulation" {
+		return errors.New("mode must be defensive_simulation")
+	}
+	if req.CurrentAccountID == "" {
+		return errors.New("current_account_id required")
+	}
+	if req.CurrentCheckoutSessionID == "" {
+		return errors.New("current_checkout_session_id required")
+	}
+	if req.CurrentAmount == "" {
+		return errors.New("current_amount required")
+	}
+	if req.CurrentCurrency == "" {
+		return errors.New("current_currency required")
+	}
+	if req.PreviousAccountID == "" {
+		return errors.New("previous_account_id required")
+	}
+	if req.PreviousPaymentReferenceID == "" {
+		return errors.New("previous_payment_reference_id required")
+	}
+	if req.PreviousTransactionID == "" {
+		return errors.New("previous_transaction_id required")
+	}
+	if req.PreviousAmount == "" {
+		return errors.New("previous_amount required")
+	}
+	if req.PreviousCurrency == "" {
+		return errors.New("previous_currency required")
+	}
+	return nil
+}
+
+func evaluatePaymentReplaySimulation(req paymentReplaySimulationRequest) map[string]any {
+	accountMatch := strings.EqualFold(req.CurrentAccountID, req.PreviousAccountID)
+	amountMatch := req.CurrentAmount == req.PreviousAmount
+	currencyMatch := req.CurrentCurrency == req.PreviousCurrency
+	checkoutSessionReused := req.CurrentCheckoutSessionID != "" && req.PreviousCheckoutSessionID != "" && req.CurrentCheckoutSessionID == req.PreviousCheckoutSessionID
+	requestNonceReused := req.CurrentRequestNonce != "" && req.PreviousRequestNonce != "" && req.CurrentRequestNonce == req.PreviousRequestNonce
+	paymentReferencePresent := req.PreviousPaymentReferenceID != ""
+	transactionPresent := req.PreviousTransactionID != ""
+
+	response := map[string]any{
+		"ok":                            false,
+		"mode":                          req.Mode,
+		"stage":                         "payment_replay_rejected",
+		"decision":                      "rejected",
+		"current_account_id":            req.CurrentAccountID,
+		"current_checkout_session_id":   req.CurrentCheckoutSessionID,
+		"current_amount":                req.CurrentAmount,
+		"current_currency":              req.CurrentCurrency,
+		"previous_account_id":           req.PreviousAccountID,
+		"previous_checkout_session_id":  req.PreviousCheckoutSessionID,
+		"previous_payment_reference_id": req.PreviousPaymentReferenceID,
+		"previous_transaction_id":       req.PreviousTransactionID,
+		"previous_amount":               req.PreviousAmount,
+		"previous_currency":             req.PreviousCurrency,
+		"controls": []string{
+			"local_simulation_only",
+			"account_binding",
+			"checkout_session_freshness",
+			"request_nonce_freshness",
+			"amount_integrity",
+			"currency_integrity",
+			"payment_reference_uniqueness",
+			"transaction_uniqueness",
+		},
+		"evidence": map[string]any{
+			"account_match":             accountMatch,
+			"amount_match":              amountMatch,
+			"currency_match":            currencyMatch,
+			"checkout_session_reused":   checkoutSessionReused,
+			"request_nonce_reused":      requestNonceReused,
+			"payment_reference_present": paymentReferencePresent,
+			"transaction_present":       transactionPresent,
+		},
+		"current_request_nonce_summary":         sensitiveValueDigestSummary(req.CurrentRequestNonce),
+		"previous_request_nonce_summary":        sensitiveValueDigestSummary(req.PreviousRequestNonce),
+		"current_payment_artifact_fingerprint":  paymentReplayArtifactFingerprint(req.CurrentAccountID, req.CurrentCheckoutSessionID, "", "", req.CurrentAmount, req.CurrentCurrency),
+		"previous_payment_artifact_fingerprint": paymentReplayArtifactFingerprint(req.PreviousAccountID, req.PreviousCheckoutSessionID, req.PreviousPaymentReferenceID, req.PreviousTransactionID, req.PreviousAmount, req.PreviousCurrency),
+	}
+
+	switch {
+	case requestNonceReused:
+		response["reason"] = "request_nonce_reuse_detected"
+		response["message"] = "本地模拟检测到请求 nonce 被复用，服务端应拒绝同一支付尝试再次提交。"
+	case !accountMatch:
+		response["reason"] = "payment_context_bound_to_account"
+		response["message"] = "本地模拟检测到上一次成功支付信息被跨账号复用，服务端应按账号主体绑定拒绝。"
+	case !amountMatch:
+		response["reason"] = "payment_amount_mismatch_detected"
+		response["message"] = "本地模拟检测到支付金额与历史成功支付摘要不一致，服务端应拒绝金额篡改。"
+	case !currencyMatch:
+		response["reason"] = "payment_currency_mismatch_detected"
+		response["message"] = "本地模拟检测到支付币种与历史成功支付摘要不一致，服务端应拒绝币种篡改。"
+	case checkoutSessionReused:
+		response["reason"] = "checkout_session_reuse_detected"
+		response["message"] = "本地模拟检测到 checkout session 被直接复用，服务端应要求新的支付会话。"
+	case paymentReferencePresent && transactionPresent:
+		response["reason"] = "payment_reference_reuse_detected"
+		response["message"] = "本地模拟检测到上一笔成功支付的 reference / transaction 被复用，服务端应要求新的支付凭证。"
+	default:
+		response["reason"] = "fresh_payment_context_required"
+		response["message"] = "本地模拟要求新的支付上下文，服务端不应接受历史支付摘要直接重放。"
+	}
+
+	return response
+}
+
+func normalizeReplayAmount(raw string) string {
+	value := strings.TrimSpace(raw)
+	if value == "" {
+		return ""
+	}
+	parsed, err := strconv.ParseFloat(value, 64)
+	if err != nil {
+		return value
+	}
+	return strconv.FormatFloat(parsed, 'f', 2, 64)
+}
+
+func paymentReplayArtifactFingerprint(accountID string, checkoutSessionID string, paymentReferenceID string, transactionID string, amount string, currency string) map[string]any {
+	joined := strings.Join([]string{
+		strings.TrimSpace(accountID),
+		strings.TrimSpace(checkoutSessionID),
+		strings.TrimSpace(paymentReferenceID),
+		strings.TrimSpace(transactionID),
+		normalizeReplayAmount(amount),
+		strings.ToUpper(strings.TrimSpace(currency)),
+	}, "|")
+	return sensitiveValueDigestSummary(joined)
+}
+
+func findLatestPaymentReplaySummaryFromLogs(logDir string) (map[string]any, error) {
+	entries, err := os.ReadDir(logDir)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, errPaymentReplaySummaryNotFound
+		}
+		return nil, err
+	}
+
+	type logCandidate struct {
+		name    string
+		path    string
+		modTime time.Time
+	}
+	candidates := make([]logCandidate, 0, len(entries))
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(strings.ToLower(entry.Name()), ".log") {
+			continue
+		}
+		info, err := entry.Info()
+		if err != nil {
+			continue
+		}
+		candidates = append(candidates, logCandidate{
+			name:    entry.Name(),
+			path:    filepath.Join(logDir, entry.Name()),
+			modTime: info.ModTime(),
+		})
+	}
+
+	sort.Slice(candidates, func(i, j int) bool {
+		if candidates[i].modTime.Equal(candidates[j].modTime) {
+			return candidates[i].name > candidates[j].name
+		}
+		return candidates[i].modTime.After(candidates[j].modTime)
+	})
+
+	for _, candidate := range candidates {
+		data, err := os.ReadFile(candidate.path)
+		if err != nil {
+			continue
+		}
+		lines := strings.Split(strings.ReplaceAll(string(data), "\r\n", "\n"), "\n")
+		for i := len(lines) - 1; i >= 0; i-- {
+			line := strings.TrimSpace(lines[i])
+			if line == "" {
+				continue
+			}
+			var record map[string]any
+			if err := json.Unmarshal([]byte(line), &record); err != nil {
+				continue
+			}
+			summary := extractPaymentReplaySummaryFromAuditRecord(record, candidate.name)
+			if len(summary) > 0 {
+				return summary, nil
+			}
+		}
+	}
+
+	return nil, errPaymentReplaySummaryNotFound
+}
+
+func extractPaymentReplaySummaryFromAuditRecord(record map[string]any, sourceFile string) map[string]any {
+	if stringifyJSONValue(record["operation_result"]) != "success" {
+		return nil
+	}
+	metadata, _ := record["metadata"].(map[string]any)
+	if len(metadata) == 0 {
+		return nil
+	}
+	voucher, _ := metadata["payment_voucher"].(map[string]any)
+	if len(voucher) == 0 || !isSuccessfulPaymentReplayVoucher(voucher) {
+		return nil
+	}
+	identifiers, _ := metadata["correlation_identifiers"].(map[string]any)
+
+	accountID := firstNonEmpty(
+		findStringField(identifiers, "account_id"),
+		findStringField(metadata["response_summary"], "account_id"),
+		findStringField(metadata["operation_flow"], "account_id"),
+		stringifyJSONValue(record["account_email"]),
+	)
+	checkoutSessionID := firstNonEmpty(
+		findStringField(identifiers, "checkout_session_id"),
+		findStringField(identifiers, "previous_checkout_session_id"),
+	)
+	paymentReferenceID := firstNonEmpty(
+		findStringField(voucher, "payment_reference_id"),
+		findStringField(voucher, "gopay_payment_reference_id"),
+	)
+	transactionID := findStringField(voucher, "transaction_id")
+	amount := normalizeReplayAmount(firstNonEmpty(
+		findStringField(voucher, "gross_amount"),
+		findStringField(metadata["response_summary"], "gross_amount"),
+	))
+	currency := strings.ToUpper(firstNonEmpty(
+		findStringField(voucher, "currency"),
+		findStringField(metadata["response_summary"], "currency"),
+	))
+	if paymentReferenceID == "" || transactionID == "" || amount == "" || currency == "" {
+		return nil
+	}
+
+	return map[string]any{
+		"source_file":                           sourceFile,
+		"source_operation_time":                 stringifyJSONValue(record["operation_time"]),
+		"source_account_email":                  stringifyJSONValue(record["account_email"]),
+		"previous_account_id":                   accountID,
+		"previous_checkout_session_id":          checkoutSessionID,
+		"previous_payment_reference_id":         paymentReferenceID,
+		"previous_transaction_id":               transactionID,
+		"previous_transaction_status":           findStringField(voucher, "transaction_status"),
+		"previous_amount":                       amount,
+		"previous_currency":                     currency,
+		"previous_payment_artifact_fingerprint": paymentReplayArtifactFingerprint(accountID, checkoutSessionID, paymentReferenceID, transactionID, amount, currency),
+	}
+}
+
+func isSuccessfulPaymentReplayVoucher(voucher map[string]any) bool {
+	status := strings.ToLower(strings.TrimSpace(findStringField(voucher, "transaction_status")))
+	switch status {
+	case "settlement", "capture", "paid", "success", "authorized", "authorize":
+		return true
+	}
+	return findStringField(voucher, "payment_reference_id", "gopay_payment_reference_id") != "" && findStringField(voucher, "transaction_id") != ""
+}
+
 type incognitoOpenRequest struct {
 	URL       string `json:"url"`
 	NewWindow bool   `json:"new_window"`
@@ -1276,6 +1808,130 @@ func findAnyTarget(port int, urlPattern string) (*cdpTarget, error) {
 		}
 	}
 	return nil, &cdpNotReadyError{message: "未在 CDP 中找到匹配 " + urlPattern + " 的页面"}
+}
+
+func selectGopayCDPObservationTargets(targets []cdpTarget) []cdpTarget {
+	type scoredTarget struct {
+		target cdpTarget
+		score  int
+		index  int
+	}
+	scored := make([]scoredTarget, 0, len(targets))
+	for i := range targets {
+		target := targets[i]
+		if target.Type != "page" && target.Type != "iframe" {
+			continue
+		}
+		score := gopayCDPTargetPriority(target)
+		if score <= 0 {
+			continue
+		}
+		scored = append(scored, scoredTarget{target: target, score: score, index: i})
+	}
+	sort.SliceStable(scored, func(i, j int) bool {
+		if scored[i].score == scored[j].score {
+			return scored[i].index < scored[j].index
+		}
+		return scored[i].score > scored[j].score
+	})
+	out := make([]cdpTarget, 0, len(scored))
+	for _, item := range scored {
+		out = append(out, item.target)
+	}
+	return out
+}
+
+func gopayCDPTargetPriority(target cdpTarget) int {
+	rawURL := strings.TrimSpace(target.URL)
+	if rawURL == "" {
+		return 0
+	}
+	parsed, err := url.Parse(rawURL)
+	if err != nil {
+		return 0
+	}
+	host := strings.ToLower(parsed.Hostname())
+	path := strings.ToLower(parsed.Path)
+	fragment := strings.ToLower(parsed.Fragment)
+	query := strings.ToLower(parsed.RawQuery)
+	switch {
+	case strings.Contains(host, "pin-web-client.gopayapi.com"):
+		return 500
+	case strings.Contains(host, "merchants-gws-app.gopayapi.com"):
+		return 460
+	case strings.Contains(host, "midtrans.com") && (strings.Contains(fragment, "gopay-tokenization/linking") || strings.Contains(path, "/snap/")):
+		return 420
+	case strings.Contains(host, "gopayapi.com"):
+		return 380
+	case strings.Contains(host, "midtrans.com"):
+		return 340
+	case (strings.Contains(host, "pay.openai.com") || strings.Contains(host, "chatgpt.com")) &&
+		((strings.Contains(query, "redirect_status=failed") && strings.Contains(query, "redirect_pm_type=gopay")) ||
+			(strings.Contains(query, "redirect_status=failed") && strings.Contains(query, "setup_intent=")) ||
+			(strings.Contains(path, "/checkout/verify") && strings.Contains(query, "setup_intent="))):
+		return 300
+	case strings.Contains(host, "stripe.network"), strings.Contains(host, "stripe.com"), strings.Contains(host, "chatgpt.com"):
+		return 0
+	default:
+		return 0
+	}
+}
+
+func gopayCDPResultPriority(result map[string]any) int {
+	if len(result) == 0 {
+		return 0
+	}
+	stage := strings.TrimSpace(stringifyJSONValue(result["page_stage"]))
+	host := strings.ToLower(strings.TrimSpace(stringifyJSONValue(result["cdp_url_host"])))
+	score := 0
+	switch stage {
+	case "pin_entry_payment":
+		score += 500
+	case "pin_entry_binding":
+		score += 470
+	case "otp_entry":
+		score += 450
+	case "checkout_failed_return":
+		score += 430
+	case "pay_now_rp1":
+		score += 420
+	case "balance_rp1_observed":
+		score += 390
+	case "gopay_consent_hubungkan":
+		score += 380
+	case "balance_wait_rp0":
+		score += 360
+	case "page_observed":
+		score += 40
+	}
+	if boolMapValue(result, "has_pin_field") {
+		score += 120
+	}
+	if boolMapValue(result, "has_otp_field") {
+		score += 100
+	}
+	if boolMapValue(result, "otp_manual_required") {
+		score += 90
+	}
+	if boolMapValue(result, "pin_auto_filled") {
+		score += 70
+	}
+	if boolMapValue(result, "pin_auto_submitted") {
+		score += 60
+	}
+	if strings.Contains(host, "pin-web-client.gopayapi.com") {
+		score += 80
+	}
+	if strings.Contains(host, "merchants-gws-app.gopayapi.com") {
+		score += 70
+	}
+	if strings.Contains(host, "midtrans.com") {
+		score += 60
+	}
+	if strings.Contains(host, "stripe.network") || strings.Contains(host, "stripe.com") {
+		score -= 500
+	}
+	return score
 }
 
 func sendCDPCommandWithID(conn *websocket.Conn, id int64, method string, params map[string]any) (*cdpResponse, error) {
@@ -1829,63 +2485,72 @@ func (l *auditLogger) Close() error {
 const auditAnalysisLogVersion = "checkout-payment-flow-v1"
 
 var auditFlowStages = map[string]string{
-	"/api/health":                      "system_health",
-	"/api/incognito/open":              "login_browser_prepare",
-	"/api/session/fetch":               "session_capture",
-	"/api/checkout":                    "checkout_create",
-	"/api/checkout/start":              "checkout_create",
-	"/api/checkout/resolve-target":     "checkout_target_resolve",
-	"/api/checkout/auto-fill":          "checkout_page_fill",
-	"/api/gopay/auto-trigger-check":    "gopay_auto_trigger_decision",
-	"/api/gopay/midtrans-linking-fill": "gopay_midtrans_page_linking",
-	"/api/gopay/full-link":             "gopay_full_payment_flow",
-	"/api/gopay/force-link":            "gopay_linking",
-	"/api/gopay/auto-link":             "gopay_linking",
-	"/api/gopay/smart-link":            "gopay_linking",
-	"/api/gopay/cdp-otp":               "gopay_otp_pin_browser_flow",
-	"/api/gopay/snap-probe":            "gopay_snap_probe",
-	"/api/gopay/monitor":               "payment_monitoring",
-	"/api/pricing/monitor":             "pricing_monitoring",
+	"/api/health":                              "system_health",
+	"/api/incognito/open":                      "login_browser_prepare",
+	"/api/session/fetch":                       "session_capture",
+	"/api/checkout":                            "checkout_create",
+	"/api/checkout/start":                      "checkout_create",
+	"/api/checkout/resolve-target":             "checkout_target_resolve",
+	"/api/checkout/auto-fill":                  "checkout_page_fill",
+	"/api/redteam/eligibility-replay-simulate": "eligibility_replay_simulation",
+	"/api/redteam/payment-replay-last":         "payment_replay_summary_lookup",
+	"/api/redteam/payment-replay-simulate":     "payment_replay_simulation",
+	"/api/gopay/auto-trigger-check":            "gopay_auto_trigger_decision",
+	"/api/gopay/midtrans-linking-fill":         "gopay_midtrans_page_linking",
+	"/api/gopay/full-link":                     "gopay_full_payment_flow",
+	"/api/gopay/force-link":                    "gopay_linking",
+	"/api/gopay/auto-link":                     "gopay_linking",
+	"/api/gopay/smart-link":                    "gopay_linking",
+	"/api/gopay/cdp-otp":                       "gopay_otp_pin_browser_flow",
+	"/api/gopay/snap-probe":                    "gopay_snap_probe",
+	"/api/gopay/monitor":                       "payment_monitoring",
+	"/api/pricing/monitor":                     "pricing_monitoring",
 }
 
 var auditFlowStepIndexes = map[string]int{
-	"/api/health":                      10,
-	"/api/incognito/open":              20,
-	"/api/session/fetch":               30,
-	"/api/checkout":                    40,
-	"/api/checkout/start":              40,
-	"/api/checkout/resolve-target":     50,
-	"/api/checkout/auto-fill":          60,
-	"/api/gopay/auto-trigger-check":    70,
-	"/api/gopay/midtrans-linking-fill": 80,
-	"/api/gopay/force-link":            90,
-	"/api/gopay/auto-link":             90,
-	"/api/gopay/smart-link":            90,
-	"/api/gopay/cdp-otp":               100,
-	"/api/gopay/full-link":             110,
-	"/api/gopay/snap-probe":            120,
-	"/api/gopay/monitor":               130,
-	"/api/pricing/monitor":             140,
+	"/api/health":                              10,
+	"/api/incognito/open":                      20,
+	"/api/session/fetch":                       30,
+	"/api/checkout":                            40,
+	"/api/checkout/start":                      40,
+	"/api/checkout/resolve-target":             50,
+	"/api/checkout/auto-fill":                  60,
+	"/api/redteam/eligibility-replay-simulate": 65,
+	"/api/redteam/payment-replay-last":         66,
+	"/api/redteam/payment-replay-simulate":     67,
+	"/api/gopay/auto-trigger-check":            70,
+	"/api/gopay/midtrans-linking-fill":         80,
+	"/api/gopay/force-link":                    90,
+	"/api/gopay/auto-link":                     90,
+	"/api/gopay/smart-link":                    90,
+	"/api/gopay/cdp-otp":                       100,
+	"/api/gopay/full-link":                     110,
+	"/api/gopay/snap-probe":                    120,
+	"/api/gopay/monitor":                       130,
+	"/api/pricing/monitor":                     140,
 }
 
 var auditFlowRouteRoles = map[string]string{
-	"/api/health":                      "确认本地 Go 服务可用，是全流程运行前的环境健康信号",
-	"/api/incognito/open":              "打开或复用系统 Chrome 无痕窗口，为登录态、checkout 页面和 CDP 观测建立浏览器上下文",
-	"/api/session/fetch":               "从浏览器上下文读取 ChatGPT Session JSON，用于后续 checkout token 获取或诊断",
-	"/api/checkout":                    "基于账号 token、套餐、账单地区和税区信息生成 OpenAI/Stripe checkout 链接",
-	"/api/checkout/start":              "基于账号 token、套餐、账单地区和税区信息生成 OpenAI/Stripe checkout 链接",
-	"/api/checkout/resolve-target":     "从当前浏览器页面或输入链接中锁定真实 checkout 支付页目标",
-	"/api/checkout/auto-fill":          "在 checkout 页面执行地址、支付方式和提交相关自动化动作",
-	"/api/gopay/auto-trigger-check":    "判断页面是否已满足 GoPay 自动触发条件，避免重复或过早执行支付链路",
-	"/api/gopay/midtrans-linking-fill": "在 Midtrans/GoPay 页面填充手机号并推进绑定入口",
-	"/api/gopay/full-link":             "执行 GoPay 绑定、PIN 验证、支付处理和最终状态查询的后端全流程辅助",
-	"/api/gopay/force-link":            "执行 GoPay 指定参数绑定请求",
-	"/api/gopay/auto-link":             "执行 GoPay 自动绑定请求",
-	"/api/gopay/smart-link":            "执行 GoPay 智能绑定请求并处理冲突复用场景",
-	"/api/gopay/cdp-otp":               "通过 CDP 观测或操作 GoPay OTP/PIN 页面，但不记录明文 OTP/PIN",
-	"/api/gopay/snap-probe":            "探测 Snap/Midtrans 页面结构与账号标识",
-	"/api/gopay/monitor":               "采集支付相关页面、网络和控制台状态，用于异常定位和流畅性分析",
-	"/api/pricing/monitor":             "采集定价页面状态，用于 checkout 前置页面诊断",
+	"/api/health":                              "确认本地 Go 服务可用，是全流程运行前的环境健康信号",
+	"/api/incognito/open":                      "打开或复用系统 Chrome 无痕窗口，为登录态、checkout 页面和 CDP 观测建立浏览器上下文",
+	"/api/session/fetch":                       "从浏览器上下文读取 ChatGPT Session JSON，用于后续 checkout token 获取或诊断",
+	"/api/checkout":                            "基于账号 token、套餐、账单地区和税区信息生成 OpenAI/Stripe checkout 链接",
+	"/api/checkout/start":                      "基于账号 token、套餐、账单地区和税区信息生成 OpenAI/Stripe checkout 链接",
+	"/api/checkout/resolve-target":             "从当前浏览器页面或输入链接中锁定真实 checkout 支付页目标",
+	"/api/checkout/auto-fill":                  "在 checkout 页面执行地址、支付方式和提交相关自动化动作",
+	"/api/redteam/eligibility-replay-simulate": "在本地红黑测试中模拟跨账号试用资格复用，验证资格是否绑定当前账号、会话和 token 指纹",
+	"/api/redteam/payment-replay-last":         "从本地审计日志中提取最近一次成功支付的安全摘要，供支付重放防御模拟面板自动填充",
+	"/api/redteam/payment-replay-simulate":     "在本地红黑测试中模拟上一次成功支付信息被复用，验证账号、金额、币种、nonce 和支付引用是否受服务端校验保护",
+	"/api/gopay/auto-trigger-check":            "判断页面是否已满足 GoPay 自动触发条件，避免重复或过早执行支付链路",
+	"/api/gopay/midtrans-linking-fill":         "在 Midtrans/GoPay 页面填充手机号并推进绑定入口",
+	"/api/gopay/full-link":                     "执行 GoPay 绑定、PIN 验证、支付处理和最终状态查询的后端全流程辅助",
+	"/api/gopay/force-link":                    "执行 GoPay 指定参数绑定请求",
+	"/api/gopay/auto-link":                     "执行 GoPay 自动绑定请求",
+	"/api/gopay/smart-link":                    "执行 GoPay 智能绑定请求并处理冲突复用场景",
+	"/api/gopay/cdp-otp":                       "通过 CDP 观测或操作 GoPay OTP/PIN 页面，但不记录明文 OTP/PIN",
+	"/api/gopay/snap-probe":                    "探测 Snap/Midtrans 页面结构与账号标识",
+	"/api/gopay/monitor":                       "采集支付相关页面、网络和控制台状态，用于异常定位和流畅性分析",
+	"/api/pricing/monitor":                     "采集定价页面状态，用于 checkout 前置页面诊断",
 }
 
 var flowAuditLogger = newAuditLogger(filepath.Join(".", "log"), 24*time.Hour, 8<<20, 512)
@@ -1894,45 +2559,51 @@ var gopayAutoTriggerMu sync.Mutex
 var gopayAutoTriggeredCheckout = map[string]time.Time{}
 
 var operationDisplayNames = map[string]string{
-	"/api/health":                      "健康检查",
-	"/api/checkout":                    "生成支付链接",
-	"/api/checkout/start":              "生成支付链接",
-	"/api/incognito/open":              "打开无痕窗口",
-	"/api/session/fetch":               "获取 Session JSON",
-	"/api/gopay/force-link":            "GoPay 强制绑定",
-	"/api/gopay/auto-link":             "GoPay 自动绑定",
-	"/api/gopay/cdp-otp":               "CDP OTP 获取",
-	"/api/gopay/smart-link":            "GoPay 智能绑定",
-	"/api/gopay/snap-probe":            "Snap 探测",
-	"/api/gopay/monitor":               "流程监控",
-	"/api/pricing/monitor":             "定价监控",
-	"/api/gopay/full-link":             "GoPay 全流程绑定",
-	"/api/gopay/auto-trigger-check":    "GoPay 自动触发检查",
-	"/api/gopay/midtrans-linking-fill": "Midtrans GoPay 页面填充",
-	"/api/checkout/resolve-target":     "Checkout 目标解析",
-	"/api/checkout/auto-fill":          "Checkout 自动填充",
-	"/api/perf/client":                 "客户端性能日志",
+	"/api/health":                              "健康检查",
+	"/api/checkout":                            "生成支付链接",
+	"/api/checkout/start":                      "生成支付链接",
+	"/api/incognito/open":                      "打开无痕窗口",
+	"/api/session/fetch":                       "获取 Session JSON",
+	"/api/redteam/eligibility-replay-simulate": "资格复用模拟",
+	"/api/redteam/payment-replay-last":         "读取上次支付摘要",
+	"/api/redteam/payment-replay-simulate":     "支付信息复用模拟",
+	"/api/gopay/force-link":                    "GoPay 强制绑定",
+	"/api/gopay/auto-link":                     "GoPay 自动绑定",
+	"/api/gopay/cdp-otp":                       "CDP OTP 获取",
+	"/api/gopay/smart-link":                    "GoPay 智能绑定",
+	"/api/gopay/snap-probe":                    "Snap 探测",
+	"/api/gopay/monitor":                       "流程监控",
+	"/api/pricing/monitor":                     "定价监控",
+	"/api/gopay/full-link":                     "GoPay 全流程绑定",
+	"/api/gopay/auto-trigger-check":            "GoPay 自动触发检查",
+	"/api/gopay/midtrans-linking-fill":         "Midtrans GoPay 页面填充",
+	"/api/checkout/resolve-target":             "Checkout 目标解析",
+	"/api/checkout/auto-fill":                  "Checkout 自动填充",
+	"/api/perf/client":                         "客户端性能日志",
 }
 
 var operationTypes = map[string]string{
-	"/api/health":                      "system_health",
-	"/api/checkout":                    "checkout_create",
-	"/api/checkout/start":              "checkout_create",
-	"/api/incognito/open":              "login_open_window",
-	"/api/session/fetch":               "session_query",
-	"/api/gopay/force-link":            "gopay_link",
-	"/api/gopay/auto-link":             "gopay_link",
-	"/api/gopay/cdp-otp":               "otp_query",
-	"/api/gopay/smart-link":            "gopay_link",
-	"/api/gopay/snap-probe":            "data_query",
-	"/api/gopay/monitor":               "monitor_trace",
-	"/api/pricing/monitor":             "monitor_trace",
-	"/api/gopay/full-link":             "gopay_full_flow",
-	"/api/gopay/auto-trigger-check":    "gopay_auto_trigger",
-	"/api/gopay/midtrans-linking-fill": "gopay_browser_linking",
-	"/api/checkout/resolve-target":     "data_query",
-	"/api/checkout/auto-fill":          "data_modify",
-	"/api/perf/client":                 "performance_trace",
+	"/api/health":                              "system_health",
+	"/api/checkout":                            "checkout_create",
+	"/api/checkout/start":                      "checkout_create",
+	"/api/incognito/open":                      "login_open_window",
+	"/api/session/fetch":                       "session_query",
+	"/api/redteam/eligibility-replay-simulate": "redteam_simulation",
+	"/api/redteam/payment-replay-last":         "redteam_data_query",
+	"/api/redteam/payment-replay-simulate":     "redteam_simulation",
+	"/api/gopay/force-link":                    "gopay_link",
+	"/api/gopay/auto-link":                     "gopay_link",
+	"/api/gopay/cdp-otp":                       "otp_query",
+	"/api/gopay/smart-link":                    "gopay_link",
+	"/api/gopay/snap-probe":                    "data_query",
+	"/api/gopay/monitor":                       "monitor_trace",
+	"/api/pricing/monitor":                     "monitor_trace",
+	"/api/gopay/full-link":                     "gopay_full_flow",
+	"/api/gopay/auto-trigger-check":            "gopay_auto_trigger",
+	"/api/gopay/midtrans-linking-fill":         "gopay_browser_linking",
+	"/api/checkout/resolve-target":             "data_query",
+	"/api/checkout/auto-fill":                  "data_modify",
+	"/api/perf/client":                         "performance_trace",
 }
 
 var sensitiveJSONKeys = map[string]struct{}{
@@ -1955,6 +2626,11 @@ var sensitiveJSONKeys = map[string]struct{}{
 	"client_secret":              {},
 	"session":                    {},
 	"session_json":               {},
+	"current_session_id":         {},
+	"current_token_fingerprint":  {},
+	"previous_trial_reference":   {},
+	"current_request_nonce":      {},
+	"previous_request_nonce":     {},
 	"gopay_pin_token":            {},
 	"gopay_payment_pin_token":    {},
 	"payment_method_id":          {},
@@ -1995,42 +2671,55 @@ var auditSafeKeySanitizer = strings.NewReplacer("-", "_", ".", "_", " ", "_")
 const auditMaxResponseBodyBytes = 512 << 10
 
 var auditResponseSummaryKeys = map[string]struct{}{
-	"ok":                         {},
-	"stage":                      {},
-	"ready":                      {},
-	"reason":                     {},
-	"strategy":                   {},
-	"error":                      {},
-	"code":                       {},
-	"account_id":                 {},
-	"target_url":                 {},
-	"country_code":               {},
-	"phone_number":               {},
-	"reference_id":               {},
-	"linking_reference_id":       {},
-	"payment_reference_id":       {},
-	"gopay_payment_reference_id": {},
-	"payment_voucher":            {},
-	"transaction_id":             {},
-	"reused_existing":            {},
-	"already_triggered":          {},
-	"checkout_key":               {},
-	"aggressive_retry":           {},
-	"pin_stage":                  {},
-	"pin_auto_filled":            {},
-	"pin_auto_submitted":         {},
-	"pin_input_strategy":         {},
-	"balance_amount":             {},
-	"balance_state":              {},
-	"hubungkan_auto_clicked":     {},
-	"pay_now_auto_clicked":       {},
-	"auto_action_paused":         {},
-	"auto_action_stage":          {},
-	"otp_manual_required":        {},
-	"has_otp_field":              {},
-	"has_pin_field":              {},
-	"cdp_url_host":               {},
-	"cdp_url_path":               {},
+	"ok":                            {},
+	"stage":                         {},
+	"decision":                      {},
+	"ready":                         {},
+	"reason":                        {},
+	"strategy":                      {},
+	"error":                         {},
+	"code":                          {},
+	"account_id":                    {},
+	"target_url":                    {},
+	"country_code":                  {},
+	"phone_number":                  {},
+	"reference_id":                  {},
+	"linking_reference_id":          {},
+	"payment_reference_id":          {},
+	"previous_payment_reference_id": {},
+	"gopay_payment_reference_id":    {},
+	"payment_voucher":               {},
+	"transaction_id":                {},
+	"previous_transaction_id":       {},
+	"reused_existing":               {},
+	"already_triggered":             {},
+	"checkout_key":                  {},
+	"source_file":                   {},
+	"aggressive_retry":              {},
+	"current_checkout_session_id":   {},
+	"previous_checkout_session_id":  {},
+	"current_amount":                {},
+	"previous_amount":               {},
+	"current_currency":              {},
+	"previous_currency":             {},
+	"redirect_status":               {},
+	"redirect_pm_type":              {},
+	"setup_intent":                  {},
+	"pin_stage":                     {},
+	"pin_auto_filled":               {},
+	"pin_auto_submitted":            {},
+	"pin_input_strategy":            {},
+	"balance_amount":                {},
+	"balance_state":                 {},
+	"hubungkan_auto_clicked":        {},
+	"pay_now_auto_clicked":          {},
+	"auto_action_paused":            {},
+	"auto_action_stage":             {},
+	"otp_manual_required":           {},
+	"has_otp_field":                 {},
+	"has_pin_field":                 {},
+	"cdp_url_host":                  {},
+	"cdp_url_path":                  {},
 }
 
 var usStates = []string{"AL", "AK", "AZ", "AR", "CA", "CO", "CT", "DE", "FL", "GA", "HI", "ID", "IL", "IN", "IA", "KS", "KY", "LA", "ME", "MD", "MA", "MI", "MN", "MS", "MO", "MT", "NE", "NV", "NH", "NJ", "NM", "NY", "NC", "ND", "OH", "OK", "OR", "PA", "RI", "SC", "SD", "TN", "TX", "UT", "VT", "VA", "WA", "WV", "WI", "WY"}
@@ -5761,6 +6450,23 @@ func resolveCheckoutPageTarget(targets []cdpTarget, expectedURL string) (*cdpTar
 	return nil, "", errors.New("未找到本工具最近一次打开的支付链接页面，请重新打开支付链接后再试。")
 }
 
+func resolveCheckoutTargetFallback(targets []cdpTarget, expectedURL string) (*cdpTarget, string, error) {
+	target, currentURL, err := resolveCheckoutPageTarget(targets, expectedURL)
+	if err == nil {
+		return target, currentURL, nil
+	}
+	for i := len(targets) - 1; i >= 0; i-- {
+		target := &targets[i]
+		if target.Type != "page" {
+			continue
+		}
+		if midtransRedirectionAccountID(target.URL) != "" {
+			return target, target.URL, nil
+		}
+	}
+	return nil, "", err
+}
+
 func checkoutResolveCandidateURLs(targets []cdpTarget) []string {
 	urls := make([]string, 0, min(len(targets), 10))
 	seen := map[string]struct{}{}
@@ -6390,6 +7096,9 @@ func midtransLinkingFillOutcome(result map[string]any) (bool, string) {
 	if midtransTechnicalErrorInText(pageText) {
 		return false, "midtrans_linking_technical_error"
 	}
+	if midtransPhoneRejectedInText(pageText) {
+		return false, "midtrans_phone_rejected"
+	}
 	found, _ := result["found"].(map[string]any)
 	countryOK := boolMapValue(found, "country") || boolJSONValue(result["country_verified"])
 	phoneOK := boolMapValue(found, "phone")
@@ -6452,6 +7161,17 @@ func midtransTechnicalErrorInText(text string) bool {
 		strings.Contains(normalized, "please try again") ||
 		strings.Contains(normalized, "we're working on it") ||
 		strings.Contains(normalized, "we’re working on it")
+}
+
+func midtransPhoneRejectedInText(text string) bool {
+	normalized := strings.ToLower(strings.Join(strings.Fields(text), " "))
+	if normalized == "" {
+		return false
+	}
+	return strings.Contains(normalized, "please use another phone number") ||
+		strings.Contains(normalized, "use another phone number") ||
+		strings.Contains(normalized, "nomor lain") ||
+		strings.Contains(normalized, "phone number is not supported")
 }
 
 const midtransNetworkDiagnosticsMaxEntries = 24
@@ -7423,6 +8143,39 @@ func handleGopayMidtransLinkingFill(w http.ResponseWriter, r *http.Request) {
 			}
 			return looksLikeLinkingPage() && !hasTechnicalError();
 		};
+		const recoverTechnicalErrorBackLoop = async (reasonLabel) => {
+			let attempts = 0;
+			let recovered = false;
+			let backMissing = false;
+			while (true) {
+				if (hasNextStep()) {
+					return { recovered: true, next_step: true, attempts, back_missing: backMissing };
+				}
+				if (!hasTechnicalError()) {
+					return { recovered: recovered || !hasTechnicalError(), attempts, back_missing: backMissing };
+				}
+				const buttons = Array.from(document.querySelectorAll('button')).filter(visible);
+				const hasBackButton = buttons.some((button) => /back|kembali|try again/i.test(textOf(button)));
+				if (!hasBackButton) {
+					backMissing = true;
+					return { recovered, attempts, back_missing: true, still_technical_error: hasTechnicalError(), reason: reasonLabel };
+				}
+				attempts += 1;
+				const stepRecovered = await clickBackFromTechnicalError();
+				recovered = recovered || stepRecovered;
+				recordClickAttempt({ attempt: attempts, action: 'technical_error_back_loop', reason: reasonLabel, recovered: stepRecovered });
+				if (hasNextStep()) {
+					return { recovered: true, next_step: true, attempts, back_missing: backMissing };
+				}
+				if (!hasTechnicalError()) {
+					return { recovered: recovered || stepRecovered, attempts, back_missing: backMissing };
+				}
+				if (!looksLikeLinkingPage()) {
+					return { recovered, attempts, navigated: true, back_missing: backMissing };
+				}
+				await wait(recoveryWaitMs);
+			}
+		};
 		const isSubmitActionButton = (button) => {
 			const text = textOf(button).toLowerCase();
 			return text.includes('link and pay') || text.includes('hubungkan') || text.includes('bayar') || text.includes('continue') || text.includes('lanjut') || text.includes('pay');
@@ -7535,7 +8288,21 @@ func handleGopayMidtransLinkingFill(w http.ResponseWriter, r *http.Request) {
 				result.stage = 'midtrans_linking_rate_limited';
 				result.retry_after_ms = 90000;
 				result.cooldown_ms = 90000;
-				recordClickAttempt({ attempt, action: 'rate_limited', retry_after_ms: result.retry_after_ms });
+				result.rate_limited = true;
+				if (hasTechnicalError()) {
+					const rateLimitBackRecovery = await recoverTechnicalErrorBackLoop('rate_limited');
+					result.rate_limit_back_recovered = !!rateLimitBackRecovery.recovered;
+					result.rate_limit_back_recovery_attempts = rateLimitBackRecovery.attempts || 0;
+					result.rate_limit_back_missing = !!rateLimitBackRecovery.back_missing;
+					result.rate_limit_back_next_step = !!rateLimitBackRecovery.next_step;
+				}
+				recordClickAttempt({
+					attempt,
+					action: 'rate_limited',
+					retry_after_ms: result.retry_after_ms,
+					back_recovered: !!result.rate_limit_back_recovered,
+					back_attempts: result.rate_limit_back_recovery_attempts || 0,
+				});
 				break;
 			}
 			if (postClickState === 'next_step' || postClickState === 'navigated') break;
@@ -8068,37 +8835,53 @@ func handleGopayCDPOTP(w http.ResponseWriter, r *http.Request) {
 		return ""
 	}
 
-	var target *cdpTarget
-	var err error
-	targetPatterns := []string{
-		"pin-web-client.gopayapi.com",
-		"merchants-gws-app.gopayapi.com",
-		"midtrans.com",
-	}
-	for _, pattern := range targetPatterns {
-		target, err = findAnyTarget(cdpDebuggingPort, pattern)
-		if err == nil {
-			break
-		}
-	}
+	targets, err := getCDPTargets(cdpDebuggingPort)
 	if err != nil {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"ok": false, "error": err.Error()})
 		return
 	}
-	conn, _, err := websocket.DefaultDialer.Dial(target.WebSocketDebuggerURL, nil)
-	if err != nil {
+	candidates := selectGopayCDPObservationTargets(targets)
+	if len(candidates) == 0 {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"ok": false, "error": "未在 CDP 中找到可用于 GoPay OTP/PIN 观测的目标页"})
+		return
+	}
+
+	var bestResult map[string]any
+	bestPriority := -1
+	var bestTarget *cdpTarget
+	for i := range candidates {
+		target := &candidates[i]
+		conn, _, err := websocket.DefaultDialer.Dial(target.WebSocketDebuggerURL, nil)
+		if err != nil {
+			continue
+		}
+		resultJSON, _ := executeCDPScript(conn, gopayCDPFlowScript(strings.TrimSpace(req.PIN)))
+		_ = conn.Close()
+		var candidateResult map[string]any
+		if resultJSON != "" {
+			_ = json.Unmarshal([]byte(resultJSON), &candidateResult)
+		} else {
+			candidateResult = map[string]any{"error": "empty result"}
+		}
+		candidateResult["target_id"] = target.ID
+		candidateResult["target_type"] = target.Type
+		candidateResult["target_url"] = target.URL
+		priority := gopayCDPResultPriority(candidateResult)
+		if priority > bestPriority {
+			bestPriority = priority
+			bestResult = candidateResult
+			bestTarget = target
+		}
+		stage := strings.TrimSpace(stringifyJSONValue(candidateResult["page_stage"]))
+		if priority >= 300 && stage != "checkout_failed_return" {
+			break
+		}
+	}
+	if bestResult == nil {
 		writeError(w, http.StatusInternalServerError, "CDP failed")
 		return
 	}
-	defer conn.Close()
-
-	resultJSON, _ := executeCDPScript(conn, gopayCDPFlowScript(strings.TrimSpace(req.PIN)))
-	var result map[string]any
-	if resultJSON != "" {
-		json.Unmarshal([]byte(resultJSON), &result)
-	} else {
-		result = map[string]any{"error": "empty result"}
-	}
+	result := bestResult
 	if detected := findOTPInText(stringifyJSONValue(result["page_text_snippet"])); detected != "" {
 		if stringifyJSONValue(result["detected_otp"]) == "" {
 			result["detected_otp"] = detected
@@ -8108,6 +8891,9 @@ func handleGopayCDPOTP(w http.ResponseWriter, r *http.Request) {
 		"ok":                     true,
 		"stage":                  firstNonEmpty(stringifyJSONValue(result["page_stage"]), "page_observed"),
 		"pin_stage":              stringifyJSONValue(result["pin_stage"]),
+		"redirect_status":        stringifyJSONValue(result["redirect_status"]),
+		"redirect_pm_type":       stringifyJSONValue(result["redirect_pm_type"]),
+		"setup_intent":           stringifyJSONValue(result["setup_intent"]),
 		"pin_auto_filled":        boolMapValue(result, "pin_auto_filled"),
 		"pin_auto_submitted":     boolMapValue(result, "pin_auto_submitted"),
 		"pin_input_strategy":     stringifyJSONValue(result["pin_input_strategy"]),
@@ -8122,7 +8908,19 @@ func handleGopayCDPOTP(w http.ResponseWriter, r *http.Request) {
 		"has_pin_field":          boolMapValue(result, "has_pin_field"),
 		"cdp_url_host":           stringifyJSONValue(result["cdp_url_host"]),
 		"cdp_url_path":           stringifyJSONValue(result["cdp_url_path"]),
-		"result":                 result,
+		"cdp_target_id": func() string {
+			if bestTarget != nil {
+				return bestTarget.ID
+			}
+			return ""
+		}(),
+		"cdp_target_type": func() string {
+			if bestTarget != nil {
+				return bestTarget.Type
+			}
+			return ""
+		}(),
+		"result": result,
 	}
 	writeJSON(w, http.StatusOK, response)
 }
@@ -8134,11 +8932,16 @@ func gopayCDPFlowScript(preferredPIN string) string {
 		const parsedURL = (() => { try { return new URL(currentURL); } catch (_err) { return null; } })();
 		const urlHost = (parsedURL?.host || '').toLowerCase();
 		const urlPath = (parsedURL?.pathname || '').toLowerCase();
+		const redirectStatus = (parsedURL?.searchParams?.get('redirect_status') || '').toLowerCase();
+		const redirectPMType = (parsedURL?.searchParams?.get('redirect_pm_type') || '').toLowerCase();
 		const actionScope = urlHost + urlPath;
 		const result = {
 			url: currentURL,
 			cdp_url_host: urlHost,
 			cdp_url_path: urlPath,
+			redirect_status: redirectStatus,
+			redirect_pm_type: redirectPMType,
+			setup_intent: parsedURL?.searchParams?.get('setup_intent') || '',
 			page_stage: 'page_observed',
 			pin_stage: '',
 			has_otp_field: false,
@@ -8288,11 +9091,20 @@ func gopayCDPFlowScript(preferredPIN string) string {
 		const pinPage = urlHost.includes('pin-web-client.gopayapi.com') || lowerText.includes('pin kamu') || lowerText.includes('masukkan pin') || lowerText.includes('enter your pin');
 		const paymentContext = lowerText.includes('payment') || lowerText.includes('bayar') || lowerText.includes('pembayaran') || lowerText.includes('total') || lowerText.includes('subscribe') || lowerText.includes('subscription');
 		const bindingContext = lowerText.includes('link') || lowerText.includes('hubungkan') || lowerText.includes('authorize') || lowerText.includes('otorisasi') || lowerText.includes('account') || lowerText.includes('akun');
+		const failedCheckoutReturn = (
+			(urlHost.includes('pay.openai.com') || urlHost.includes('chatgpt.com')) &&
+			redirectStatus === 'failed' &&
+			(redirectPMType === 'gopay' || lowerText.includes('gopay') || currentURL.toLowerCase().includes('setup_intent'))
+		);
 
-		if (otpPage) {
+		if (failedCheckoutReturn) {
+			result.page_stage = 'checkout_failed_return';
+		}
+
+		if (!failedCheckoutReturn && otpPage) {
 			result.page_stage = 'otp_entry';
 			result.otp_manual_required = true;
-		} else if (pinPage) {
+		} else if (!failedCheckoutReturn && pinPage) {
 			result.pin_stage = paymentContext && !bindingContext ? 'payment' : 'binding';
 			result.page_stage = result.pin_stage === 'payment' ? 'pin_entry_payment' : 'pin_entry_binding';
 		}
@@ -8487,8 +9299,8 @@ func handleGopayMonitor(w http.ResponseWriter, r *http.Request) {
 		Stream    bool `json:"stream"`
 	}
 	_ = json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<17)).Decode(&req)
-	if req.DurationS <= 0 || req.DurationS > 120 {
-		req.DurationS = 30
+	if req.DurationS <= 0 || req.DurationS > 30 {
+		req.DurationS = 12
 	}
 	if !isCDPReady(cdpDebuggingPort) {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"ok": false, "error": "CDP not ready"})
@@ -8540,9 +9352,16 @@ func handleGopayMonitor(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"ok":      true,
 		"targets": activeTargets,
-		"events":  events,
+		"events":  truncateMonitorEvents(events, 120),
 		"summary": summary,
 	})
+}
+
+func truncateMonitorEvents(events []monitorEvent, limit int) []monitorEvent {
+	if limit <= 0 || len(events) <= limit {
+		return events
+	}
+	return append([]monitorEvent(nil), events[:limit]...)
 }
 
 func runGopayMonitorSession(ctx context.Context, durationS int, onEvent func(monitorEvent)) ([]monitorEvent, monitorSummaryStats, error) {
@@ -8698,8 +9517,8 @@ func handlePricingMonitor(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid json")
 		return
 	}
-	if req.DurationS <= 0 || req.DurationS > 180 {
-		req.DurationS = 12
+	if req.DurationS <= 0 || req.DurationS > 60 {
+		req.DurationS = 8
 	}
 	if !isCDPReady(cdpDebuggingPort) {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"ok": false, "error": "CDP not ready"})
@@ -8743,7 +9562,7 @@ func handlePricingMonitor(w http.ResponseWriter, r *http.Request) {
 			initiatorType: r.initiatorType || '',
 			transferSize: r.transferSize || 0,
 			duration: Math.round(r.duration || 0)
-		})).filter(r => match(r.name)).slice(0, 200);
+		})).filter(r => match(r.name)).slice(0, 80);
 		const nav = performance.getEntriesByType('navigation').map(r => ({
 			name: r.name,
 			type: r.type || '',
@@ -8765,8 +9584,8 @@ func handlePricingMonitor(w http.ResponseWriter, r *http.Request) {
 			}
 		});
 		const storageDump = {
-			local: Object.keys(localStorage).slice(0, 80).map(k => ({key:k, value:String(localStorage.getItem(k) || '').slice(0, 300)})).filter(x => match(x.key + ' ' + x.value)),
-			session: Object.keys(sessionStorage).slice(0, 80).map(k => ({key:k, value:String(sessionStorage.getItem(k) || '').slice(0, 300)})).filter(x => match(x.key + ' ' + x.value)),
+			local: Object.keys(localStorage).slice(0, 30).map(k => ({key:k, value:String(localStorage.getItem(k) || '').slice(0, 160)})).filter(x => match(x.key + ' ' + x.value)),
+			session: Object.keys(sessionStorage).slice(0, 30).map(k => ({key:k, value:String(sessionStorage.getItem(k) || '').slice(0, 160)})).filter(x => match(x.key + ' ' + x.value)),
 		};
 		return JSON.stringify({
 			title: document.title,
@@ -8774,9 +9593,9 @@ func handlePricingMonitor(w http.ResponseWriter, r *http.Request) {
 			cards,
 			resources,
 			navigation: nav,
-			promo_hints: promoHints.slice(0, 40),
+			promo_hints: promoHints.slice(0, 20),
 			storage: storageDump,
-			body_text: (document.body?.innerText || '').replace(/\s+/g, ' ').trim().slice(0, 5000)
+			body_text: (document.body?.innerText || '').replace(/\s+/g, ' ').trim().slice(0, 2000)
 		});
 	})()`, mustJSON(filters))
 
@@ -9360,7 +10179,7 @@ func handleCheckoutResolveTarget(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"ok": false, "error": err.Error()})
 		return
 	}
-	target, currentURL, err := resolveCheckoutPageTarget(targets, req.OpenedURL)
+	target, currentURL, err := resolveCheckoutTargetFallback(targets, req.OpenedURL)
 	if err != nil {
 		writeJSON(w, http.StatusOK, map[string]any{
 			"ok":             false,

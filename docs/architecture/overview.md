@@ -57,6 +57,9 @@ web/app.js
   ├─ 调用 /api/checkout 与 /api/checkout/start
   ├─ 调用 /api/incognito/open
   ├─ 调用 /api/session/fetch
+  ├─ 调用 /api/redteam/eligibility-replay-simulate
+  ├─ 调用 /api/redteam/payment-replay-last
+  ├─ 调用 /api/redteam/payment-replay-simulate
   ├─ 调用 /api/checkout/resolve-target
   ├─ 调用 /api/checkout/auto-fill
   ├─ 调用 /api/gopay/cdp-otp
@@ -175,6 +178,8 @@ browser-use-service
 - Midtrans redirection 页面填充。
 - GoPay OTP 页面 CDP 识别与自动填入。
 - GoPay/定价页面 CDP 监控。
+- 本地红黑测试：资格复用模拟面板与防御判定 API。
+- 本地红黑测试：支付信息复用模拟面板、最近成功支付摘要提取与支付重放防御判定 API。
 - API 审计日志与敏感字段脱敏/可选完整捕获。
 - browser-use Node/Playwright 服务和 CLI。
 - Chrome 凭证提取扩展。

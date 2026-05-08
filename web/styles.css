@@ -1169,6 +1169,12 @@ pre {
   color: var(--muted);
 }
 
+.gopay-inline-pair {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 100px;
+  gap: 8px;
+}
+
 .gopay-check {
   display: flex;
   align-items: center;
@@ -1212,6 +1218,48 @@ pre {
 
 .gopay-result {
   margin-top: 10px;
+}
+
+.gopay-decision-details {
+  margin-bottom: 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: rgba(10, 14, 39, 0.42);
+  padding: 10px;
+}
+
+.gopay-decision-head {
+  margin-bottom: 8px;
+  color: var(--ink);
+  font-size: 13px;
+  font-weight: 800;
+}
+
+.gopay-decision-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.gopay-decision-grid > div,
+.gopay-decision-evidence {
+  min-width: 0;
+  border: 1px solid rgba(139, 146, 179, 0.14);
+  border-radius: 8px;
+  background: rgba(5, 8, 23, 0.42);
+  padding: 8px 10px;
+}
+
+.gopay-decision-evidence {
+  margin-top: 10px;
+}
+
+.gopay-decision-grid strong,
+.gopay-decision-evidence strong {
+  display: block;
+  color: var(--ink);
+  line-height: 1.5;
+  overflow-wrap: anywhere;
 }
 
 #gopayStepFlow .step-flow-item.done:last-child {

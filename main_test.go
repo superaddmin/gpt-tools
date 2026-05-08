@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"math"
 	"net/http"
@@ -535,6 +536,209 @@ func TestHandleClientPerformanceLogSummarizesMetrics(t *testing.T) {
 	}
 }
 
+func TestHandleEligibilityReplaySimulateRejectsCrossAccountReplay(t *testing.T) {
+	oldConfig := config
+	config = appConfig{EnableRedteamAPIs: true}
+	t.Cleanup(func() { config = oldConfig })
+	req := httptest.NewRequest(http.MethodPost, "/api/redteam/eligibility-replay-simulate", strings.NewReader(`{
+		"mode":"defensive_simulation",
+		"current_account_id":"acct-current",
+		"current_session_id":"sess-current",
+		"current_token_fingerprint":"tokfp-current",
+		"previous_account_id":"acct-previous",
+		"previous_trial_reference":"trial-ref-123456"
+	}`))
+	req.RemoteAddr = "127.0.0.1:12345"
+	rec := httptest.NewRecorder()
+
+	handleEligibilityReplaySimulate(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200, body=%s", rec.Code, rec.Body.String())
+	}
+	var response map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if response["ok"] != false {
+		t.Fatalf("ok = %#v, want false", response["ok"])
+	}
+	if response["stage"] != "eligibility_replay_rejected" {
+		t.Fatalf("stage = %#v", response["stage"])
+	}
+	if response["decision"] != "rejected" {
+		t.Fatalf("decision = %#v", response["decision"])
+	}
+	if response["reason"] != "eligibility_bound_to_account_session" {
+		t.Fatalf("reason = %#v", response["reason"])
+	}
+	controls, ok := response["controls"].([]any)
+	if !ok || len(controls) < 3 {
+		t.Fatalf("controls = %#v", response["controls"])
+	}
+	evidence, ok := response["evidence"].(map[string]any)
+	if !ok {
+		t.Fatalf("evidence type = %T", response["evidence"])
+	}
+	if evidence["account_match"] != false || evidence["session_present"] != true || evidence["token_fingerprint_present"] != true {
+		t.Fatalf("evidence = %#v", evidence)
+	}
+	trialRef, ok := response["previous_trial_reference_summary"].(map[string]any)
+	if !ok {
+		t.Fatalf("previous_trial_reference_summary type = %T", response["previous_trial_reference_summary"])
+	}
+	if trialRef["present"] != true || trialRef["sha256"] == "" {
+		t.Fatalf("previous_trial_reference_summary = %#v", trialRef)
+	}
+	if strings.Contains(rec.Body.String(), "trial-ref-123456") {
+		t.Fatalf("response leaked raw previous trial reference: %s", rec.Body.String())
+	}
+}
+
+func TestHandleEligibilityReplaySimulateAllowsSameSubjectContext(t *testing.T) {
+	oldConfig := config
+	config = appConfig{EnableRedteamAPIs: true}
+	t.Cleanup(func() { config = oldConfig })
+	req := httptest.NewRequest(http.MethodPost, "/api/redteam/eligibility-replay-simulate", strings.NewReader(`{
+		"mode":"defensive_simulation",
+		"current_account_id":"acct-current",
+		"current_session_id":"sess-current",
+		"current_token_fingerprint":"tokfp-current",
+		"previous_account_id":"acct-current",
+		"previous_trial_reference":"trial-ref-123456"
+	}`))
+	req.RemoteAddr = "127.0.0.1:12345"
+	rec := httptest.NewRecorder()
+
+	handleEligibilityReplaySimulate(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200, body=%s", rec.Code, rec.Body.String())
+	}
+	var response map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if response["ok"] != true {
+		t.Fatalf("ok = %#v, want true", response["ok"])
+	}
+	if response["stage"] != "eligibility_context_verified" {
+		t.Fatalf("stage = %#v", response["stage"])
+	}
+	if response["decision"] != "matched_subject" {
+		t.Fatalf("decision = %#v", response["decision"])
+	}
+	if response["reason"] != "same_account_context" {
+		t.Fatalf("reason = %#v", response["reason"])
+	}
+}
+
+func TestHandleEligibilityReplaySimulateRequiresDefensiveMode(t *testing.T) {
+	oldConfig := config
+	config = appConfig{EnableRedteamAPIs: true}
+	t.Cleanup(func() { config = oldConfig })
+
+	req := httptest.NewRequest(http.MethodPost, "/api/redteam/eligibility-replay-simulate", strings.NewReader(`{
+		"current_account_id":"acct-current",
+		"current_session_id":"sess-current",
+		"current_token_fingerprint":"tokfp-current",
+		"previous_account_id":"acct-previous",
+		"previous_trial_reference":"trial-ref-123456"
+	}`))
+	req.RemoteAddr = "127.0.0.1:12345"
+	rec := httptest.NewRecorder()
+
+	handleEligibilityReplaySimulate(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400, body=%s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "mode must be defensive_simulation") {
+		t.Fatalf("body = %s", rec.Body.String())
+	}
+}
+
+func TestHandleEligibilityReplaySimulateRejectsWhenRedteamDisabled(t *testing.T) {
+	oldConfig := config
+	config = appConfig{}
+	t.Cleanup(func() { config = oldConfig })
+
+	req := httptest.NewRequest(http.MethodPost, "/api/redteam/eligibility-replay-simulate", strings.NewReader(`{"mode":"defensive_simulation","current_account_id":"acct-current","current_session_id":"sess-current","current_token_fingerprint":"tokfp-current","previous_account_id":"acct-previous","previous_trial_reference":"trial-ref-123456"}`))
+	req.RemoteAddr = "127.0.0.1:12345"
+	rec := httptest.NewRecorder()
+
+	handleEligibilityReplaySimulate(rec, req)
+
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403, body=%s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "redteam APIs are disabled") {
+		t.Fatalf("body = %s", rec.Body.String())
+	}
+}
+
+func TestHandleEligibilityReplaySimulateRejectsNonLoopbackRequest(t *testing.T) {
+	oldConfig := config
+	config = appConfig{EnableRedteamAPIs: true}
+	t.Cleanup(func() { config = oldConfig })
+
+	req := httptest.NewRequest(http.MethodPost, "/api/redteam/eligibility-replay-simulate", strings.NewReader(`{"mode":"defensive_simulation","current_account_id":"acct-current","current_session_id":"sess-current","current_token_fingerprint":"tokfp-current","previous_account_id":"acct-previous","previous_trial_reference":"trial-ref-123456"}`))
+	req.RemoteAddr = "8.8.8.8:443"
+	rec := httptest.NewRecorder()
+
+	handleEligibilityReplaySimulate(rec, req)
+
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403, body=%s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "loopback access") {
+		t.Fatalf("body = %s", rec.Body.String())
+	}
+}
+
+func TestBuildAuditLogRecordIncludesEligibilityReplaySimulationFields(t *testing.T) {
+	req := httptest.NewRequest(http.MethodPost, "/api/redteam/eligibility-replay-simulate", strings.NewReader(`{
+		"mode":"defensive_simulation",
+		"current_account_id":"acct-current",
+		"current_session_id":"sess-current",
+		"current_token_fingerprint":"tokfp-current",
+		"previous_account_id":"acct-previous",
+		"previous_trial_reference":"trial-ref-123456"
+	}`))
+	responseBody := []byte(`{
+		"ok": false,
+		"stage": "eligibility_replay_rejected",
+		"decision": "rejected",
+		"reason": "eligibility_bound_to_account_session",
+		"controls": ["account_binding","session_binding","token_fingerprint_binding"]
+	}`)
+
+	record := buildAuditLogRecord(req, []byte(`{"mode":"defensive_simulation","current_account_id":"acct-current","current_session_id":"sess-current","current_token_fingerprint":"tokfp-current","previous_account_id":"acct-previous","previous_trial_reference":"trial-ref-123456"}`), responseBody, http.StatusOK, time.Now())
+
+	if record.OperationName != "资格复用模拟" {
+		t.Fatalf("OperationName = %q", record.OperationName)
+	}
+	if record.OperationType != "redteam_simulation" {
+		t.Fatalf("OperationType = %q", record.OperationType)
+	}
+	if record.OperationResult != "failed" {
+		t.Fatalf("OperationResult = %q, want failed", record.OperationResult)
+	}
+	if record.Metadata["flow_stage"] != "eligibility_replay_simulation" {
+		t.Fatalf("flow_stage = %#v", record.Metadata["flow_stage"])
+	}
+	if record.Metadata["flow_step_index"] != 65 {
+		t.Fatalf("flow_step_index = %#v", record.Metadata["flow_step_index"])
+	}
+	summary, _ := record.Metadata["response_summary"].(map[string]any)
+	if summary["decision"] != "rejected" || summary["reason"] != "eligibility_bound_to_account_session" {
+		t.Fatalf("response_summary = %#v", summary)
+	}
+	if strings.Contains(stringifyJSONValue(record.Metadata["request_payload"]), "trial-ref-123456") {
+		t.Fatalf("request_payload leaked raw trial reference: %#v", record.Metadata["request_payload"])
+	}
+}
+
 func TestBuildAuditLogRecordIncludesAutoTriggerFlowFields(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/api/gopay/auto-trigger-check", strings.NewReader(`{"source":"verification","submitted":false}`))
 	responseBody := []byte(`{
@@ -561,6 +765,432 @@ func TestBuildAuditLogRecordIncludesAutoTriggerFlowFields(t *testing.T) {
 	summary, _ := record.Metadata["response_summary"].(map[string]any)
 	if summary["reason"] != "waiting_for_checkout_submit" {
 		t.Fatalf("response_summary.reason = %#v", summary["reason"])
+	}
+}
+
+func TestRedteamEligibilityPanelExposesLocalSimulationEntry(t *testing.T) {
+	html, err := os.ReadFile(filepath.Join("web", "index.html"))
+	if err != nil {
+		t.Fatalf("read index.html: %v", err)
+	}
+	page := string(html)
+
+	for _, want := range []string{
+		"资格复用模拟",
+		`id="eligibilityReplayForm"`,
+		`id="eligibilityCurrentAccountId"`,
+		`id="eligibilityPreviousAccountId"`,
+		`id="eligibilitySimulateBtn"`,
+		`id="eligibilityReplayOutput"`,
+	} {
+		if !strings.Contains(page, want) {
+			t.Fatalf("index.html missing %q", want)
+		}
+	}
+}
+
+func TestEligibilityReplayPanelScriptCallsLocalSimulationAPI(t *testing.T) {
+	source, err := os.ReadFile("web/app.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	script := string(source)
+
+	for _, want := range []string{
+		"/api/redteam/eligibility-replay-simulate",
+		"eligibilityReplayForm",
+		"eligibilitySimulateBtn",
+		"eligibilityReplayOutput",
+		"crypto.subtle.digest",
+		"mode: \"defensive_simulation\"",
+	} {
+		if !strings.Contains(script, want) {
+			t.Fatalf("web/app.js missing %q", want)
+		}
+	}
+}
+
+func TestHandlePaymentReplaySimulateRejectsCrossAccountReuse(t *testing.T) {
+	oldConfig := config
+	config = appConfig{EnableRedteamAPIs: true}
+	t.Cleanup(func() { config = oldConfig })
+	req := httptest.NewRequest(http.MethodPost, "/api/redteam/payment-replay-simulate", strings.NewReader(`{
+		"mode":"defensive_simulation",
+		"current_account_id":"acct-current",
+		"current_checkout_session_id":"cs-new",
+		"current_request_nonce":"nonce-new",
+		"current_amount":"20.00",
+		"current_currency":"IDR",
+		"previous_account_id":"acct-previous",
+		"previous_checkout_session_id":"cs-old",
+		"previous_payment_reference_id":"pay-ref-123",
+		"previous_transaction_id":"tx-123",
+		"previous_request_nonce":"nonce-old",
+		"previous_amount":"20.00",
+		"previous_currency":"IDR"
+	}`))
+	req.RemoteAddr = "127.0.0.1:12345"
+	rec := httptest.NewRecorder()
+
+	handlePaymentReplaySimulate(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200, body=%s", rec.Code, rec.Body.String())
+	}
+	var response map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if response["ok"] != false || response["decision"] != "rejected" {
+		t.Fatalf("response = %#v", response)
+	}
+	if response["stage"] != "payment_replay_rejected" {
+		t.Fatalf("stage = %#v", response["stage"])
+	}
+	if response["reason"] != "payment_context_bound_to_account" {
+		t.Fatalf("reason = %#v", response["reason"])
+	}
+	evidence, ok := response["evidence"].(map[string]any)
+	if !ok {
+		t.Fatalf("evidence type = %T", response["evidence"])
+	}
+	if evidence["account_match"] != false || evidence["payment_reference_present"] != true {
+		t.Fatalf("evidence = %#v", evidence)
+	}
+}
+
+func TestHandlePaymentReplaySimulateRejectsAmountMismatch(t *testing.T) {
+	oldConfig := config
+	config = appConfig{EnableRedteamAPIs: true}
+	t.Cleanup(func() { config = oldConfig })
+	req := httptest.NewRequest(http.MethodPost, "/api/redteam/payment-replay-simulate", strings.NewReader(`{
+		"mode":"defensive_simulation",
+		"current_account_id":"acct-current",
+		"current_checkout_session_id":"cs-new",
+		"current_request_nonce":"nonce-new",
+		"current_amount":"21.00",
+		"current_currency":"IDR",
+		"previous_account_id":"acct-current",
+		"previous_checkout_session_id":"cs-old",
+		"previous_payment_reference_id":"pay-ref-123",
+		"previous_transaction_id":"tx-123",
+		"previous_request_nonce":"nonce-old",
+		"previous_amount":"20.00",
+		"previous_currency":"IDR"
+	}`))
+	req.RemoteAddr = "127.0.0.1:12345"
+	rec := httptest.NewRecorder()
+
+	handlePaymentReplaySimulate(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200, body=%s", rec.Code, rec.Body.String())
+	}
+	var response map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if response["reason"] != "payment_amount_mismatch_detected" {
+		t.Fatalf("reason = %#v", response["reason"])
+	}
+	evidence, _ := response["evidence"].(map[string]any)
+	if evidence["amount_match"] != false {
+		t.Fatalf("evidence.amount_match = %#v", evidence["amount_match"])
+	}
+}
+
+func TestHandlePaymentReplaySimulateRejectsReferenceReuseEvenWithFreshSession(t *testing.T) {
+	oldConfig := config
+	config = appConfig{EnableRedteamAPIs: true}
+	t.Cleanup(func() { config = oldConfig })
+	req := httptest.NewRequest(http.MethodPost, "/api/redteam/payment-replay-simulate", strings.NewReader(`{
+		"mode":"defensive_simulation",
+		"current_account_id":"acct-current",
+		"current_checkout_session_id":"cs-fresh",
+		"current_request_nonce":"nonce-fresh",
+		"current_amount":"20.00",
+		"current_currency":"IDR",
+		"previous_account_id":"acct-current",
+		"previous_checkout_session_id":"cs-old",
+		"previous_payment_reference_id":"pay-ref-123",
+		"previous_transaction_id":"tx-123",
+		"previous_request_nonce":"nonce-old",
+		"previous_amount":"20.00",
+		"previous_currency":"IDR"
+	}`))
+	req.RemoteAddr = "127.0.0.1:12345"
+	rec := httptest.NewRecorder()
+
+	handlePaymentReplaySimulate(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200, body=%s", rec.Code, rec.Body.String())
+	}
+	var response map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if response["reason"] != "payment_reference_reuse_detected" {
+		t.Fatalf("reason = %#v", response["reason"])
+	}
+	evidence, _ := response["evidence"].(map[string]any)
+	if evidence["checkout_session_reused"] != false || evidence["request_nonce_reused"] != false {
+		t.Fatalf("evidence = %#v", evidence)
+	}
+}
+
+func TestHandlePaymentReplaySimulateRejectsRequestNonceReuse(t *testing.T) {
+	oldConfig := config
+	config = appConfig{EnableRedteamAPIs: true}
+	t.Cleanup(func() { config = oldConfig })
+	req := httptest.NewRequest(http.MethodPost, "/api/redteam/payment-replay-simulate", strings.NewReader(`{
+		"mode":"defensive_simulation",
+		"current_account_id":"acct-current",
+		"current_checkout_session_id":"cs-fresh",
+		"current_request_nonce":"nonce-old",
+		"current_amount":"20.00",
+		"current_currency":"IDR",
+		"previous_account_id":"acct-current",
+		"previous_checkout_session_id":"cs-old",
+		"previous_payment_reference_id":"pay-ref-123",
+		"previous_transaction_id":"tx-123",
+		"previous_request_nonce":"nonce-old",
+		"previous_amount":"20.00",
+		"previous_currency":"IDR"
+	}`))
+	req.RemoteAddr = "127.0.0.1:12345"
+	rec := httptest.NewRecorder()
+
+	handlePaymentReplaySimulate(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200, body=%s", rec.Code, rec.Body.String())
+	}
+	var response map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if response["reason"] != "request_nonce_reuse_detected" {
+		t.Fatalf("reason = %#v", response["reason"])
+	}
+}
+
+func TestHandlePaymentReplaySimulateRequiresDefensiveMode(t *testing.T) {
+	oldConfig := config
+	config = appConfig{EnableRedteamAPIs: true}
+	t.Cleanup(func() { config = oldConfig })
+	req := httptest.NewRequest(http.MethodPost, "/api/redteam/payment-replay-simulate", strings.NewReader(`{
+		"current_account_id":"acct-current",
+		"current_checkout_session_id":"cs-fresh",
+		"current_amount":"20.00",
+		"current_currency":"IDR",
+		"previous_account_id":"acct-current",
+		"previous_payment_reference_id":"pay-ref-123",
+		"previous_transaction_id":"tx-123",
+		"previous_amount":"20.00",
+		"previous_currency":"IDR"
+	}`))
+	req.RemoteAddr = "127.0.0.1:12345"
+	rec := httptest.NewRecorder()
+
+	handlePaymentReplaySimulate(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400, body=%s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "mode must be defensive_simulation") {
+		t.Fatalf("body = %s", rec.Body.String())
+	}
+}
+
+func TestFindLatestPaymentReplaySummaryFromLogsPrefersNewestSuccess(t *testing.T) {
+	logDir := t.TempDir()
+	olderPath := filepath.Join(logDir, "older.log")
+	newerPath := filepath.Join(logDir, "newer.log")
+
+	olderLine := `{"operation_time":"2026-05-08T10:00:00+08:00","operation_result":"success","account_email":"older@example.com","metadata":{"correlation_identifiers":{"account_id":"acct-old","checkout_session_id":"cs-old"},"payment_voucher":{"payment_reference_id":"pay-old","transaction_id":"tx-old","transaction_status":"settlement","gross_amount":"10.00","currency":"USD"}}}`
+	newerLine := `{"operation_time":"2026-05-08T11:00:00+08:00","operation_result":"success","account_email":"newer@example.com","metadata":{"correlation_identifiers":{"account_id":"acct-new","checkout_session_id":"cs-new"},"payment_voucher":{"payment_reference_id":"pay-new","transaction_id":"tx-new","transaction_status":"settlement","gross_amount":"20.00","currency":"IDR"}}}`
+
+	if err := os.WriteFile(olderPath, []byte(olderLine+"\n"), 0o644); err != nil {
+		t.Fatalf("write older log: %v", err)
+	}
+	if err := os.WriteFile(newerPath, []byte(newerLine+"\n"), 0o644); err != nil {
+		t.Fatalf("write newer log: %v", err)
+	}
+	if err := os.Chtimes(olderPath, time.Date(2026, 5, 8, 10, 0, 0, 0, time.Local), time.Date(2026, 5, 8, 10, 0, 0, 0, time.Local)); err != nil {
+		t.Fatalf("chtimes older: %v", err)
+	}
+	if err := os.Chtimes(newerPath, time.Date(2026, 5, 8, 11, 0, 0, 0, time.Local), time.Date(2026, 5, 8, 11, 0, 0, 0, time.Local)); err != nil {
+		t.Fatalf("chtimes newer: %v", err)
+	}
+
+	summary, err := findLatestPaymentReplaySummaryFromLogs(logDir)
+	if err != nil {
+		t.Fatalf("findLatestPaymentReplaySummaryFromLogs returned error: %v", err)
+	}
+	if summary["previous_account_id"] != "acct-new" {
+		t.Fatalf("previous_account_id = %#v", summary["previous_account_id"])
+	}
+	if summary["previous_checkout_session_id"] != "cs-new" {
+		t.Fatalf("previous_checkout_session_id = %#v", summary["previous_checkout_session_id"])
+	}
+	if summary["previous_payment_reference_id"] != "pay-new" || summary["previous_transaction_id"] != "tx-new" {
+		t.Fatalf("payment ids = %#v", summary)
+	}
+	if summary["previous_amount"] != "20.00" || summary["previous_currency"] != "IDR" {
+		t.Fatalf("amount/currency = %#v", summary)
+	}
+	if summary["source_file"] != "newer.log" {
+		t.Fatalf("source_file = %#v", summary["source_file"])
+	}
+	if _, ok := summary["previous_payment_artifact_fingerprint"].(map[string]any); !ok {
+		t.Fatalf("previous_payment_artifact_fingerprint type = %T", summary["previous_payment_artifact_fingerprint"])
+	}
+}
+
+func TestBuildAuditLogRecordIncludesPaymentReplaySimulationFields(t *testing.T) {
+	req := httptest.NewRequest(http.MethodPost, "/api/redteam/payment-replay-simulate", strings.NewReader(`{
+		"mode":"defensive_simulation",
+		"current_account_id":"acct-current",
+		"current_checkout_session_id":"cs-fresh",
+		"current_request_nonce":"nonce-fresh",
+		"current_amount":"20.00",
+		"current_currency":"IDR",
+		"previous_account_id":"acct-current",
+		"previous_checkout_session_id":"cs-old",
+		"previous_payment_reference_id":"pay-ref-123",
+		"previous_transaction_id":"tx-123",
+		"previous_request_nonce":"nonce-old",
+		"previous_amount":"20.00",
+		"previous_currency":"IDR"
+	}`))
+	responseBody := []byte(`{
+		"ok": false,
+		"stage": "payment_replay_rejected",
+		"decision": "rejected",
+		"reason": "payment_reference_reuse_detected"
+	}`)
+
+	record := buildAuditLogRecord(req, []byte(`{"mode":"defensive_simulation","current_account_id":"acct-current","current_checkout_session_id":"cs-fresh","current_request_nonce":"nonce-fresh","current_amount":"20.00","current_currency":"IDR","previous_account_id":"acct-current","previous_checkout_session_id":"cs-old","previous_payment_reference_id":"pay-ref-123","previous_transaction_id":"tx-123","previous_request_nonce":"nonce-old","previous_amount":"20.00","previous_currency":"IDR"}`), responseBody, http.StatusOK, time.Now())
+
+	if record.OperationName != "支付信息复用模拟" {
+		t.Fatalf("OperationName = %q", record.OperationName)
+	}
+	if record.Metadata["flow_stage"] != "payment_replay_simulation" {
+		t.Fatalf("flow_stage = %#v", record.Metadata["flow_stage"])
+	}
+	summary, _ := record.Metadata["response_summary"].(map[string]any)
+	if summary["reason"] != "payment_reference_reuse_detected" {
+		t.Fatalf("response_summary = %#v", summary)
+	}
+	if strings.Contains(stringifyJSONValue(record.Metadata["request_payload"]), "nonce-fresh") || strings.Contains(stringifyJSONValue(record.Metadata["request_payload"]), "nonce-old") {
+		t.Fatalf("request_payload leaked raw nonce: %#v", record.Metadata["request_payload"])
+	}
+}
+
+func TestTruncateMonitorEventsLimitsLength(t *testing.T) {
+	events := make([]monitorEvent, 0, 5)
+	for i := 0; i < 5; i++ {
+		events = append(events, monitorEvent{Method: fmt.Sprintf("m-%d", i)})
+	}
+	truncated := truncateMonitorEvents(events, 3)
+	if len(truncated) != 3 {
+		t.Fatalf("len(truncated) = %d, want 3", len(truncated))
+	}
+	if truncated[0].Method != "m-0" || truncated[2].Method != "m-2" {
+		t.Fatalf("truncated = %#v", truncated)
+	}
+}
+
+func TestRedteamAPIsEnabledReadsConfigFlag(t *testing.T) {
+	oldConfig := config
+	config = appConfig{EnableRedteamAPIs: true}
+	t.Cleanup(func() { config = oldConfig; _ = os.Unsetenv("ENABLE_REDTEAM_APIS") })
+	_ = os.Unsetenv("ENABLE_REDTEAM_APIS")
+	if !redteamAPIsEnabled() {
+		t.Fatal("redteamAPIsEnabled = false, want true")
+	}
+}
+
+func TestIsLoopbackRequestAcceptsLocalhost(t *testing.T) {
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.RemoteAddr = "127.0.0.1:9000"
+	if !isLoopbackRequest(req) {
+		t.Fatal("isLoopbackRequest = false, want true")
+	}
+}
+
+func TestIsLoopbackRequestRejectsRemoteIP(t *testing.T) {
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.RemoteAddr = "8.8.8.8:53"
+	if isLoopbackRequest(req) {
+		t.Fatal("isLoopbackRequest = true, want false")
+	}
+}
+
+func TestPaymentReplayPanelExposesLoadAndSimulateActions(t *testing.T) {
+	html, err := os.ReadFile(filepath.Join("web", "index.html"))
+	if err != nil {
+		t.Fatalf("read index.html: %v", err)
+	}
+	page := string(html)
+
+	for _, want := range []string{
+		"支付信息复用模拟",
+		`id="paymentReplayForm"`,
+		`id="paymentReplayLoadBtn"`,
+		`id="paymentReplaySimulateBtn"`,
+		`id="paymentReplayOutput"`,
+	} {
+		if !strings.Contains(page, want) {
+			t.Fatalf("index.html missing %q", want)
+		}
+	}
+}
+
+func TestGoPayPanelLivesInToolsColumnBelowBrowserUse(t *testing.T) {
+	html, err := os.ReadFile(filepath.Join("web", "index.html"))
+	if err != nil {
+		t.Fatalf("read index.html: %v", err)
+	}
+	page := string(html)
+
+	toolsIdx := strings.Index(page, `<div class="tools-column">`)
+	browserIdx := strings.Index(page, `id="browserUsePanel"`)
+	gopayIdx := strings.LastIndex(page, `id="gopayPanel"`)
+	leftIdx := strings.Index(page, `<div class="left-column">`)
+	if toolsIdx < 0 || browserIdx < 0 || gopayIdx < 0 || leftIdx < 0 {
+		t.Fatalf("missing expected layout anchors: tools=%d browser=%d gopay=%d left=%d", toolsIdx, browserIdx, gopayIdx, leftIdx)
+	}
+	if gopayIdx < toolsIdx {
+		t.Fatalf("gopay panel is not inside tools column: tools=%d gopay=%d", toolsIdx, gopayIdx)
+	}
+	if gopayIdx < browserIdx {
+		t.Fatalf("gopay panel should appear below browser-use panel: browser=%d gopay=%d", browserIdx, gopayIdx)
+	}
+	if leftIdx > gopayIdx {
+		t.Fatalf("unexpected left column order: left=%d gopay=%d", leftIdx, gopayIdx)
+	}
+}
+
+func TestPaymentReplayPanelScriptCallsSummaryAndSimulationAPIs(t *testing.T) {
+	source, err := os.ReadFile("web/app.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	script := string(source)
+
+	for _, want := range []string{
+		"/api/redteam/payment-replay-last",
+		"/api/redteam/payment-replay-simulate",
+		"paymentReplayLoadBtn",
+		"paymentReplaySimulateBtn",
+		"generateLocalReplayNonce",
+		"generateLocalCheckoutSessionID",
+	} {
+		if !strings.Contains(script, want) {
+			t.Fatalf("web/app.js missing %q", want)
+		}
 	}
 }
 
@@ -691,6 +1321,142 @@ func TestMidtransRedirectionAccountIDFromBaseURL(t *testing.T) {
 	}
 }
 
+func TestSelectGopayCDPObservationTargetsPrefersActionableHostsBeforeStripe(t *testing.T) {
+	targets := []cdpTarget{
+		{ID: "stripe-iframe", Type: "iframe", URL: "https://m.stripe.network/inner.html#foo"},
+		{ID: "midtrans-page", Type: "page", URL: "https://app.midtrans.com/snap/v4/redirection/acct-123#/gopay-tokenization/linking"},
+		{ID: "gopay-pin", Type: "page", URL: "https://pin-web-client.gopayapi.com/v2/pin"},
+		{ID: "gopay-merchant", Type: "iframe", URL: "https://merchants-gws-app.gopayapi.com/linking/otp"},
+	}
+
+	candidates := selectGopayCDPObservationTargets(targets)
+
+	if len(candidates) < 3 {
+		t.Fatalf("candidate length = %d, want >= 3", len(candidates))
+	}
+	if candidates[0].ID != "gopay-pin" {
+		t.Fatalf("first candidate = %q, want gopay-pin", candidates[0].ID)
+	}
+	if candidates[1].ID != "gopay-merchant" {
+		t.Fatalf("second candidate = %q, want gopay-merchant", candidates[1].ID)
+	}
+	if candidates[2].ID != "midtrans-page" {
+		t.Fatalf("third candidate = %q, want midtrans-page", candidates[2].ID)
+	}
+}
+
+func TestSelectGopayCDPObservationTargetsSkipsStripeWhenNoGoPayHostsPresent(t *testing.T) {
+	targets := []cdpTarget{
+		{ID: "chatgpt-page", Type: "page", URL: "https://chatgpt.com/checkout/openai_llc/cs_live_test"},
+		{ID: "stripe-iframe", Type: "iframe", URL: "https://m.stripe.network/inner.html#foo"},
+	}
+
+	candidates := selectGopayCDPObservationTargets(targets)
+
+	if len(candidates) != 0 {
+		t.Fatalf("candidate length = %d, want 0 when only stripe/chatgpt targets exist", len(candidates))
+	}
+}
+
+func TestGopayCDPResultPriorityTreatsStripeObservedPageAsLowestSignal(t *testing.T) {
+	stripeObserved := map[string]any{
+		"page_stage":   "page_observed",
+		"cdp_url_host": "m.stripe.network",
+		"cdp_url_path": "/inner.html",
+	}
+	otpPage := map[string]any{
+		"page_stage":          "otp_entry",
+		"otp_manual_required": true,
+		"cdp_url_host":        "merchants-gws-app.gopayapi.com",
+	}
+
+	if gopayCDPResultPriority(otpPage) <= gopayCDPResultPriority(stripeObserved) {
+		t.Fatalf("otp page priority should be higher than stripe observed page: otp=%d stripe=%d", gopayCDPResultPriority(otpPage), gopayCDPResultPriority(stripeObserved))
+	}
+}
+
+func TestSelectGopayCDPObservationTargetsIncludesFailedCheckoutReturnBeforeStripe(t *testing.T) {
+	targets := []cdpTarget{
+		{ID: "stripe-outer", Type: "iframe", URL: "https://js.stripe.com/v3/m-outer-3437aaddcdf6922d623e172c2d6f9278.html"},
+		{ID: "failed-return", Type: "page", URL: "https://pay.openai.com/c/pay/cs_live_test?redirect_pm_type=gopay&redirect_status=failed&setup_intent=seti_123"},
+	}
+
+	candidates := selectGopayCDPObservationTargets(targets)
+
+	if len(candidates) != 1 {
+		t.Fatalf("candidate length = %d, want 1", len(candidates))
+	}
+	if candidates[0].ID != "failed-return" {
+		t.Fatalf("first candidate = %q, want failed-return", candidates[0].ID)
+	}
+}
+
+func TestGopayCDPResultPriorityPrefersFailedCheckoutReturnOverStripeObserved(t *testing.T) {
+	stripeObserved := map[string]any{
+		"page_stage":   "page_observed",
+		"cdp_url_host": "js.stripe.com",
+		"cdp_url_path": "/v3/m-outer-3437aaddcdf6922d623e172c2d6f9278.html",
+	}
+	failedReturn := map[string]any{
+		"page_stage":   "checkout_failed_return",
+		"cdp_url_host": "pay.openai.com",
+		"cdp_url_path": "/c/pay/cs_live_test",
+	}
+
+	if gopayCDPResultPriority(failedReturn) <= gopayCDPResultPriority(stripeObserved) {
+		t.Fatalf("failed checkout return priority should be higher than stripe observed page: failed=%d stripe=%d", gopayCDPResultPriority(failedReturn), gopayCDPResultPriority(stripeObserved))
+	}
+}
+
+func TestGopayCDPOTPSelectionDoesNotShortCircuitOnFailedCheckoutReturn(t *testing.T) {
+	source, err := os.ReadFile("main.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	script := string(source)
+
+	if !strings.Contains(script, "stage != \"checkout_failed_return\"") {
+		t.Fatal("cdp-otp selection should continue scanning after checkout_failed_return")
+	}
+}
+
+func TestGopayCDPFlowScriptCapturesFailedCheckoutReturnParams(t *testing.T) {
+	source, err := os.ReadFile("main.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	script := string(source)
+
+	for _, want := range []string{
+		"redirect_status",
+		"redirect_pm_type",
+		"setup_intent",
+		"checkout_failed_return",
+	} {
+		if !strings.Contains(script, want) {
+			t.Fatalf("gopay cdp flow script missing %q", want)
+		}
+	}
+}
+
+func TestFrontendWatcherIncludesResolveLatestCheckoutTargetRecovery(t *testing.T) {
+	source, err := os.ReadFile(filepath.Join("web", "app.js"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	script := string(source)
+
+	for _, want := range []string{
+		"async function resolveLatestCheckoutTarget(openedURL)",
+		"resolveLatestCheckoutTarget(latestOpenedCheckoutURL)",
+		"gopay-resolve-target-recovered",
+	} {
+		if !strings.Contains(script, want) {
+			t.Fatalf("frontend recovery logic missing %q", want)
+		}
+	}
+}
+
 func TestMidtransLinkingAccountIDRejectsNonLinkingURL(t *testing.T) {
 	rawURL := "https://app.midtrans.com/snap/v4/redirection/b070d7fb-6d98-4cbd-99df-fa13843415ba#/payment"
 
@@ -759,6 +1525,27 @@ func TestMidtransLinkingFillOutcomeRejectsTechnicalErrorAfterClick(t *testing.T)
 	}
 	if stage != "midtrans_linking_technical_error" {
 		t.Fatalf("stage = %q, want midtrans_linking_technical_error", stage)
+	}
+}
+
+func TestMidtransLinkingFillOutcomeRejectsPhoneNumberErrorAfterClick(t *testing.T) {
+	ok, stage := midtransLinkingFillOutcome(map[string]any{
+		"clicked":          true,
+		"country_code":     "86",
+		"country_verified": true,
+		"found": map[string]any{
+			"country": true,
+			"phone":   true,
+			"button":  true,
+		},
+		"page_text_snippet": "Link GoPay account with OpenAI LLC to complete payment Phone number: +86 Please use another phone number Link and pay",
+	})
+
+	if ok {
+		t.Fatal("ok = true, want false when Midtrans rejects the phone number")
+	}
+	if stage != "midtrans_phone_rejected" {
+		t.Fatalf("stage = %q, want midtrans_phone_rejected", stage)
 	}
 }
 
@@ -851,6 +1638,9 @@ func TestMidtransLinkingFillScriptDetectsBlankShellAndRateLimitCooldown(t *testi
 		"x-envoy-ratelimited",
 		"retry_after_ms",
 		"cooldown_ms",
+		"recoverTechnicalErrorBackLoop('rate_limited')",
+		"rate_limit_back_recovered",
+		"rate_limit_back_recovery_attempts",
 	} {
 		if !strings.Contains(script, want) {
 			t.Fatalf("midtrans linking script missing %q", want)
@@ -871,9 +1661,77 @@ func TestCheckoutSubmitWatcherRespectsMidtransLinkingCooldown(t *testing.T) {
 		"retry_after_ms",
 		"cooldown_ms",
 		"Math.max(retryAfterMs",
+		"已持续点击 Back 退出错误页",
+		"限流冷却",
 	} {
 		if !strings.Contains(script, want) {
 			t.Fatalf("checkout watcher missing cooldown guard %q", want)
+		}
+	}
+}
+
+func TestGopayOTPWatcherShowsFailedCheckoutReturnDetails(t *testing.T) {
+	source, err := os.ReadFile("web/app.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	script := string(source)
+
+	for _, want := range []string{
+		"redirect_status=failed",
+		"setup_intent",
+		"redirect_pm_type",
+		"gopay-checkout-failed-return",
+	} {
+		if !strings.Contains(script, want) {
+			t.Fatalf("gopay otp watcher missing %q", want)
+		}
+	}
+}
+
+func TestGoPayPanelExposesDuplicateOrderDecisionDetails(t *testing.T) {
+	html, err := os.ReadFile(filepath.Join("web", "index.html"))
+	if err != nil {
+		t.Fatalf("read index.html: %v", err)
+	}
+	page := string(html)
+
+	for _, want := range []string{
+		"重复下单判定详情",
+		`id="gopayDecisionDetails"`,
+		`id="gopayDecisionStage"`,
+		`id="gopayDecisionReason"`,
+		`id="gopayDecisionRedirectStatus"`,
+		`id="gopayDecisionSetupIntent"`,
+		`id="gopayDecisionEvidence"`,
+	} {
+		if !strings.Contains(page, want) {
+			t.Fatalf("index.html missing %q", want)
+		}
+	}
+}
+
+func TestGoPayDecisionDetailsScriptHandlesFailedReturnAndRateLimit(t *testing.T) {
+	source, err := os.ReadFile("web/app.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	script := string(source)
+
+	for _, want := range []string{
+		"gopayDecisionDetails",
+		"gopayDecisionStage",
+		"gopayDecisionReason",
+		"gopayDecisionRedirectStatus",
+		"gopayDecisionSetupIntent",
+		"renderGopayDecisionDetails",
+		"if (gopayResult) gopayResult.hidden = false;",
+		"midtrans_linking_rate_limited",
+		"midtrans_phone_rejected",
+		"checkout_failed_return",
+	} {
+		if !strings.Contains(script, want) {
+			t.Fatalf("web/app.js missing %q", want)
 		}
 	}
 }
@@ -1385,6 +2243,25 @@ func TestResolveCheckoutFillTargetPrefersStripeFrameMatchingExpected(t *testing.
 	}
 	if canonicalURL != "https://chatgpt.com/checkout/openai_llc/cs_live_test_123" {
 		t.Fatalf("canonicalURL = %q", canonicalURL)
+	}
+}
+
+func TestResolveCheckoutTargetFallbackUsesMidtransRedirectCandidateWhenCheckoutPageGone(t *testing.T) {
+	expected := "https://pay.openai.com/c/pay/cs_live_test_123#fid=test"
+	targets := []cdpTarget{
+		{ID: "old-1", Type: "page", URL: "https://chatgpt.com/checkout/openai_llc/cs_live_old_111"},
+		{ID: "midtrans-1", Type: "page", URL: "https://app.midtrans.com/snap/v4/redirection/acct-123#/gopay-tokenization/linking"},
+	}
+
+	target, currentURL, err := resolveCheckoutTargetFallback(targets, expected)
+	if err != nil {
+		t.Fatalf("resolveCheckoutTargetFallback returned error: %v", err)
+	}
+	if target.ID != "midtrans-1" {
+		t.Fatalf("target.ID = %q, want midtrans-1", target.ID)
+	}
+	if currentURL != "https://app.midtrans.com/snap/v4/redirection/acct-123#/gopay-tokenization/linking" {
+		t.Fatalf("currentURL = %q", currentURL)
 	}
 }
 

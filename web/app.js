@@ -1031,6 +1031,320 @@ autoFillCheckoutBtn?.addEventListener("click", async () => {
 });
 
 // =================================
+// 本地红黑测试：资格复用模拟
+// =================================
+const eligibilityReplayForm = document.querySelector("#eligibilityReplayForm");
+const eligibilityCurrentAccountId = document.querySelector("#eligibilityCurrentAccountId");
+const eligibilityCurrentSessionId = document.querySelector("#eligibilityCurrentSessionId");
+const eligibilityCurrentTokenFingerprint = document.querySelector("#eligibilityCurrentTokenFingerprint");
+const eligibilityPreviousAccountId = document.querySelector("#eligibilityPreviousAccountId");
+const eligibilityPreviousTrialReference = document.querySelector("#eligibilityPreviousTrialReference");
+const eligibilitySimulateBtn = document.querySelector("#eligibilitySimulateBtn");
+const eligibilityReplayBadge = document.querySelector("#eligibilityReplayBadge");
+const eligibilityReplayResult = document.querySelector("#eligibilityReplayResult");
+const eligibilityDecision = document.querySelector("#eligibilityDecision");
+const eligibilityReason = document.querySelector("#eligibilityReason");
+const eligibilityMode = document.querySelector("#eligibilityMode");
+const eligibilityReplayOutput = document.querySelector("#eligibilityReplayOutput");
+
+(function initEligibilityReplayFormMemory() {
+  var prefix = "eligibility_replay_form_";
+  [
+    { el: eligibilityCurrentAccountId, key: "current_account_id" },
+    { el: eligibilityCurrentSessionId, key: "current_session_id" },
+    { el: eligibilityCurrentTokenFingerprint, key: "current_token_fingerprint" },
+    { el: eligibilityPreviousAccountId, key: "previous_account_id" },
+    { el: eligibilityPreviousTrialReference, key: "previous_trial_reference" },
+  ].forEach(function (field) {
+    if (!field.el) return;
+    var saved = localStorage.getItem(prefix + field.key);
+    if (saved !== null && saved !== undefined) {
+      field.el.value = saved;
+    }
+    var persist = function () {
+      localStorage.setItem(prefix + field.key, field.el.value);
+    };
+    field.el.addEventListener("input", persist);
+    field.el.addEventListener("change", persist);
+  });
+})();
+
+async function sha256Hex(text) {
+  if (!text || !window.crypto || !window.crypto.subtle) {
+    return "";
+  }
+  var encoded = new TextEncoder().encode(text);
+  var digest = await window.crypto.subtle.digest("SHA-256", encoded);
+  return Array.from(new Uint8Array(digest)).map(function (byte) {
+    return byte.toString(16).padStart(2, "0");
+  }).join("");
+}
+
+async function buildEligibilityReplayPayload() {
+  var tokenFingerprint = (eligibilityCurrentTokenFingerprint?.value || "").trim();
+  if (!tokenFingerprint) {
+    var accessToken = extractAccessToken(fields.token?.value || "");
+    tokenFingerprint = await sha256Hex(accessToken);
+    if (eligibilityCurrentTokenFingerprint && tokenFingerprint) {
+      eligibilityCurrentTokenFingerprint.value = tokenFingerprint;
+      localStorage.setItem("eligibility_replay_form_current_token_fingerprint", tokenFingerprint);
+    }
+  }
+  return {
+    mode: "defensive_simulation",
+    current_account_id: (eligibilityCurrentAccountId?.value || "").trim(),
+    current_session_id: (eligibilityCurrentSessionId?.value || "").trim(),
+    current_token_fingerprint: tokenFingerprint,
+    previous_account_id: (eligibilityPreviousAccountId?.value || "").trim(),
+    previous_trial_reference: (eligibilityPreviousTrialReference?.value || "").trim(),
+  };
+}
+
+function renderEligibilityReplayResult(data, requestOK) {
+  if (eligibilityReplayResult) eligibilityReplayResult.hidden = false;
+  if (eligibilityDecision) setText(eligibilityDecision, data?.decision || (requestOK ? "matched_subject" : "request_failed"));
+  if (eligibilityReason) setText(eligibilityReason, data?.reason || data?.error || "-");
+  if (eligibilityMode) setText(eligibilityMode, data?.mode || "defensive_simulation");
+  if (eligibilityReplayOutput) setText(eligibilityReplayOutput, JSON.stringify(data, null, 2));
+  if (eligibilityReplayBadge) {
+    if (data?.decision === "matched_subject") {
+      setText(eligibilityReplayBadge, "同主体");
+      eligibilityReplayBadge.className = "badge";
+    } else if (data?.decision === "rejected") {
+      setText(eligibilityReplayBadge, "已拒绝");
+      eligibilityReplayBadge.className = "badge error";
+    } else {
+      setText(eligibilityReplayBadge, requestOK ? "完成" : "错误");
+      eligibilityReplayBadge.className = requestOK ? "badge neutral" : "badge error";
+    }
+  }
+}
+
+eligibilityReplayForm?.addEventListener("submit", async function (event) {
+  event.preventDefault();
+  if (!eligibilitySimulateBtn) return;
+  eligibilitySimulateBtn.disabled = true;
+  setText(eligibilitySimulateBtn, "模拟中");
+  if (eligibilityReplayBadge) {
+    setText(eligibilityReplayBadge, "运行中");
+    eligibilityReplayBadge.className = "badge";
+  }
+
+  try {
+    var payload = await buildEligibilityReplayPayload();
+    var result = await postJSON("/api/redteam/eligibility-replay-simulate", payload);
+    renderEligibilityReplayResult(result.data, result.response.ok);
+  } catch (error) {
+    renderEligibilityReplayResult({ error: error.message || "模拟失败" }, false);
+  } finally {
+    eligibilitySimulateBtn.disabled = false;
+    setText(eligibilitySimulateBtn, "模拟复用资格");
+  }
+});
+
+// =================================
+// 本地红黑测试：支付信息复用模拟
+// =================================
+const paymentReplayForm = document.querySelector("#paymentReplayForm");
+const paymentReplayLoadBtn = document.querySelector("#paymentReplayLoadBtn");
+const paymentReplaySimulateBtn = document.querySelector("#paymentReplaySimulateBtn");
+const paymentReplayBadge = document.querySelector("#paymentReplayBadge");
+const paymentReplayResult = document.querySelector("#paymentReplayResult");
+const paymentReplayStatus = document.querySelector("#paymentReplayStatus");
+const paymentReplayReason = document.querySelector("#paymentReplayReason");
+const paymentReplaySource = document.querySelector("#paymentReplaySource");
+const paymentReplayOutput = document.querySelector("#paymentReplayOutput");
+const paymentReplayCurrentAccountId = document.querySelector("#paymentReplayCurrentAccountId");
+const paymentReplayCurrentCheckoutSessionId = document.querySelector("#paymentReplayCurrentCheckoutSessionId");
+const paymentReplayCurrentRequestNonce = document.querySelector("#paymentReplayCurrentRequestNonce");
+const paymentReplayCurrentAmount = document.querySelector("#paymentReplayCurrentAmount");
+const paymentReplayCurrentCurrency = document.querySelector("#paymentReplayCurrentCurrency");
+const paymentReplayPreviousAccountId = document.querySelector("#paymentReplayPreviousAccountId");
+const paymentReplayPreviousCheckoutSessionId = document.querySelector("#paymentReplayPreviousCheckoutSessionId");
+const paymentReplayPreviousPaymentReferenceId = document.querySelector("#paymentReplayPreviousPaymentReferenceId");
+const paymentReplayPreviousTransactionId = document.querySelector("#paymentReplayPreviousTransactionId");
+const paymentReplayPreviousRequestNonce = document.querySelector("#paymentReplayPreviousRequestNonce");
+const paymentReplayPreviousAmount = document.querySelector("#paymentReplayPreviousAmount");
+const paymentReplayPreviousCurrency = document.querySelector("#paymentReplayPreviousCurrency");
+
+(function initPaymentReplayFormMemory() {
+  var prefix = "payment_replay_form_";
+  [
+    { el: paymentReplayCurrentAccountId, key: "current_account_id" },
+    { el: paymentReplayCurrentCheckoutSessionId, key: "current_checkout_session_id" },
+    { el: paymentReplayCurrentRequestNonce, key: "current_request_nonce" },
+    { el: paymentReplayCurrentAmount, key: "current_amount" },
+    { el: paymentReplayCurrentCurrency, key: "current_currency" },
+    { el: paymentReplayPreviousAccountId, key: "previous_account_id" },
+    { el: paymentReplayPreviousCheckoutSessionId, key: "previous_checkout_session_id" },
+    { el: paymentReplayPreviousPaymentReferenceId, key: "previous_payment_reference_id" },
+    { el: paymentReplayPreviousTransactionId, key: "previous_transaction_id" },
+    { el: paymentReplayPreviousRequestNonce, key: "previous_request_nonce" },
+    { el: paymentReplayPreviousAmount, key: "previous_amount" },
+    { el: paymentReplayPreviousCurrency, key: "previous_currency" },
+  ].forEach(function (field) {
+    if (!field.el) return;
+    var saved = localStorage.getItem(prefix + field.key);
+    if (saved !== null && saved !== undefined) {
+      field.el.value = saved;
+    }
+    var persist = function () {
+      localStorage.setItem(prefix + field.key, field.el.value);
+    };
+    field.el.addEventListener("input", persist);
+    field.el.addEventListener("change", persist);
+  });
+})();
+
+function generateLocalReplayNonce() {
+  if (window.crypto && typeof window.crypto.randomUUID === "function") {
+    return "nonce-" + window.crypto.randomUUID();
+  }
+  return "nonce-" + Date.now().toString(36) + "-" + Math.random().toString(36).slice(2, 10);
+}
+
+function generateLocalCheckoutSessionID() {
+  if (window.crypto && typeof window.crypto.randomUUID === "function") {
+    return "cs-sim-" + window.crypto.randomUUID().replace(/-/g, "").slice(0, 24);
+  }
+  return "cs-sim-" + Date.now().toString(36) + Math.random().toString(36).slice(2, 10);
+}
+
+function renderPaymentReplayResult(data, requestOK) {
+  if (paymentReplayResult) paymentReplayResult.hidden = false;
+  if (paymentReplayStatus) setText(paymentReplayStatus, data?.decision || data?.stage || (requestOK ? "loaded" : "error"));
+  if (paymentReplayReason) setText(paymentReplayReason, data?.reason || data?.error || "-");
+  if (paymentReplaySource) setText(paymentReplaySource, data?.source_file || data?.source_account_email || "local");
+  if (paymentReplayOutput) setText(paymentReplayOutput, JSON.stringify(data, null, 2));
+  if (paymentReplayBadge) {
+    if (data?.stage === "payment_replay_summary_loaded") {
+      setText(paymentReplayBadge, "已载入");
+      paymentReplayBadge.className = "badge neutral";
+    } else if (data?.decision === "rejected") {
+      setText(paymentReplayBadge, "已拦截");
+      paymentReplayBadge.className = "badge error";
+    } else if (requestOK) {
+      setText(paymentReplayBadge, "完成");
+      paymentReplayBadge.className = "badge";
+    } else {
+      setText(paymentReplayBadge, "错误");
+      paymentReplayBadge.className = "badge error";
+    }
+  }
+}
+
+function applyLoadedSummaryToPaymentReplayForm(data) {
+  if (paymentReplayPreviousAccountId) paymentReplayPreviousAccountId.value = data.previous_account_id || "";
+  if (paymentReplayPreviousCheckoutSessionId) paymentReplayPreviousCheckoutSessionId.value = data.previous_checkout_session_id || "";
+  if (paymentReplayPreviousPaymentReferenceId) paymentReplayPreviousPaymentReferenceId.value = data.previous_payment_reference_id || "";
+  if (paymentReplayPreviousTransactionId) paymentReplayPreviousTransactionId.value = data.previous_transaction_id || "";
+  if (paymentReplayPreviousAmount) paymentReplayPreviousAmount.value = data.previous_amount || "";
+  if (paymentReplayPreviousCurrency) paymentReplayPreviousCurrency.value = data.previous_currency || "";
+
+  if (paymentReplayCurrentAccountId && !paymentReplayCurrentAccountId.value.trim()) {
+    paymentReplayCurrentAccountId.value = data.previous_account_id || "";
+  }
+  if (paymentReplayCurrentAmount && !paymentReplayCurrentAmount.value.trim()) {
+    paymentReplayCurrentAmount.value = data.previous_amount || "";
+  }
+  if (paymentReplayCurrentCurrency && !paymentReplayCurrentCurrency.value.trim()) {
+    paymentReplayCurrentCurrency.value = data.previous_currency || "";
+  }
+  if (paymentReplayCurrentCheckoutSessionId) {
+    paymentReplayCurrentCheckoutSessionId.value = generateLocalCheckoutSessionID();
+  }
+  if (paymentReplayCurrentRequestNonce) {
+    paymentReplayCurrentRequestNonce.value = generateLocalReplayNonce();
+  }
+
+  [
+    paymentReplayCurrentAccountId,
+    paymentReplayCurrentCheckoutSessionId,
+    paymentReplayCurrentRequestNonce,
+    paymentReplayCurrentAmount,
+    paymentReplayCurrentCurrency,
+    paymentReplayPreviousAccountId,
+    paymentReplayPreviousCheckoutSessionId,
+    paymentReplayPreviousPaymentReferenceId,
+    paymentReplayPreviousTransactionId,
+    paymentReplayPreviousAmount,
+    paymentReplayPreviousCurrency,
+  ].forEach(function (field) {
+    if (!field || !field.id) return;
+    localStorage.setItem("payment_replay_form_" + field.id.replace(/^paymentReplay/, "").replace(/[A-Z]/g, function (m) { return "_" + m.toLowerCase(); }).replace(/^_/, ""), field.value);
+  });
+}
+
+async function loadLatestPaymentReplaySummary() {
+  var response = await fetch("/api/redteam/payment-replay-last", {
+    method: "GET",
+    headers: buildRequestHeaders(),
+  });
+  var data = await response.json();
+  return { response: response, data: data };
+}
+
+function buildPaymentReplayPayload() {
+  return {
+    mode: "defensive_simulation",
+    current_account_id: (paymentReplayCurrentAccountId?.value || "").trim(),
+    current_checkout_session_id: (paymentReplayCurrentCheckoutSessionId?.value || "").trim(),
+    current_request_nonce: (paymentReplayCurrentRequestNonce?.value || "").trim(),
+    current_amount: (paymentReplayCurrentAmount?.value || "").trim(),
+    current_currency: (paymentReplayCurrentCurrency?.value || "").trim(),
+    previous_account_id: (paymentReplayPreviousAccountId?.value || "").trim(),
+    previous_checkout_session_id: (paymentReplayPreviousCheckoutSessionId?.value || "").trim(),
+    previous_payment_reference_id: (paymentReplayPreviousPaymentReferenceId?.value || "").trim(),
+    previous_transaction_id: (paymentReplayPreviousTransactionId?.value || "").trim(),
+    previous_request_nonce: (paymentReplayPreviousRequestNonce?.value || "").trim(),
+    previous_amount: (paymentReplayPreviousAmount?.value || "").trim(),
+    previous_currency: (paymentReplayPreviousCurrency?.value || "").trim(),
+  };
+}
+
+paymentReplayLoadBtn?.addEventListener("click", async function () {
+  paymentReplayLoadBtn.disabled = true;
+  setText(paymentReplayLoadBtn, "读取中");
+  if (paymentReplayBadge) {
+    setText(paymentReplayBadge, "扫描日志");
+    paymentReplayBadge.className = "badge";
+  }
+  try {
+    var result = await loadLatestPaymentReplaySummary();
+    if (result.response.ok && result.data.ok) {
+      applyLoadedSummaryToPaymentReplayForm(result.data);
+    }
+    renderPaymentReplayResult(result.data, result.response.ok);
+  } catch (error) {
+    renderPaymentReplayResult({ error: error.message || "读取失败" }, false);
+  } finally {
+    paymentReplayLoadBtn.disabled = false;
+    setText(paymentReplayLoadBtn, "读取上次支付摘要");
+  }
+});
+
+paymentReplayForm?.addEventListener("submit", async function (event) {
+  event.preventDefault();
+  if (!paymentReplaySimulateBtn) return;
+  paymentReplaySimulateBtn.disabled = true;
+  setText(paymentReplaySimulateBtn, "模拟中");
+  if (paymentReplayBadge) {
+    setText(paymentReplayBadge, "运行中");
+    paymentReplayBadge.className = "badge";
+  }
+
+  try {
+    var result = await postJSON("/api/redteam/payment-replay-simulate", buildPaymentReplayPayload());
+    renderPaymentReplayResult(result.data, result.response.ok);
+  } catch (error) {
+    renderPaymentReplayResult({ error: error.message || "模拟失败" }, false);
+  } finally {
+    paymentReplaySimulateBtn.disabled = false;
+    setText(paymentReplaySimulateBtn, "模拟支付重放");
+  }
+});
+
+// =================================
 // GoPay 一键绑定
 // =================================
 const gopayAccountId = document.querySelector("#gopayAccountId");
@@ -1048,6 +1362,14 @@ const gopayLatency = document.querySelector("#gopayLatency");
 const gopayLinkStatus = document.querySelector("#gopayLinkStatus");
 const gopayRefID = document.querySelector("#gopayRefID");
 const gopayOutput = document.querySelector("#gopayOutput");
+const gopayDecisionDetails = document.querySelector("#gopayDecisionDetails");
+const gopayDecisionStage = document.querySelector("#gopayDecisionStage");
+const gopayDecisionReason = document.querySelector("#gopayDecisionReason");
+const gopayDecisionRedirectStatus = document.querySelector("#gopayDecisionRedirectStatus");
+const gopayDecisionPMType = document.querySelector("#gopayDecisionPMType");
+const gopayDecisionSetupIntent = document.querySelector("#gopayDecisionSetupIntent");
+const gopayDecisionCheckoutSession = document.querySelector("#gopayDecisionCheckoutSession");
+const gopayDecisionEvidence = document.querySelector("#gopayDecisionEvidence");
 let gopayPaymentFlowRunning = false;
 let gopayAutoTriggerRunning = false;
 let gopayCheckoutWatcherActive = false;
@@ -1128,6 +1450,118 @@ function resetGopaySteps() {
   if (gopayLinkStatus) setText(gopayLinkStatus, "-");
   if (gopayRefID) setText(gopayRefID, "-");
   if (gopayLatency) setText(gopayLatency, "-");
+  resetGopayDecisionDetails();
+}
+
+function resetGopayDecisionDetails() {
+  if (gopayDecisionDetails) gopayDecisionDetails.hidden = true;
+  [
+    gopayDecisionStage,
+    gopayDecisionReason,
+    gopayDecisionRedirectStatus,
+    gopayDecisionPMType,
+    gopayDecisionSetupIntent,
+    gopayDecisionCheckoutSession,
+    gopayDecisionEvidence,
+  ].forEach(function (node) {
+    if (node) setText(node, "-");
+  });
+}
+
+function extractCheckoutSessionId(rawURL) {
+  var value = (rawURL || "").trim();
+  if (!value) return "";
+  try {
+    var parsed = new URL(value);
+    var parts = parsed.pathname.replace(/^\/+|\/+$/g, "").split("/");
+    var last = parts[parts.length - 1] || "";
+    return /^cs_/i.test(last) ? last : "";
+  } catch (_err) {
+    return "";
+  }
+}
+
+function latestFailureSignature(entries) {
+  if (!Array.isArray(entries)) return "";
+  for (var i = entries.length - 1; i >= 0; i -= 1) {
+    var entry = entries[i] || {};
+    var status = Number(entry.status || 0);
+    if (status >= 400) {
+      var parts = [String(status)];
+      var headersText = JSON.stringify(entry.response_headers || {}).toLowerCase();
+      if (headersText.includes("x-envoy-ratelimited")) parts.push("x-envoy-ratelimited");
+      return parts.join(" / ");
+    }
+  }
+  return "";
+}
+
+function gopayDecisionReasonText(data) {
+  var stage = (data?.stage || data?.result?.page_stage || "").trim();
+  if (stage === "checkout_failed_return") return "支付最终回跳失败";
+  if (stage === "midtrans_linking_rate_limited") return "上游限流或重复提交";
+  if (stage === "midtrans_phone_rejected") return "手机号被上游拒绝";
+  if (stage === "midtrans_linking_technical_error") return "Midtrans technical error";
+  if (data?.reason) return data.reason;
+  if (data?.error) return data.error;
+  return stage || "-";
+}
+
+function gopayDecisionEvidenceText(data) {
+  var stage = (data?.stage || data?.result?.page_stage || "").trim();
+  var result = data?.result || data?.browser_result || {};
+  if (stage === "checkout_failed_return") {
+    var pieces = [];
+    var redirectStatus = (data?.redirect_status || result.redirect_status || "").trim();
+    var pmType = (data?.redirect_pm_type || result.redirect_pm_type || "").trim();
+    var setupIntent = (data?.setup_intent || result.setup_intent || "").trim();
+    if (redirectStatus) pieces.push("redirect_status=" + redirectStatus);
+    if (pmType) pieces.push("pm=" + pmType);
+    if (setupIntent) pieces.push("setup_intent=" + setupIntent);
+    return pieces.join("，") || "已回跳失败页";
+  }
+  if (stage === "midtrans_phone_rejected") {
+    return "页面文案: Please use another phone number";
+  }
+  if (stage === "midtrans_linking_rate_limited") {
+    var signature = latestFailureSignature(result?.network_diagnostics?.entries || data?.network_diagnostics?.entries);
+    return signature ? "上游失败信号: " + signature : "检测到 429 / x-envoy-ratelimited";
+  }
+  if (data?.error) return data.error;
+  return (result?.page_text_snippet || "").slice(0, 140) || "-";
+}
+
+function renderGopayDecisionDetails(data) {
+  var result = data?.result || data?.browser_result || {};
+  var stage = (data?.stage || result.page_stage || "").trim();
+  var redirectStatus = (data?.redirect_status || result.redirect_status || "").trim();
+  var pmType = (data?.redirect_pm_type || result.redirect_pm_type || "").trim();
+  var setupIntent = (data?.setup_intent || result.setup_intent || "").trim();
+  var checkoutSession =
+    (data?.checkout_session_id || "").trim() ||
+    extractCheckoutSessionId(data?.checkout_url || "") ||
+    extractCheckoutSessionId(result?.url || "") ||
+    extractCheckoutSessionId(data?.target_url || "");
+  var shouldShow =
+    stage === "checkout_failed_return" ||
+    stage === "midtrans_linking_rate_limited" ||
+    stage === "midtrans_phone_rejected" ||
+    !!redirectStatus ||
+    (!!data && data.ok === false);
+
+  if (!shouldShow) {
+    resetGopayDecisionDetails();
+    return;
+  }
+  if (gopayResult) gopayResult.hidden = false;
+  if (gopayDecisionDetails) gopayDecisionDetails.hidden = false;
+  if (gopayDecisionStage) setText(gopayDecisionStage, stage || "-");
+  if (gopayDecisionReason) setText(gopayDecisionReason, gopayDecisionReasonText(data));
+  if (gopayDecisionRedirectStatus) setText(gopayDecisionRedirectStatus, redirectStatus || "-");
+  if (gopayDecisionPMType) setText(gopayDecisionPMType, pmType || "-");
+  if (gopayDecisionSetupIntent) setText(gopayDecisionSetupIntent, setupIntent || "-");
+  if (gopayDecisionCheckoutSession) setText(gopayDecisionCheckoutSession, checkoutSession || "-");
+  if (gopayDecisionEvidence) setText(gopayDecisionEvidence, gopayDecisionEvidenceText(data));
 }
 
 function renderGopayStageResults(stages) {
@@ -1279,6 +1713,38 @@ function startGopayOTPAutoCapture() {
             setText(gopayBadge, "等 OTP");
             gopayBadge.className = "badge neutral";
           }
+        }
+        if (pageStage === "checkout_failed_return") {
+          var failedRedirectStatus = (data.redirect_status || result.redirect_status || "failed").trim();
+          var failedPMType = (data.redirect_pm_type || result.redirect_pm_type || "gopay").trim();
+          var failedSetupIntent = (data.setup_intent || result.setup_intent || "").trim();
+          var failedDetail = "支付流程已回跳到订阅页，redirect_status=failed";
+          if (failedRedirectStatus && failedRedirectStatus !== "failed") {
+            failedDetail = "支付流程已回跳到订阅页，redirect_status=" + failedRedirectStatus;
+          }
+          if (failedPMType) failedDetail += "，pm=" + failedPMType;
+          if (failedSetupIntent) failedDetail += "，setup_intent=" + failedSetupIntent;
+          failedDetail += "；正在重新锁定最新支付页面";
+          setGopayStep("success", "warning", failedDetail);
+          appendCheckoutWatcherEvent("gopay-checkout-failed-return", failedDetail);
+          if (gopayBadge) {
+            setText(gopayBadge, "回跳恢复中");
+            gopayBadge.className = "badge neutral";
+          }
+          if (gopayResult) gopayResult.hidden = false;
+          if (gopayLinkStatus) setText(gopayLinkStatus, "⚠ redirect_status=" + failedRedirectStatus + "，正在重新锁定页面");
+          if (gopayRefID) setText(gopayRefID, failedSetupIntent ? failedSetupIntent.slice(0, 36) : (failedPMType || "-"));
+          if (gopayOutput) setText(gopayOutput, JSON.stringify(data, null, 2));
+          renderGopayDecisionDetails(data);
+          resolveLatestCheckoutTarget(latestOpenedCheckoutURL).then(function (resolved) {
+            var recoveredURL = (resolved?.currentURL || "").trim();
+            if (!recoveredURL) {
+              return;
+            }
+            appendCheckoutWatcherEvent("gopay-resolve-target-recovered", recoveredURL);
+          }).catch(function (error) {
+            appendCheckoutWatcherEvent("gopay-resolve-target-error", error.message || "重新锁定页面失败");
+          });
         }
         if (pageStage === "pin_entry_binding" || pageStage === "pin_entry_payment" || hasPinField) {
           var pinLabel = pinStage === "payment" ? "支付确认 PIN" : "绑定授权 PIN";
@@ -1453,6 +1919,30 @@ async function fillCurrentMidtransLinkingPage(targetURL, checkoutURL) {
   return data;
 }
 
+async function resolveLatestCheckoutTarget(openedURL) {
+  var baseURL = (openedURL || latestOpenedCheckoutURL || latestCheckoutURL || "").trim();
+  if (!baseURL) {
+    return null;
+  }
+  var response = await fetch("/api/checkout/resolve-target", {
+    method: "POST",
+    headers: buildRequestHeaders(),
+    body: JSON.stringify({ opened_url: baseURL }),
+  });
+  var data = await response.json();
+  if (!response.ok) {
+    throw new Error(data.error || "resolve checkout target failed");
+  }
+  var currentURL = (data.current_url || data.target?.url || "").trim();
+  if (currentURL) {
+    latestOpenedCheckoutURL = currentURL;
+  }
+  return {
+    currentURL: currentURL,
+    data: data,
+  };
+}
+
 function startCheckoutSubmitWatcher(autoFillData) {
   var checkoutURL = autoFillData?.current_url || autoFillData?.expected_url || latestOpenedCheckoutURL;
   var checkoutKey = checkoutAutoTriggerKey(checkoutURL);
@@ -1511,13 +2001,9 @@ function startCheckoutSubmitWatcher(autoFillData) {
     attempts += 1;
 
     try {
-      var response = await fetch("/api/checkout/resolve-target", {
-        method: "POST",
-        headers: buildRequestHeaders(),
-        body: JSON.stringify({ opened_url: checkoutURL }),
-      });
-      var data = await response.json();
-      var currentURL = data.current_url || data.target?.url || "";
+      var resolved = await resolveLatestCheckoutTarget(checkoutURL);
+      var data = resolved?.data || {};
+      var currentURL = resolved?.currentURL || "";
       var candidateURLs = Array.isArray(data.candidate_urls) ? data.candidate_urls : [];
       var submittedCandidateURL = candidateURLs.find(function (url) {
         return checkoutURLIndicatesSubmitted(url, checkoutKey);
@@ -1540,7 +2026,7 @@ function startCheckoutSubmitWatcher(autoFillData) {
         appendCheckoutWatcherEvent("checkout-url", linkingURL);
       }
 
-      if (response.ok && (data.ok || submittedCandidateURL || hasMidtransCandidate) && (checkoutURLIndicatesSubmitted(currentURL, checkoutKey) || hasMidtransCandidate)) {
+      if ((response?.ok && (data.ok || submittedCandidateURL || hasMidtransCandidate) && (checkoutURLIndicatesSubmitted(currentURL, checkoutKey) || hasMidtransCandidate)) || ((currentURL || linkingURL) && (checkoutURLIndicatesSubmitted(currentURL, checkoutKey) || hasMidtransCandidate))) {
         appendCheckoutWatcherEvent("checkout-submitted", hasMidtransCandidate ? "检测到 Midtrans GoPay redirection 页面，开始 GoPay 自动触发检查" : "检测到支付页已提交，开始 GoPay 自动触发检查");
         var decision = await checkGopayAutoTriggerReady({
           source: "checkout-submit-watch",
@@ -1579,6 +2065,7 @@ function startCheckoutSubmitWatcher(autoFillData) {
             try {
               var fillResult = await fillCurrentMidtransLinkingPage(linkingURL, checkoutURL);
               if (gopayOutput) setText(gopayOutput, JSON.stringify(fillResult, null, 2));
+              renderGopayDecisionDetails(fillResult);
               if (fillResult.ok) {
                 gopayMidtransRetryNotBefore = 0;
                 gopayMidtransCooldownNoticeKey = "";
@@ -1595,16 +2082,39 @@ function startCheckoutSubmitWatcher(autoFillData) {
                 var retryHint = fillResult.aggressive_retry ? "（保守恢复已开启）" : "";
                 var fillStage = fillResult.stage || fillResult.error || "unknown";
                 var retryAfterMs = Number(fillResult.retry_after_ms || fillResult.cooldown_ms || 0);
+                var rateLimitBackRecovered = !!fillResult.rate_limit_back_recovered;
+                var rateLimitBackAttempts = Number(fillResult.rate_limit_back_recovery_attempts || 0);
                 if (!Number.isFinite(retryAfterMs)) retryAfterMs = 0;
                 if (!retryAfterMs && fillStage === "midtrans_linking_rate_limited") retryAfterMs = 90000;
                 if (!retryAfterMs && (fillStage === "midtrans_linking_blank_shell" || fillStage === "midtrans_linking_loading_stuck")) retryAfterMs = 30000;
+                if (fillStage === "midtrans_linking_rate_limited") {
+                  var rateLimitMessage = "检测到 Midtrans 429 限流";
+                  if (rateLimitBackRecovered) {
+                    rateLimitMessage += "，已持续点击 Back 退出错误页";
+                  } else if (rateLimitBackAttempts > 0) {
+                    rateLimitMessage += "，已尝试点击 Back 恢复 " + rateLimitBackAttempts + " 次";
+                  }
+                  if (retryAfterMs > 0) {
+                    rateLimitMessage += "，冷却约 " + Math.ceil(retryAfterMs / 1000) + " 秒后再尝试";
+                  }
+                  setGopayStep("linking", "warning", rateLimitMessage);
+                } else if (fillStage === "midtrans_phone_rejected") {
+                  setGopayStep("linking", "error", "上游已拒绝当前手机号，请更换号码后重试");
+                  appendCheckoutWatcherEvent("midtrans-phone-rejected", "Midtrans/GoPay 返回手机号不可用，请更换号码");
+                } else if (fillStage === "midtrans_linking_technical_error") {
+                  setGopayStep("linking", "warning", "technical error 页面恢复中，持续点击 Back，进入下一状态即停止");
+                }
                 if (retryAfterMs > 0) {
                   retryAfterMs = Math.min(Math.max(retryAfterMs, 5000), 120000);
                   gopayMidtransRetryNotBefore = Date.now() + retryAfterMs;
                   gopayMidtransCooldownNoticeKey = "";
-                  appendCheckoutWatcherEvent("midtrans-linking-cooldown", "页面处于 " + fillStage + "，冷却 " + Math.ceil(retryAfterMs / 1000) + " 秒后再尝试");
+                  var cooldownSummary = "页面处于 " + fillStage + "，冷却 " + Math.ceil(retryAfterMs / 1000) + " 秒后再尝试";
+                  if (fillStage === "midtrans_linking_rate_limited" && rateLimitBackRecovered) {
+                    cooldownSummary += "；错误页已通过 Back 恢复退出";
+                  }
+                  appendCheckoutWatcherEvent("midtrans-linking-cooldown", cooldownSummary);
                   if (monitorBadge) {
-                    monitorBadge.textContent = fillStage === "midtrans_linking_rate_limited" ? "已限流" : "加载中";
+                    monitorBadge.textContent = fillStage === "midtrans_linking_rate_limited" ? "限流冷却" : "加载中";
                     monitorBadge.className = "badge neutral";
                   }
                 }
@@ -1729,6 +2239,7 @@ async function runGopayFullLinkPayment(options) {
     }
     if (gopayRefID) setText(gopayRefID, (data.reference_id || data.account_id || "-").slice(0, 36));
     if (gopayOutput) setText(gopayOutput, JSON.stringify(data, null, 2));
+    renderGopayDecisionDetails(data);
 
     if (data.stages) {
       renderGopayStageResults(data.stages);
@@ -1801,6 +2312,7 @@ async function runGopayFullLinkPayment(options) {
     if (gopayLatency) setText(gopayLatency, elapsed + "ms");
     if (gopayLinkStatus) setText(gopayLinkStatus, "❌ 网络错误");
     if (gopayOutput) setText(gopayOutput, JSON.stringify({ error: err.message }));
+    renderGopayDecisionDetails({ ok: false, stage: "network_error", error: err.message });
     if (gopayBadge) { setText(gopayBadge, "错误"); gopayBadge.className = "badge error"; }
     setGopayStep("linking", "error", "网络错误: " + err.message);
     return null;

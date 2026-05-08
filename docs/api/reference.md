@@ -203,6 +203,201 @@
 - `503`：CDP 未就绪或未找到目标页，响应包含 `code: cdp_not_ready` 或诊断信息。
 - `500`：CDP 执行过程异常。
 
+### `POST /api/redteam/eligibility-replay-simulate`
+
+本地红黑测试接口。只做“资格是否绑定账号 / 会话 / token 指纹”的防御模拟，不调用 OpenAI、Midtrans 或 GoPay，也不会生成真实 checkout 或试用会话。
+
+访问限制：
+
+- 接口默认关闭。
+- 只有在 `ENABLE_REDTEAM_APIS=true` 或配置中 `enable_redteam_apis=true` 时才允许访问。
+- 请求必须来自 loopback 地址，否则返回 `403`。
+
+请求体：
+
+```json
+{
+  "mode": "defensive_simulation",
+  "current_account_id": "acct-current",
+  "current_session_id": "sess-current",
+  "current_token_fingerprint": "sha256-of-current-token",
+  "previous_account_id": "acct-previous",
+  "previous_trial_reference": "trial-ref-xxxx"
+}
+```
+
+校验：
+
+- `mode` 必须是 `defensive_simulation`
+- `current_account_id`
+- `current_session_id`
+- `current_token_fingerprint`
+- `previous_account_id`
+- `previous_trial_reference`
+
+成功响应分两类：
+
+1. 同主体上下文通过本地校验：
+
+```json
+{
+  "ok": true,
+  "stage": "eligibility_context_verified",
+  "decision": "matched_subject",
+  "reason": "same_account_context"
+}
+```
+
+2. 跨账号资格复用被拒绝：
+
+```json
+{
+  "ok": false,
+  "stage": "eligibility_replay_rejected",
+  "decision": "rejected",
+  "reason": "eligibility_bound_to_account_session",
+  "controls": [
+    "local_simulation_only",
+    "account_binding",
+    "session_binding",
+    "token_fingerprint_binding"
+  ],
+  "evidence": {
+    "account_match": false,
+    "session_present": true,
+    "token_fingerprint_present": true,
+    "previous_trial_reference_present": true,
+    "cross_account_replay": true
+  }
+}
+```
+
+响应中的 `current_session_id_summary`、`current_token_fingerprint_summary`、`previous_trial_reference_summary` 只返回长度、尾号和 SHA-256 摘要，不返回原文。
+
+失败响应：
+
+- `400`：请求体非法、字段缺失，或 `mode` 不是 `defensive_simulation`。
+- `403`：redteam 接口未启用，或请求不是本机 loopback 访问。
+
+### `GET /api/redteam/payment-replay-last`
+
+从本地 `log/` 审计日志里提取最近一次成功支付的安全摘要。只返回调试所需的支付摘要和派生指纹，不调用真实支付系统。
+
+访问限制与 `POST /api/redteam/eligibility-replay-simulate` 相同：默认关闭，需显式启用，且只允许 loopback 请求。
+
+成功响应示例：
+
+```json
+{
+  "ok": true,
+  "stage": "payment_replay_summary_loaded",
+  "source_file": "user@example.com_20260508110000.log",
+  "source_operation_time": "2026-05-08T11:00:00+08:00",
+  "source_account_email": "user@example.com",
+  "previous_account_id": "acct-123",
+  "previous_checkout_session_id": "cs_live_123",
+  "previous_payment_reference_id": "pay-ref-123",
+  "previous_transaction_id": "tx-123",
+  "previous_transaction_status": "settlement",
+  "previous_amount": "20.00",
+  "previous_currency": "IDR",
+  "previous_payment_artifact_fingerprint": {
+    "present": true,
+    "length": 68,
+    "sha256": "..."
+  }
+}
+```
+
+失败响应：
+
+- `404`：`log/` 中未找到最近一次成功支付摘要。
+- `403`：redteam 接口未启用，或请求不是本机 loopback 访问。
+- `500`：本地日志读取或解析失败。
+
+### `POST /api/redteam/payment-replay-simulate`
+
+本地红黑测试接口。用于模拟“把上一次成功支付的摘要信息重放到当前请求里”，验证服务端是否具备账号绑定、金额校验、币种校验、nonce 新鲜度和支付引用唯一性等防护。
+
+访问限制与 `POST /api/redteam/eligibility-replay-simulate` 相同：默认关闭，需显式启用，且只允许 loopback 请求。
+
+请求体：
+
+```json
+{
+  "mode": "defensive_simulation",
+  "current_account_id": "acct-current",
+  "current_checkout_session_id": "cs-sim-fresh",
+  "current_request_nonce": "nonce-fresh",
+  "current_amount": "20.00",
+  "current_currency": "IDR",
+  "previous_account_id": "acct-previous",
+  "previous_checkout_session_id": "cs-old",
+  "previous_payment_reference_id": "pay-ref-123",
+  "previous_transaction_id": "tx-123",
+  "previous_request_nonce": "nonce-old",
+  "previous_amount": "20.00",
+  "previous_currency": "IDR"
+}
+```
+
+校验：
+
+- `mode` 必须是 `defensive_simulation`
+- `current_account_id`
+- `current_checkout_session_id`
+- `current_amount`
+- `current_currency`
+- `previous_account_id`
+- `previous_payment_reference_id`
+- `previous_transaction_id`
+- `previous_amount`
+- `previous_currency`
+
+成功响应示例：
+
+```json
+{
+  "ok": false,
+  "stage": "payment_replay_rejected",
+  "decision": "rejected",
+  "reason": "payment_reference_reuse_detected",
+  "controls": [
+    "local_simulation_only",
+    "account_binding",
+    "checkout_session_freshness",
+    "request_nonce_freshness",
+    "amount_integrity",
+    "currency_integrity",
+    "payment_reference_uniqueness",
+    "transaction_uniqueness"
+  ],
+  "evidence": {
+    "account_match": true,
+    "amount_match": true,
+    "currency_match": true,
+    "checkout_session_reused": false,
+    "request_nonce_reused": false,
+    "payment_reference_present": true,
+    "transaction_present": true
+  }
+}
+```
+
+接口会额外返回：
+
+- `current_request_nonce_summary`
+- `previous_request_nonce_summary`
+- `current_payment_artifact_fingerprint`
+- `previous_payment_artifact_fingerprint`
+
+这些字段只返回摘要和 SHA-256，不返回可直接复用的完整敏感值。
+
+失败响应：
+
+- `400`：请求体非法、字段缺失，或 `mode` 不是 `defensive_simulation`。
+- `403`：redteam 接口未启用，或请求不是本机 loopback 访问。
+
 ### `POST /api/checkout/resolve-target`
 
 根据最近打开的 checkout URL，在 Chrome CDP 目标列表中解析当前实际支付页。
@@ -460,12 +655,14 @@
 
 ```json
 {
-  "duration_s": 30,
+  "duration_s": 12,
   "stream": false
 }
 ```
 
-`duration_s` 小于等于 0 或大于 120 时重置为 30。
+`duration_s` 小于等于 0 或大于 30 时重置为 12。
+
+非流式响应中的 `events` 最多返回 120 条，避免响应体过大。
 
 非流式成功响应：
 
@@ -486,7 +683,7 @@
     "stripe_api_calls": 1,
     "snap_api_calls": 0,
     "gopay_api_calls": 0,
-    "duration_s": 30
+    "duration_s": 12
   }
 }
 ```
@@ -501,12 +698,22 @@
 
 ```json
 {
-  "duration_s": 12,
+  "duration_s": 8,
   "url_filters": ["pricing", "checkout", "trial"]
 }
 ```
 
+`duration_s` 小于等于 0 或大于 60 时重置为 8。
+
 默认过滤词：`pricing`、`subscription`、`checkout`、`payments`、`stripe`、`offer`、`promo`、`trial`、`eligible`、`eligibility`、`experiment`、`feature`、`plan`。
+
+响应裁剪规则：
+
+- `resources` 最多 80 条
+- `promo_hints` 最多 20 条
+- `body_text` 最多 2000 个字符
+- `localStorage` / `sessionStorage` 最多各 30 个键
+- 单个 storage 值最多 160 个字符
 
 成功响应：
 
@@ -514,7 +721,7 @@
 {
   "ok": true,
   "summary": {
-    "duration_s": 12,
+    "duration_s": 8,
     "resource_count": 0,
     "card_count": 0,
     "promo_hint_count": 0,
