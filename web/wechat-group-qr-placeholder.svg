@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="360" height="520" viewBox="0 0 360 520" fill="none">
+  <rect width="360" height="520" rx="24" fill="white"/>
+  <rect x="118" y="44" width="124" height="124" rx="18" fill="#F3F4F6" stroke="#D1D5DB"/>
+  <text x="180" y="208" text-anchor="middle" font-family="Segoe UI, Arial, sans-serif" font-size="28" font-weight="700" fill="#111827">微信群二维码</text>
+  <text x="180" y="244" text-anchor="middle" font-family="Segoe UI, Arial, sans-serif" font-size="18" fill="#6B7280">请替换为你的群二维码图片</text>
+  <rect x="40" y="284" width="280" height="180" rx="20" fill="#F9FAFB" stroke="#D1D5DB" stroke-dasharray="10 10"/>
+  <text x="180" y="378" text-anchor="middle" font-family="Segoe UI, Arial, sans-serif" font-size="22" font-weight="600" fill="#9CA3AF">wechat-group-qr.png</text>
+</svg>

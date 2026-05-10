@@ -1,0 +1,400 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="description" content="Checkout Workbench 工作原理">
+    <title>工作原理 - Checkout Workbench</title>
+    <style>
+      :root {
+        --bg: #f6f7f8;
+        --panel: #ffffff;
+        --ink: #15201c;
+        --muted: #65716d;
+        --line: #dce4e1;
+        --soft: #eef7f4;
+        --accent: #08745f;
+        --accent-dark: #075c4c;
+        --warn: #8a5a00;
+        --warn-bg: #fff7e6;
+      }
+
+      * { box-sizing: border-box; }
+
+      body {
+        margin: 0;
+        background: var(--bg);
+        color: var(--ink);
+        font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      }
+
+      .page {
+        width: min(1080px, calc(100% - 32px));
+        margin: 0 auto;
+        padding: 28px 0 46px;
+      }
+
+      .topbar {
+        display: flex;
+        align-items: flex-start;
+        justify-content: space-between;
+        gap: 18px;
+        margin-bottom: 18px;
+      }
+
+      a {
+        color: var(--accent);
+        font-weight: 700;
+        text-decoration: none;
+      }
+
+      a:hover { text-decoration: underline; }
+
+      h1, h2, h3, p { margin-top: 0; }
+
+      h1 {
+        margin-bottom: 8px;
+        font-size: 30px;
+      }
+
+      h2 {
+        margin-bottom: 12px;
+        font-size: 20px;
+      }
+
+      h3 {
+        margin-bottom: 8px;
+        font-size: 16px;
+      }
+
+      .lead {
+        max-width: 860px;
+        color: var(--muted);
+        line-height: 1.8;
+      }
+
+      .card {
+        border: 1px solid var(--line);
+        border-radius: 10px;
+        background: var(--panel);
+        padding: 18px;
+        margin-top: 14px;
+      }
+
+      .grid {
+        display: grid;
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+        gap: 12px;
+      }
+
+      .grid.two {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+      }
+
+      .mini {
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        background: #fbfcfc;
+        padding: 14px;
+      }
+
+      .mini strong {
+        display: block;
+        margin-bottom: 6px;
+        color: var(--accent-dark);
+      }
+
+      .mini p,
+      .step p,
+      .table-note {
+        margin: 0;
+        color: var(--muted);
+        font-size: 14px;
+        line-height: 1.75;
+      }
+
+      .flow {
+        display: grid;
+        gap: 10px;
+      }
+
+      .step {
+        display: grid;
+        grid-template-columns: 38px minmax(0, 1fr);
+        gap: 12px;
+        align-items: start;
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        background: #fff;
+        padding: 12px;
+      }
+
+      .num {
+        display: grid;
+        width: 34px;
+        height: 34px;
+        place-items: center;
+        border-radius: 999px;
+        background: var(--soft);
+        color: var(--accent-dark);
+        font-weight: 900;
+      }
+
+      table {
+        width: 100%;
+        border-collapse: collapse;
+        overflow: hidden;
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        font-size: 14px;
+      }
+
+      th, td {
+        border-bottom: 1px solid var(--line);
+        padding: 10px 12px;
+        text-align: left;
+        vertical-align: top;
+      }
+
+      th {
+        background: #f1f5f4;
+        color: #26312e;
+        font-weight: 800;
+      }
+
+      tr:last-child td { border-bottom: 0; }
+
+      code {
+        border-radius: 5px;
+        background: #eef2f4;
+        padding: 2px 5px;
+        font-size: 13px;
+      }
+
+      pre {
+        overflow-x: auto;
+        margin: 10px 0 0;
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        background: #101917;
+        color: #e8f2ef;
+        padding: 12px;
+        line-height: 1.55;
+        font-size: 13px;
+      }
+
+      .tag {
+        display: inline-flex;
+        align-items: center;
+        border-radius: 999px;
+        background: var(--soft);
+        color: var(--accent-dark);
+        padding: 3px 8px;
+        font-size: 12px;
+        font-weight: 800;
+      }
+
+      .note {
+        border-color: rgba(8, 116, 95, 0.24);
+        background: var(--soft);
+      }
+
+      @media (max-width: 820px) {
+        .topbar,
+        .grid,
+        .grid.two {
+          grid-template-columns: 1fr;
+          display: grid;
+        }
+
+        .topbar { gap: 10px; }
+
+        table {
+          display: block;
+          overflow-x: auto;
+          white-space: nowrap;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <main class="page">
+      <div class="topbar">
+        <div>
+          <h1>Checkout Workbench 工作原理</h1>
+          <p class="lead">这个本地页面整合了 checkout 链接生成、Chrome CDP 会话提取、支付页目标锁定、GoPay/Midtrans 辅助流程、页面监控和 browser-use Playwright 自动化。前端负责收集输入与展示状态，真实协议编排和浏览器调试操作由本地 Go 后端与 browser-use 服务完成。</p>
+        </div>
+        <a href="/">返回控制台</a>
+      </div>
+
+      <section class="card">
+        <h2>整体结构</h2>
+        <div class="grid">
+          <div class="mini">
+            <strong>浏览器前端</strong>
+            <p>提供三栏工作台，调用本地 Go API 生成 checkout 链接、打开无痕窗口、获取 Session、自动填地址、执行 GoPay 辅助动作，并可调用 browser-use 服务进行网页分析。</p>
+          </div>
+          <div class="mini">
+            <strong>本地 Go 后端</strong>
+            <p>提供 checkout、Chrome CDP、Session、GoPay、Midtrans、监控和审计接口，固定监听 <code>127.0.0.1:18473</code>。</p>
+          </div>
+          <div class="mini">
+            <strong>browser-use 服务</strong>
+            <p>独立 Node/Playwright 服务，默认监听 <code>127.0.0.1:38765</code>，提供 <code>GET /health</code> 与 <code>POST /run</code>。</p>
+          </div>
+        </div>
+      </section>
+
+      <section class="card">
+        <h2>核心流程</h2>
+        <div class="flow">
+          <div class="step">
+            <div class="num">1</div>
+            <div>
+              <h3>获取会话</h3>
+              <p>用户可粘贴 access token、JWT 或整份 <code>/api/auth/session</code> JSON。也可以打开 Chrome 无痕窗口后调用 <code>POST /api/session/fetch</code>，由后端通过 CDP 在 <code>chatgpt.com</code> 页面中读取 Session JSON。</p>
+            </div>
+          </div>
+          <div class="step">
+            <div class="num">2</div>
+            <div>
+              <h3>生成 checkout 链接</h3>
+              <p>前端调用 <code>POST /api/checkout</code> 或兼容入口 <code>POST /api/checkout/start</code>。后端校验请求、转发 checkout 上游、初始化 Stripe 页面，并返回 <code>checkout_url</code>、<code>url</code> 和 <code>checkout_session_id</code>。</p>
+            </div>
+          </div>
+          <div class="step">
+            <div class="num">3</div>
+            <div>
+              <h3>打开并锁定支付页</h3>
+              <p>前端通过 <code>POST /api/incognito/open</code> 打开 checkout 链接，并记录最近打开的 URL。后续 <code>POST /api/checkout/resolve-target</code> 与 <code>POST /api/checkout/auto-fill</code> 都会基于该 URL 校验当前 CDP 目标，避免填错页面。</p>
+            </div>
+          </div>
+          <div class="step">
+            <div class="num">4</div>
+            <div>
+              <h3>GoPay 与 Midtrans 辅助</h3>
+              <p>GoPay 相关能力由 <code>/api/gopay/full-link</code>、<code>/api/gopay/auto-link</code>、<code>/api/gopay/smart-link</code>、<code>/api/gopay/cdp-otp</code>、<code>/api/gopay/midtrans-linking-fill</code> 等当前已注册接口提供。</p>
+            </div>
+          </div>
+          <div class="step">
+            <div class="num">5</div>
+            <div>
+              <h3>页面监控与 browser-use</h3>
+              <p><code>POST /api/gopay/monitor</code> 和 <code>POST /api/pricing/monitor</code> 负责 CDP 监控；browser-use <code>POST /run</code> 负责 Playwright 导航、等待、填表、提交和页面数据提取。</p>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section class="card">
+        <h2>当前本地 Go API</h2>
+        <table>
+          <thead>
+            <tr>
+              <th>接口</th>
+              <th>用途</th>
+              <th>关键输入</th>
+              <th>关键输出</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><code>GET /api/health</code></td>
+              <td>健康检查</td>
+              <td>无</td>
+              <td><code>status</code>、<code>time</code></td>
+            </tr>
+            <tr>
+              <td><code>POST /api/checkout</code><br><code>POST /api/checkout/start</code></td>
+              <td>生成 checkout 长链接</td>
+              <td><code>token</code>、<code>plan_name</code>、<code>billing_details</code>、<code>checkout_ui_mode</code></td>
+              <td><code>checkout_url</code>、<code>url</code>、<code>checkout_session_id</code></td>
+            </tr>
+            <tr>
+              <td><code>POST /api/incognito/open</code></td>
+              <td>打开 Chrome 无痕窗口</td>
+              <td><code>url</code>、<code>new_window</code></td>
+              <td><code>ok</code>、<code>url</code>、<code>new_window</code></td>
+            </tr>
+            <tr>
+              <td><code>POST /api/session/fetch</code></td>
+              <td>通过 CDP 获取 Session JSON</td>
+              <td><code>stream</code></td>
+              <td><code>json</code>、<code>diagnostics</code> 或 NDJSON 事件</td>
+            </tr>
+            <tr>
+              <td><code>POST /api/checkout/resolve-target</code></td>
+              <td>解析当前 checkout CDP 目标</td>
+              <td><code>opened_url</code></td>
+              <td><code>current_url</code>、<code>target</code>、<code>candidate_urls</code></td>
+            </tr>
+            <tr>
+              <td><code>POST /api/checkout/auto-fill</code></td>
+              <td>锁定目标并填入随机美国地址</td>
+              <td><code>expected_url</code></td>
+              <td><code>address</code>、<code>fill_target</code>、<code>filled</code></td>
+            </tr>
+            <tr>
+              <td><code>POST /api/gopay/full-link</code></td>
+              <td>完整 GoPay 链路辅助</td>
+              <td><code>access_token</code>、<code>country_code</code>、<code>phone_number</code>、<code>otp_channel</code>、<code>otp</code>、<code>pin</code></td>
+              <td><code>ok</code>、<code>stage</code>、<code>stages</code>、<code>summary</code>、<code>payment_voucher</code></td>
+            </tr>
+            <tr>
+              <td><code>POST /api/gopay/auto-link</code><br><code>POST /api/gopay/smart-link</code><br><code>POST /api/gopay/force-link</code></td>
+              <td>GoPay linking 创建、复用与自动验证</td>
+              <td><code>account_id</code>、<code>country_code</code>、<code>phone_number</code>、<code>otp_channel</code>、<code>otp</code>、<code>pin</code></td>
+              <td><code>ok</code>、<code>stage</code>、<code>reference_id</code>、<code>summary</code></td>
+            </tr>
+            <tr>
+              <td><code>POST /api/gopay/cdp-otp</code><br><code>POST /api/gopay/midtrans-linking-fill</code><br><code>POST /api/gopay/snap-probe</code></td>
+              <td>浏览器页面内 OTP、手机号和 Midtrans/Snap 探测辅助</td>
+              <td><code>otp</code>、<code>target_url</code>、<code>country_code</code>、<code>phone_number</code></td>
+              <td><code>ok</code>、<code>result</code>、<code>browser_result</code>、<code>probe_steps</code></td>
+            </tr>
+            <tr>
+              <td><code>POST /api/gopay/monitor</code><br><code>POST /api/pricing/monitor</code></td>
+              <td>通过 CDP 采集页面、网络、控制台和资源信息</td>
+              <td><code>duration_s</code>、<code>stream</code>、<code>url_filters</code></td>
+              <td><code>events</code>、<code>summary</code>、<code>snapshot</code> 或 NDJSON 事件</td>
+            </tr>
+            <tr>
+              <td><code>POST /api/gopay/auto-trigger-check</code></td>
+              <td>判断是否满足 GoPay 自动触发条件</td>
+              <td><code>source</code>、<code>checkout_url</code>、<code>page_text</code>、<code>submitted</code></td>
+              <td><code>ready</code>、<code>reason</code>、<code>conditions</code></td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section class="card">
+        <h2>browser-use 服务</h2>
+        <div class="grid two">
+          <div class="mini">
+            <strong><code>GET /health</code></strong>
+            <p>返回 <code>ok</code>、<code>service: browser-use</code> 和当前端口，用于前端判断 Playwright 自动化服务是否可用。</p>
+          </div>
+          <div class="mini">
+            <strong><code>POST /run</code></strong>
+            <p>接收 <code>url</code>、<code>browser</code>、<code>headless</code>、<code>waitFor</code>、<code>formData</code>、<code>fieldHints</code> 等字段，执行导航、等待、表单填写、可选提交和页面数据提取。</p>
+          </div>
+        </div>
+        <pre>{
+  "url": "https://example.com",
+  "task": "browser-use task",
+  "browser": "chromium",
+  "headless": true,
+  "submit": false,
+  "waitFor": { "selector": "form" },
+  "formData": { "email": "test@example.com" }
+}</pre>
+      </section>
+
+      <section class="card note">
+        <h2>文档来源</h2>
+        <p class="table-note">完整、可维护的文档位于 <code>docs/</code>。架构总览见 <code>docs/architecture/overview.md</code>，API 参考见 <code>docs/api/reference.md</code>，开发指南见 <code>docs/development/guide.md</code>，一致性审计见 <code>docs/audit/docs-code-consistency.md</code>。</p>
+      </section>
+    </main>
+  </body>
+</html>

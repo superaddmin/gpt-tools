@@ -1,0 +1,985 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="description" content="OpenAI 支付长链接生成器">
+    <title>Checkout Workbench</title>
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%2308745f'/%3E%3Cpath d='M8 10h16v4H8zM8 18h11v4H8z' fill='white'/%3E%3C/svg%3E">
+    <link rel="stylesheet" href="/styles.css?v=20260509x">
+  </head>
+  <body>
+    <main class="shell">
+      <header class="workbench-header">
+        <div class="workbench-title">
+          <p class="workbench-kicker">本地支付辅助</p>
+          <h1>Checkout Workbench</h1>
+          <p>Popay、打开无痕窗口、获取 Session，并完成 GoPay 辅助操作。</p>
+        </div>
+        <div class="workbench-status">
+          <span class="status-chip">本地服务 <strong id="healthBadge" class="badge">检测中</strong></span>
+          <span class="status-chip muted">布局模式 <strong>三栏工作台</strong></span>
+        </div>
+      </header>
+
+      <nav class="flow-nav" aria-label="推荐流程">
+        <span>推荐流程</span>
+        <ol>
+          <li><a href="#checkoutForm">获取 Session</a></li>
+          <li><a href="#checkoutForm">Popay</a></li>
+          <li><a href="#resultPanel">打开支付页</a></li>
+          <li><a href="#gopayPanel">GoPay 绑定</a></li>
+          <li><a href="#luckmailPanel">LuckMail 接码</a></li>
+          <li><a href="#browserUsePanel">Browser Use 分析</a></li>
+        </ol>
+      </nav>
+
+      <nav class="mobile-anchor-nav" aria-label="页面快捷导航">
+        <a href="#checkoutForm">生成</a>
+        <a href="#resultPanel">结果</a>
+        <a href="#gopayPanel">GoPay</a>
+        <a href="#luckmailPanel">接码</a>
+        <a href="#browserUsePanel">Browser Use</a>
+      </nav>
+
+      <section class="workspace">
+        <div class="left-column">
+        <div class="panel form-panel">
+          <div class="panel-head">
+            <div>
+              <h2>Popay</h2>
+              <p class="panel-subtitle">生成可直接打开的 OpenAI 支付长链接。</p>
+            </div>
+            <span class="badge neutral">主流程</span>
+          </div>
+
+          <form id="checkoutForm" autocomplete="off">
+            <label class="field-block">
+              <span>访问令牌 / Session JSON</span>
+              <textarea id="token" name="token" rows="10" placeholder="粘贴 access token，或整份 /api/auth/session JSON"></textarea>
+              <small class="field-hint">支持直接粘贴 JWT，或整份 <code>/api/auth/session</code> JSON，系统会自动提取 <code>accessToken</code>。</small>
+            </label>
+
+            <details class="section-box">
+              <summary class="section-title">
+                <span>可选浏览器态</span>
+                <small>403 时再填</small>
+              </summary>
+              <label>
+                <span>Cookie</span>
+                <textarea id="checkoutCookie" name="checkout_cookie" rows="4" placeholder="粘贴 chatgpt.com 当前会话 Cookie"></textarea>
+              </label>
+              <label>
+                <span>User-Agent</span>
+                <input id="checkoutUserAgent" name="checkout_user_agent" placeholder="可选，留空使用默认浏览器 UA">
+              </label>
+            </details>
+
+            <input id="planName" name="plan_name" type="hidden" value="chatgptplusplan">
+            <input id="entryPoint" name="entry_point" type="hidden" value="all_plans_pricing_modal">
+            <input id="country" name="country" type="hidden" value="ID">
+            <input id="currency" name="currency" type="hidden" value="IDR">
+            <input id="promoCampaignId" name="promo_campaign_id" type="hidden" value="plus-1-month-free">
+            <input id="customerEmail" name="customer_email" type="hidden">
+            <input id="couponFromQuery" type="checkbox" hidden checked>
+            <select id="checkoutUIMode" aria-label="Checkout UI mode" hidden>
+              <option value="hosted" selected>hosted</option>
+            </select>
+
+            <div class="toolbar payment-method-toolbar" aria-label="选择支付方式生成链接">
+              <button id="submitButton" type="submit" data-payment-method="popay">Popay</button>
+              <button id="paypalSubmitButton" type="button" data-payment-method="paypal" class="paypal-button">PayPal</button>
+            </div>
+
+            <div class="incognito-toolbar">
+              <button id="openIncognitoBtn" type="button" class="secondary-button">打开无痕窗口</button>
+              <button id="autoFillCheckoutBtn" type="button" class="secondary-button">自动填地址</button>
+              <button id="fetchSessionBtn" type="button" class="secondary-button">获取 Session JSON</button>
+              <button id="exportSub2APIBtn" type="button" class="secondary-button">导出 sub2api 凭证</button>
+            </div>
+          </form>
+        </div>
+
+          <div class="panel gopay-panel" id="gopayPanel">
+          <div class="panel-head">
+            <h2>GoPay 一键绑定</h2>
+            <span id="gopayBadge" class="badge neutral">就绪</span>
+          </div>
+
+          <div class="gopay-form">
+            <div class="gopay-field-row">
+              <label class="gopay-field">
+                <span>Account ID</span>
+                <input id="gopayAccountId" placeholder="从支付链接 URL 提取的 gopay_guid" autocomplete="off">
+              </label>
+            </div>
+            <div class="gopay-field-row gopay-two-col">
+              <label class="gopay-field">
+                <span>手机号</span>
+                <input id="gopayPhone" value="18120322232" placeholder="18120322232" autocomplete="off">
+              </label>
+              <label class="gopay-field">
+                <span>6 位 OTP 验证码</span>
+                <input id="gopayOTP" type="text" inputmode="numeric" maxlength="6" placeholder="输入收到的 OTP" autocomplete="off">
+              </label>
+            </div>
+            <details class="section-box compact-options">
+              <summary class="section-title">
+                <span>GoPay 高级选项</span>
+                <small>国家码 / 通道 / PIN / 监控</small>
+              </summary>
+              <div class="gopay-field-row gopay-two-col">
+                <label class="gopay-field">
+                  <span>国家码</span>
+                  <input id="gopayCountryCode" value="86" placeholder="86" autocomplete="off">
+                </label>
+                <label class="gopay-field">
+                  <span>OTP 通道</span>
+                  <select id="gopayOTPChannel">
+                    <option value="whatsapp" selected>WhatsApp</option>
+                    <option value="sms">SMS</option>
+                  </select>
+                </label>
+              </div>
+              <div class="gopay-field-row">
+                <label class="gopay-field">
+                  <span>6 位 GoPay PIN（记住上次值，用于绑定授权 PIN 和支付确认 PIN）</span>
+                  <input id="gopayPINCode" type="password" inputmode="numeric" maxlength="6" placeholder="输入 GoPay PIN，将默认记住上次值（仅当前浏览器）" autocomplete="off">
+                </label>
+              </div>
+              <div class="gopay-field-row">
+                <label class="gopay-check">
+                  <input id="gopayAggressiveRetry" type="checkbox">
+                  <span>支付页遇到弹窗/延迟时，开启保守恢复与冷却重试</span>
+                </label>
+              </div>
+            </details>
+            <div class="gopay-toolbar">
+              <button id="gopayLinkBtn" type="button">GoPay 一键绑定</button>
+              <button id="gopayMonitorBtn" type="button" class="secondary-button">开始流程监控</button>
+            </div>
+          </div>
+
+          <div id="gopayStepFlow" class="step-flow" hidden>
+            <div class="step-flow-item" data-gopay-step="linking">
+              <span class="step-dot"></span>
+              <div>
+                <strong>Linking</strong>
+                <p id="gopayLinkingText">等待提交</p>
+              </div>
+            </div>
+            <div class="step-flow-item" data-gopay-step="reference">
+              <span class="step-dot"></span>
+              <div>
+                <strong>验证引用</strong>
+                <p id="gopayReferenceText">等待提交</p>
+              </div>
+            </div>
+            <div class="step-flow-item" data-gopay-step="consent">
+              <span class="step-dot"></span>
+              <div>
+                <strong>触发 OTP</strong>
+                <p id="gopayConsentText">等待提交</p>
+              </div>
+            </div>
+            <div class="step-flow-item" data-gopay-step="otp">
+              <span class="step-dot"></span>
+              <div>
+                <strong>验证 OTP</strong>
+                <p id="gopayOTPText">等待提交</p>
+              </div>
+            </div>
+            <div class="step-flow-item" data-gopay-step="pin">
+              <span class="step-dot"></span>
+              <div>
+                <strong>PIN 验证</strong>
+                <p id="gopayPINText">等待提交</p>
+              </div>
+            </div>
+            <div class="step-flow-item" data-gopay-step="success">
+              <span class="step-dot"></span>
+              <div>
+                <strong>绑定完成</strong>
+                <p id="gopaySuccessText">等待提交</p>
+              </div>
+            </div>
+          </div>
+
+          <div id="gopayResult" class="gopay-result" hidden>
+            <div class="gopay-result-grid">
+              <div>
+                <span class="metric-label">Link 状态</span>
+                <strong id="gopayLinkStatus">-</strong>
+              </div>
+              <div>
+                <span class="metric-label">Reference ID</span>
+                <strong id="gopayRefID">-</strong>
+              </div>
+              <div>
+                <span class="metric-label">耗时</span>
+                <strong id="gopayLatency">-</strong>
+              </div>
+            </div>
+            <pre id="gopayOutput">{}</pre>
+          </div>
+          </div>
+
+          <div class="panel luckmail-panel" id="luckmailPanel">
+            <div class="panel-head">
+              <div>
+                <h2>LuckMail 接码</h2>
+                <p class="panel-subtitle">支持已购邮箱 Token 查询验证码，也保留临时接码订单模式。</p>
+              </div>
+              <span id="luckmailBadge" class="badge neutral">就绪</span>
+            </div>
+            <div class="luckmail-form">
+              <div class="section-box compact-options luckmail-token-box">
+                <div class="section-title static-title">
+                  <span>已购邮箱 Token 接码</span>
+                  <small>适用于 LuckMail 已购邮箱</small>
+                </div>
+                <div class="gopay-field-row">
+                  <label class="gopay-field">
+                    <span>已购邮箱 Token</span>
+                    <input id="luckmailToken" type="password" placeholder="粘贴已购邮箱 token，不是 API key" autocomplete="off">
+                  </label>
+                </div>
+                <div class="gopay-field-row">
+                  <label class="gopay-field">
+                    <span>已购邮箱地址 / 手动邮箱</span>
+                    <input id="luckmailPurchasedEmail" type="email" placeholder="Token 无效时手动填写邮箱地址" autocomplete="off">
+                  </label>
+                </div>
+                <div class="gopay-field-row">
+                  <label class="gopay-field">
+                    <span>手动验证码</span>
+                    <input id="luckmailManualCode" inputmode="numeric" placeholder="未读取到有效 Token 时手动填写验证码" autocomplete="one-time-code">
+                  </label>
+                </div>
+                <div class="luckmail-mode-row" id="luckmailModeHint">当前模式：自动检测 Token；没有有效 Token 时会切换为手动模式。</div>
+                <div class="gopay-field-row gopay-two-col">
+                  <label class="gopay-field">
+                    <span>等待秒数</span>
+                    <input id="luckmailTokenTimeoutS" type="number" min="5" max="900" value="300" autocomplete="off">
+                  </label>
+                  <label class="gopay-field">
+                    <span>轮询间隔秒</span>
+                    <input id="luckmailTokenIntervalS" type="number" min="1" max="30" value="3" autocomplete="off">
+                  </label>
+                </div>
+                <div class="gopay-toolbar">
+                  <button id="luckmailDeviceLoginGuideBtn" type="button" class="device-login-guide-button">设备登录引导</button>
+                  <button id="luckmailLoadPurchaseBtn" type="button" class="secondary-button">读取已购邮箱</button>
+                  <button id="luckmailLoginEmailFillBtn" type="button" class="secondary-button">登录页填入邮箱</button>
+                  <button id="luckmailManualCodeFillBtn" type="button" class="secondary-button">手动填验证码</button>
+                  <button id="luckmailTokenCodeBtn" type="button">等待已购邮箱验证码</button>
+                  <button id="luckmailTokenMailsBtn" type="button" class="secondary-button">查询邮件列表</button>
+                  <button id="luckmailShareCodeLinkBtn" type="button" class="secondary-button">复制验证码查看链接</button>
+                </div>
+                <div class="voice-prompt-row">
+                  <label class="voice-prompt-toggle">
+                    <input id="luckmailVoicePromptToggle" type="checkbox">
+                    <span>语音播报</span>
+                  </label>
+                  <span id="luckmailVoicePromptText" class="voice-prompt-text">未开启</span>
+                </div>
+              </div>
+              <details class="section-box compact-options">
+                <summary class="section-title">
+                  <span>临时接码订单</span>
+                  <small>新建临时邮箱 / 项目代码 / 邮箱类型</small>
+                </summary>
+              <div class="gopay-field-row gopay-two-col">
+                <label class="gopay-field">
+                  <span>项目代码</span>
+                  <input id="luckmailProjectCode" value="openai" placeholder="openai" autocomplete="off">
+                </label>
+                <label class="gopay-field">
+                  <span>邮箱类型</span>
+                  <select id="luckmailEmailType">
+                    <option value="ms_graph" selected>ms_graph</option>
+                    <option value="ms_imap">ms_imap</option>
+                    <option value="self_built">self_built</option>
+                    <option value="google_variant">google_variant</option>
+                  </select>
+                </label>
+              </div>
+              <details class="section-box compact-options">
+                <summary class="section-title">
+                  <span>LuckMail 高级选项</span>
+                  <small>域名 / 指定邮箱 / 轮询</small>
+                </summary>
+                <div class="gopay-field-row gopay-two-col">
+                  <label class="gopay-field">
+                    <span>指定域名</span>
+                    <input id="luckmailDomain" placeholder="可选，例如 outlook.com" autocomplete="off">
+                  </label>
+                  <label class="gopay-field">
+                    <span>指定邮箱</span>
+                    <input id="luckmailSpecifiedEmail" placeholder="可选" autocomplete="off">
+                  </label>
+                </div>
+                <div class="gopay-field-row gopay-two-col">
+                  <label class="gopay-field">
+                    <span>等待秒数</span>
+                    <input id="luckmailTimeoutS" type="number" min="30" max="900" value="300" autocomplete="off">
+                  </label>
+                  <label class="gopay-field">
+                    <span>轮询间隔秒</span>
+                    <input id="luckmailIntervalS" type="number" min="1" max="30" value="3" autocomplete="off">
+                  </label>
+                </div>
+              </details>
+              <div class="gopay-toolbar">
+                <button id="luckmailCreateAndWaitBtn" type="button">创建并等待验证码</button>
+                <button id="luckmailCopyCodeBtn" type="button" class="secondary-button" disabled>复制验证码</button>
+              </div>
+              </details>
+            </div>
+            <div id="luckmailResult" class="gopay-result" hidden>
+              <div class="gopay-result-grid">
+                <div>
+                  <span class="metric-label">邮箱</span>
+                  <strong id="luckmailEmailAddress">-</strong>
+                </div>
+                <div>
+                  <span class="metric-label">验证码</span>
+                  <strong id="luckmailVerificationCode">-</strong>
+                </div>
+                <div>
+                  <span class="metric-label">耗时</span>
+                  <strong id="luckmailLatency">-</strong>
+                </div>
+              </div>
+              <p class="luckmail-mail-meta" id="luckmailMailMeta">-</p>
+              <pre id="luckmailOutput">{}</pre>
+            </div>
+          </div>
+        </div>
+
+        <div class="center-column">
+          <div class="panel monitor-panel">
+            <div id="gopayMonitor" class="gopay-monitor">
+              <div class="monitor-head">
+                <h3>流程监控</h3>
+                <span id="monitorBadge" class="badge neutral">空闲</span>
+              </div>
+              <div class="monitor-summary" id="monitorSummary" hidden>
+                <span>网络请求: <strong id="monitorNetCount">0</strong></span>
+                <span>页面跳转: <strong id="monitorPageCount">0</strong></span>
+                <span>API 调用: <strong id="monitorAPICount">0</strong></span>
+                <span>JS 错误: <strong id="monitorErrorCount">0</strong></span>
+              </div>
+              <div class="monitor-log" id="monitorLog">
+                <div class="monitor-empty">点击「开始流程监控」抓取页面全流程数据</div>
+              </div>
+              <pre id="monitorOutput" hidden>{}</pre>
+            </div>
+          </div>
+
+          <div class="panel incognito-diagnostics-panel" id="incognitoDiagnosticsPanel">
+            <div class="panel-head">
+              <div>
+                <h2>无痕性能诊断</h2>
+                <p class="panel-subtitle">检查 9223、CDP target、页面加载耗时和慢资源。</p>
+              </div>
+              <span id="incognitoDiagBadge" class="badge neutral">未检测</span>
+            </div>
+            <div class="incognito-diag-grid">
+              <div>
+                <span class="metric-label">CDP 9223</span>
+                <strong id="incognitoDiagCDP">-</strong>
+              </div>
+              <div>
+                <span class="metric-label">Target</span>
+                <strong id="incognitoDiagTargets">-</strong>
+              </div>
+              <div>
+                <span class="metric-label">页面状态</span>
+                <strong id="incognitoDiagReadyState">-</strong>
+              </div>
+              <div>
+                <span class="metric-label">页面加载</span>
+                <strong id="incognitoDiagLoad">-</strong>
+              </div>
+            </div>
+            <p class="incognito-diag-message" id="incognitoDiagMessage">点击「刷新诊断」查看无痕窗口卡顿根因。</p>
+            <div class="incognito-diag-toolbar">
+              <button id="incognitoDiagRefreshBtn" type="button" class="secondary-button">刷新诊断</button>
+              <button id="incognitoDiagOpenBtn" type="button" class="secondary-button">打开并诊断</button>
+            </div>
+            <div class="incognito-diag-slow" id="incognitoDiagSlow" hidden></div>
+            <details class="raw-output incognito-diag-raw">
+              <summary class="section-title">
+                <span>查看诊断 JSON</span>
+                <small>CDP / 页面性能</small>
+              </summary>
+              <pre id="incognitoDiagOutput">{}</pre>
+            </details>
+          </div>
+
+          <div class="panel luckmail-mails-panel" id="luckmailMailsPanel" hidden>
+            <div class="panel-head">
+              <div>
+                <h2>LuckMail 邮件列表</h2>
+                <p class="panel-subtitle">展示当前已购邮箱 Token 返回的邮件列表，按 LuckMail 接口返回顺序显示。</p>
+              </div>
+              <span id="luckmailMailsCount" class="badge neutral">0 封</span>
+            </div>
+            <div class="luckmail-mails-summary">
+              <span class="metric-label">当前邮箱</span>
+              <strong id="luckmailMailsEmail">-</strong>
+            </div>
+            <div class="luckmail-mails-list" id="luckmailMailsList">
+              <div class="luckmail-mails-empty" id="luckmailMailsEmpty">点击「查询邮件列表」后在这里显示邮件。</div>
+            </div>
+          </div>
+
+          <div class="panel result-panel" id="resultPanel">
+          <div class="panel-head">
+            <h2>生成结果</h2>
+            <span id="latency" class="badge neutral">空闲</span>
+          </div>
+
+          <div id="summary" class="summary">
+            <div>
+              <span class="metric-label">状态</span>
+              <strong id="statusText">空闲</strong>
+            </div>
+            <div>
+              <span class="metric-label">Session</span>
+              <strong id="sessionText">-</strong>
+            </div>
+            <div>
+              <span class="metric-label">域名</span>
+              <strong id="hostText">-</strong>
+            </div>
+          </div>
+
+          <div id="stepFlow" class="step-flow">
+            <div class="step-flow-item" data-step="input">
+              <span class="step-dot"></span>
+              <div>
+                <strong>识别输入</strong>
+                <p id="stepInputText">等待提交</p>
+              </div>
+            </div>
+            <div class="step-flow-item" data-step="token">
+              <span class="step-dot"></span>
+              <div>
+                <strong>提取 Token</strong>
+                <p id="stepTokenText">等待提交</p>
+              </div>
+            </div>
+            <div class="step-flow-item" data-step="checkout">
+              <span class="step-dot"></span>
+              <div>
+                <strong>请求 Checkout</strong>
+                <p id="stepCheckoutText">等待提交</p>
+              </div>
+            </div>
+            <div class="step-flow-item" data-step="cookie">
+              <span class="step-dot"></span>
+              <div>
+                <strong>浏览器会话</strong>
+                <p id="stepCookieText">等待提交</p>
+              </div>
+            </div>
+            <div class="step-flow-item" data-step="link">
+              <span class="step-dot"></span>
+              <div>
+                <strong>生成链接</strong>
+                <p id="stepLinkText">等待提交</p>
+              </div>
+            </div>
+          </div>
+
+          <div id="alertBox" class="alert-box" hidden>
+            <div class="alert-head">
+              <strong id="alertTitle">生成失败</strong>
+              <span id="alertBadge" class="alert-badge">错误</span>
+            </div>
+            <p id="alertMessage" class="alert-message">-</p>
+            <p id="alertHint" class="alert-hint" hidden>-</p>
+            <div id="alertSteps" class="alert-steps" hidden>
+              <span class="alert-steps-title">下一步</span>
+              <ol id="alertStepsList"></ol>
+            </div>
+          </div>
+
+          <div id="finalStatus" class="final-status">
+            <div>
+              <span class="metric-label">结果</span>
+              <strong id="finalTransactionText">-</strong>
+            </div>
+            <div>
+              <span class="metric-label">支付链接</span>
+              <a id="checkoutUrlLink" class="checkout-link" href="#" target="_blank" rel="noreferrer" hidden>打开链接</a>
+              <button id="openInIncognitoBtn" class="incognito-link-button" type="button" hidden>无痕打开</button>
+              <button id="copyCheckoutLinkButton" class="copy-button" type="button" hidden>复制链接</button>
+            </div>
+            <div>
+              <span class="metric-label">说明</span>
+              <strong id="finalSettlementText">-</strong>
+            </div>
+          </div>
+
+          <div class="next-actions" aria-label="下一步操作">
+            <span class="metric-label">下一步操作</span>
+            <div class="next-actions-grid">
+              <a class="next-action-link" href="#gopayPanel">GoPay 绑定</a>
+              <a class="next-action-link" href="#browserUsePanel">Browser Use 分析</a>
+            </div>
+          </div>
+
+          <details class="raw-output">
+            <summary class="section-title">
+              <span>查看原始 JSON 输出</span>
+              <small>调试详情</small>
+            </summary>
+            <pre id="output">{}</pre>
+          </details>
+        </div>
+        </div>
+
+        <div class="tools-column">
+          <div class="tool-tabs" role="tablist" aria-label="工具面板切换">
+            <a class="tool-tab" href="#gopayPanel">GoPay</a>
+            <a class="tool-tab" href="#browserUsePanel">Browser Use</a>
+          </div>
+
+          <div class="panel browser-use-panel" id="browserUsePanel">
+          <div class="panel-head">
+            <h2>Browser Use</h2>
+            <span id="browserUseBadge" class="badge neutral">检测中</span>
+          </div>
+
+          <div class="browser-use-form">
+            <label class="browser-use-field">
+              <span>目标 URL</span>
+              <input id="browserUseUrl" type="url" placeholder="https://example.com" autocomplete="off">
+            </label>
+
+            <label class="browser-use-field">
+              <span>任务说明</span>
+              <textarea id="browserUseTask" rows="3" placeholder="例如：打开页面，填写邮箱并提取全部文本与链接"></textarea>
+            </label>
+
+            <details class="section-box compact-options browser-use-advanced">
+              <summary class="section-title">
+                <span>Browser Use 高级选项</span>
+                <small>等待条件 / 表单 JSON / 运行参数</small>
+              </summary>
+              <div class="browser-use-row browser-use-two-col">
+                <label class="browser-use-field">
+                  <span>等待文本</span>
+                  <input id="browserUseWaitText" placeholder="例如：Example Domain" autocomplete="off">
+                </label>
+                <label class="browser-use-field">
+                  <span>等待选择器</span>
+                  <input id="browserUseWaitSelector" placeholder="例如：form input[name='email']" autocomplete="off">
+                </label>
+              </div>
+
+              <label class="browser-use-field">
+                <span>表单数据 JSON</span>
+                <textarea id="browserUseFormData" rows="5" placeholder='例如：{"email":"demo@example.com","name":"Alice"}'></textarea>
+              </label>
+
+              <label class="browser-use-field">
+                <span>字段提示 JSON</span>
+                <textarea id="browserUseFieldHints" rows="5" placeholder='例如：{"email":{"label":"Email"},"name":{"placeholder":"Your name"}}'></textarea>
+              </label>
+
+              <div class="browser-use-row browser-use-two-col">
+                <label class="browser-use-field">
+                  <span>运行模式</span>
+                  <select id="browserUseHeadless">
+                    <option value="true" selected>无头</option>
+                    <option value="false">可见浏览器</option>
+                  </select>
+                </label>
+                <label class="browser-use-field">
+                  <span>提交表单</span>
+                  <select id="browserUseSubmit">
+                    <option value="false" selected>仅填写/提取</option>
+                    <option value="true">填写后提交</option>
+                  </select>
+                </label>
+              </div>
+            </details>
+
+            <div class="browser-use-toolbar">
+              <button id="browserUseRunBtn" type="button">一键调用 browser-use</button>
+              <button id="browserUsePrefillBtn" type="button">填入示例</button>
+            </div>
+
+            <p class="browser-use-help">默认直连本地服务 <code>http://127.0.0.1:38765/run</code>。如果按钮显示离线，请先在 <code>f:\chatadd\.codex\runtime\browser-use-service</code> 下启动 <code>node src/server.js</code>。</p>
+          </div>
+
+          <div id="browserUseResult" class="browser-use-result" hidden>
+            <div class="browser-use-result-grid">
+              <div>
+                <span class="metric-label">服务状态</span>
+                <strong id="browserUseServiceStatus">-</strong>
+              </div>
+              <div>
+                <span class="metric-label">执行结果</span>
+                <strong id="browserUseRunStatus">-</strong>
+              </div>
+              <div>
+                <span class="metric-label">耗时</span>
+                <strong id="browserUseDuration">-</strong>
+              </div>
+            </div>
+            <pre id="browserUseOutput">{}</pre>
+          </div>
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <aside class="wechat-group-card is-expanded" id="wechatGroupCard" aria-label="微信群二维码">
+      <button class="wechat-group-card__close" id="wechatGroupCloseBtn" type="button" aria-label="关闭微信群二维码">×</button>
+      <button class="wechat-group-card__toggle" id="wechatGroupToggleBtn" type="button" aria-expanded="true">
+        <span class="wechat-group-card__title">微信群</span>
+        <span class="wechat-group-card__name">Super Plus</span>
+      </button>
+      <button class="wechat-group-card__preview" id="wechatGroupPreviewBtn" type="button" aria-label="查看微信群二维码大图">
+        <img
+          class="wechat-group-card__image"
+          src="/wechat-group-qr-placeholder.svg"
+          alt="微信群二维码"
+        >
+      </button>
+    </aside>
+
+    <div class="wechat-group-modal" id="wechatGroupModal" hidden>
+      <button class="wechat-group-modal__backdrop" id="wechatGroupBackdrop" type="button" aria-label="关闭二维码预览"></button>
+      <div class="wechat-group-modal__dialog" role="dialog" aria-modal="true" aria-labelledby="wechatGroupModalTitle">
+        <div class="wechat-group-modal__head">
+          <div>
+            <div class="wechat-group-card__title">微信群</div>
+            <div class="wechat-group-card__name" id="wechatGroupModalTitle">Super Plus</div>
+          </div>
+          <button class="wechat-group-modal__close" id="wechatGroupModalCloseBtn" type="button" aria-label="关闭二维码预览">×</button>
+        </div>
+        <img
+          class="wechat-group-modal__image"
+          src="/wechat-group-qr-placeholder.svg"
+          alt="微信群二维码大图"
+        >
+      </div>
+    </div>
+
+    <script src="/app.js?v=20260510a"></script>
+    <script>
+      const browserUseUrl = document.querySelector("#browserUseUrl");
+      const browserUseTask = document.querySelector("#browserUseTask");
+      const browserUseWaitText = document.querySelector("#browserUseWaitText");
+      const browserUseWaitSelector = document.querySelector("#browserUseWaitSelector");
+      const browserUseFormData = document.querySelector("#browserUseFormData");
+      const browserUseFieldHints = document.querySelector("#browserUseFieldHints");
+      const browserUseHeadless = document.querySelector("#browserUseHeadless");
+      const browserUseSubmit = document.querySelector("#browserUseSubmit");
+      const browserUseRunBtn = document.querySelector("#browserUseRunBtn");
+      const browserUsePrefillBtn = document.querySelector("#browserUsePrefillBtn");
+      const browserUseBadge = document.querySelector("#browserUseBadge");
+      const browserUseResult = document.querySelector("#browserUseResult");
+      const browserUseServiceStatus = document.querySelector("#browserUseServiceStatus");
+      const browserUseRunStatus = document.querySelector("#browserUseRunStatus");
+      const browserUseDuration = document.querySelector("#browserUseDuration");
+      const browserUseOutput = document.querySelector("#browserUseOutput");
+      const browserUseServiceBaseURL = "http://127.0.0.1:38765";
+
+      /**
+       * 检查 browser-use 本地服务状态。
+       * @returns {Promise<boolean>}
+       */
+      async function checkBrowserUseHealth() {
+        try {
+          const response = await fetch(browserUseServiceBaseURL + "/health");
+          if (!response.ok) {
+            throw new Error("health check failed");
+          }
+          const data = await response.json();
+          if (browserUseBadge) {
+            browserUseBadge.textContent = "在线";
+            browserUseBadge.className = "badge";
+          }
+          if (browserUseServiceStatus) {
+            browserUseServiceStatus.textContent = data.service || "browser-use";
+          }
+          return true;
+        } catch (_error) {
+          if (browserUseBadge) {
+            browserUseBadge.textContent = "离线";
+            browserUseBadge.className = "badge error";
+          }
+          if (browserUseServiceStatus) {
+            browserUseServiceStatus.textContent = "未连接";
+          }
+          return false;
+        }
+      }
+
+      /**
+       * 解析可选 JSON 文本。
+       * @param {HTMLTextAreaElement | null} field
+       * @returns {object}
+       */
+      function parseBrowserUseJSONField(field) {
+        const raw = (field?.value || "").trim();
+        if (!raw) {
+          return {};
+        }
+        return JSON.parse(raw);
+      }
+
+      /**
+       * 构建 browser-use 请求体。
+       * @returns {object}
+       */
+      function buildBrowserUsePayload() {
+        const waitFor = {};
+        if ((browserUseWaitText?.value || "").trim()) {
+          waitFor.text = browserUseWaitText.value.trim();
+        }
+        if ((browserUseWaitSelector?.value || "").trim()) {
+          waitFor.selector = browserUseWaitSelector.value.trim();
+        }
+
+        return {
+          task: (browserUseTask?.value || "").trim() || "browser-use task",
+          url: (browserUseUrl?.value || "").trim(),
+          waitFor: waitFor,
+          formData: parseBrowserUseJSONField(browserUseFormData),
+          fieldHints: parseBrowserUseJSONField(browserUseFieldHints),
+          headless: (browserUseHeadless?.value || "true") === "true",
+          submit: (browserUseSubmit?.value || "false") === "true",
+          logLevel: "info",
+          retryCount: 2,
+          screenshotOnError: true
+        };
+      }
+
+      /**
+       * 渲染 browser-use 执行结果。
+       * @param {object} result
+       * @param {number} durationMs
+       * @returns {void}
+       */
+      function renderBrowserUseResult(result, durationMs) {
+        if (browserUseResult) {
+          browserUseResult.hidden = false;
+        }
+        if (browserUseRunStatus) {
+          browserUseRunStatus.textContent = result?.status || result?.error || "unknown";
+        }
+        if (browserUseDuration) {
+          browserUseDuration.textContent = durationMs + " ms";
+        }
+        if (browserUseOutput) {
+          browserUseOutput.textContent = JSON.stringify(result, null, 2);
+        }
+      }
+
+      /**
+       * 调用 browser-use 本地服务。
+       * @returns {Promise<void>}
+       */
+      async function runBrowserUseFromPage() {
+        if (!browserUseRunBtn) {
+          return;
+        }
+
+        browserUseRunBtn.disabled = true;
+        browserUseRunBtn.textContent = "执行中...";
+        if (browserUseRunStatus) {
+          browserUseRunStatus.textContent = "运行中";
+        }
+
+        const startedAt = performance.now();
+        try {
+          const healthy = await checkBrowserUseHealth();
+          if (!healthy) {
+            throw new Error("browser-use 本地服务未启动，请先运行 node src/server.js");
+          }
+
+          const payload = buildBrowserUsePayload();
+          const response = await fetch(browserUseServiceBaseURL + "/run", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(payload)
+          });
+          const result = await response.json();
+          renderBrowserUseResult(result, Math.round(performance.now() - startedAt));
+        } catch (error) {
+          renderBrowserUseResult({
+            status: "failed",
+            error: error instanceof Error ? error.message : String(error)
+          }, Math.round(performance.now() - startedAt));
+        } finally {
+          browserUseRunBtn.disabled = false;
+          browserUseRunBtn.textContent = "一键调用 browser-use";
+        }
+      }
+
+      /**
+       * 填充 browser-use 示例输入。
+       * @returns {void}
+       */
+      function prefillBrowserUseExample() {
+        if (browserUseUrl) {
+          browserUseUrl.value = latestCheckoutURL || "https://example.com";
+        }
+        if (browserUseTask) {
+          browserUseTask.value = latestCheckoutURL
+            ? "打开当前支付链接页面，分析并提取全部页面数据内容"
+            : "打开示例页面，提取全部文本、链接、结构化数据与表单信息";
+        }
+        if (browserUseWaitText) {
+          browserUseWaitText.value = latestCheckoutURL ? "Checkout" : "Example Domain";
+        }
+        if (browserUseWaitSelector) {
+          browserUseWaitSelector.value = "";
+        }
+        if (browserUseFormData) {
+          browserUseFormData.value = JSON.stringify({}, null, 2);
+        }
+        if (browserUseFieldHints) {
+          browserUseFieldHints.value = JSON.stringify({}, null, 2);
+        }
+        if (browserUseHeadless) {
+          browserUseHeadless.value = "true";
+        }
+        if (browserUseSubmit) {
+          browserUseSubmit.value = "false";
+        }
+      }
+
+      /**
+       * 解析 Session 获取接口错误消息。
+       * @param {string} rawText
+       * @returns {string}
+       */
+      function normalizeSessionFetchErrorMessage(rawText) {
+        const text = String(rawText || "").trim();
+        if (!text) {
+          return "获取 Session JSON 失败，请确认已在无痕窗口中登录 ChatGPT";
+        }
+        try {
+          const parsed = JSON.parse(text);
+          return parsed.error || parsed.message || text;
+        } catch (_error) {
+          return text;
+        }
+      }
+
+      /**
+       * 非流式方式获取 Session JSON。
+       * @param {{ skipEnsureWindow?: boolean, allowRecovery?: boolean, silentConclusion?: boolean }} options
+       * @returns {Promise<string>}
+       */
+      async function fetchLatestSessionJSONWithoutStream(options) {
+        options = options || {};
+        const skipEnsureWindow = !!options.skipEnsureWindow;
+        const allowRecovery = options.allowRecovery !== false;
+        const silentConclusion = !!options.silentConclusion;
+
+        if (!skipEnsureWindow) {
+          const ensured = await ensureIncognitoWindow();
+          if (!ensured) {
+            throw new Error("无法启动 Chrome 无痕窗口，请确认系统已安装 Chrome 浏览器。");
+          }
+        }
+
+        sessionMonitorAbortController = new AbortController();
+        clearMonitor();
+        if (gopayMonitor) gopayMonitor.hidden = false;
+        if (monitorBadge) { monitorBadge.textContent = "Session 回退模式中"; monitorBadge.className = "badge"; }
+        appendMonitorEvent({ domain: "Log", method: "session-fetch-fallback", summary: "检测到流式不可用，自动切换到普通模式", ts: Date.now() });
+
+        const response = await fetch("/api/session/fetch", {
+          method: "POST",
+          headers: buildRequestHeaders(),
+          body: JSON.stringify({ stream: false }),
+          signal: sessionMonitorAbortController.signal,
+        });
+
+        const text = await response.text();
+        let payload = null;
+        try {
+          payload = JSON.parse(text);
+        } catch (_error) {
+          payload = null;
+        }
+
+        if (!response.ok) {
+          throw new Error(normalizeSessionFetchErrorMessage(text));
+        }
+
+        const resultJSON = payload?.json || "";
+        const diagnostics = payload?.diagnostics || null;
+
+        if (diagnostics && monitorOutput) {
+          monitorOutput.hidden = false;
+          monitorOutput.textContent = JSON.stringify({ mode: "fallback", diagnostics: diagnostics }, null, 2);
+        }
+
+        if (diagnostics?.conclusion && !silentConclusion) {
+          renderSessionConclusion(diagnostics.conclusion);
+        }
+
+        if (resultJSON) {
+          fields.token.value = resultJSON;
+          if (sessionText) setText(sessionText, "已提取 Session JSON");
+          if (monitorBadge) { monitorBadge.textContent = "Session 已获取"; monitorBadge.className = "badge"; }
+          sessionMonitorAbortController = null;
+          return resultJSON;
+        }
+
+        if (diagnostics?.conclusion && allowRecovery) {
+          var recovered = await handleSessionAutoAction(diagnostics.conclusion);
+          if (recovered) {
+            sessionMonitorAbortController = null;
+            return recovered;
+          }
+        }
+
+        sessionMonitorAbortController = null;
+        if (monitorBadge) { monitorBadge.textContent = "Session 失败"; monitorBadge.className = "badge error"; }
+        throw new Error(diagnostics?.session_preview || payload?.error || "获取 Session JSON 失败，请确认已在无痕窗口中登录 ChatGPT");
+      }
+
+      if (typeof fetchLatestSessionJSON === "function") {
+        const originalFetchLatestSessionJSON = fetchLatestSessionJSON;
+        fetchLatestSessionJSON = async function (options) {
+          try {
+            return await originalFetchLatestSessionJSON(options);
+          } catch (error) {
+            const message = error instanceof Error ? error.message : String(error || "");
+            if (
+              message.includes("streaming not supported")
+              || message.includes("浏览器未返回可读取的流式响应")
+              || message.includes("{\"error\":\"streaming not supported\"")
+            ) {
+              return await fetchLatestSessionJSONWithoutStream(options);
+            }
+            throw error;
+          }
+        };
+      }
+
+      browserUseRunBtn?.addEventListener("click", function () {
+        void runBrowserUseFromPage();
+      });
+
+      browserUsePrefillBtn?.addEventListener("click", function () {
+        prefillBrowserUseExample();
+      });
+
+      window.setTimeout(checkBrowserUseHealth, 6500);
+    </script>
+  </body>
+</html>

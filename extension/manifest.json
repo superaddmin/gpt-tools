@@ -1,0 +1,48 @@
+{
+  "manifest_version": 3,
+  "name": "ChatAdd 凭证提取器",
+  "version": "1.0.0",
+  "description": "一键提取已登录网站的 Cookies、LocalStorage 与 SessionStorage 凭证数据",
+  "permissions": [
+    "cookies",
+    "storage",
+    "scripting",
+    "tabs",
+    "downloads",
+    "windows"
+  ],
+  "host_permissions": [
+    "https://chatgpt.com/*",
+    "https://*.chatgpt.com/*",
+    "https://auth.openai.com/*",
+    "https://*.openai.com/*"
+  ],
+  "incognito": "split",
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://chatgpt.com/*",
+        "https://*.chatgpt.com/*"
+      ],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    }
+  ],
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "ChatAdd 凭证提取器",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  },
+  "icons": {
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  }
+}
