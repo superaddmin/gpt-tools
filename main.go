@@ -2498,9 +2498,25 @@ func automateLoginEmailFill(ctx context.Context, email string, timeout time.Dura
 		if text := stringifyJSONValue(action["continue_button_text"]); text != "" {
 			result.ContinueButtonText = text
 		}
+		if ready, _ := action["verification_ready"].(bool); ready {
+			result.OK = true
+			result.Stage = "login_verification_ready"
+			result.VerificationReady = true
+			result.VerificationHint = stringifyJSONValue(action["verification_hint"])
+			result.CurrentURL = stringifyJSONValue(action["url"])
+			result.ElapsedMS = time.Since(startedAt).Milliseconds()
+			return result
+		}
 		if timedOut, _ := action["operation_timed_out"].(bool); timedOut {
 			result.OperationTimedOut = true
 			result.PageError = stringifyJSONValue(action["page_error"])
+			result.CurrentURL = stringifyJSONValue(action["url"])
+			if result.ClickedContinue && time.Now().Before(hardDeadline) {
+				result.Stage = "login_email_transient_timeout_cleared"
+				result.Error = ""
+				time.Sleep(1200 * time.Millisecond)
+				continue
+			}
 			result.OK = false
 			result.Stage = "login_email_operation_timed_out"
 			if result.PageError != "" {
@@ -2508,16 +2524,6 @@ func automateLoginEmailFill(ctx context.Context, email string, timeout time.Dura
 			} else {
 				result.Error = "页面提示 Operation timed out，邮箱提交请求超时"
 			}
-			result.CurrentURL = stringifyJSONValue(action["url"])
-			result.ElapsedMS = time.Since(startedAt).Milliseconds()
-			return result
-		}
-		if ready, _ := action["verification_ready"].(bool); ready {
-			result.OK = true
-			result.Stage = "login_verification_ready"
-			result.VerificationReady = true
-			result.VerificationHint = stringifyJSONValue(action["verification_hint"])
-			result.CurrentURL = stringifyJSONValue(action["url"])
 			result.ElapsedMS = time.Since(startedAt).Milliseconds()
 			return result
 		}
@@ -3749,6 +3755,17 @@ func runLoginEmailFillStep(conn *websocket.Conn, email string) (map[string]any, 
 			const message = messages.find((text) => text.toLowerCase().includes('operation timed out') || text.includes('操作超时') || text.includes('请求超时')) || '';
 			return { timed_out: Boolean(message), message };
 		};
+		const clearTransientPageError = () => {
+			const buttons = clickables().filter((el) => {
+				const text = textOf(el).toLowerCase();
+				const label = [text, el.getAttribute('aria-label'), el.getAttribute('title')].filter(Boolean).join(' ').toLowerCase();
+				return label.includes('close') || label.includes('dismiss') || label.includes('retry') || label.includes('try again') || label.includes('关闭') || label.includes('重试') || label === '×' || label === 'x';
+			});
+			for (const button of buttons.slice(0, 3)) {
+				try { clickElement(button); } catch (_err) {}
+			}
+			return buttons.length > 0;
+		};
 		const result = { url: location.href, title: document.title, clicked_login: false, email_mode_switched: false, email_filled: false, clicked_continue: false, verification_ready: false, operation_timed_out: false };
 		const existingVerification = verificationProbe();
 		if (existingVerification.ready) {
@@ -3788,17 +3805,18 @@ func runLoginEmailFillStep(conn *websocket.Conn, email string) (map[string]any, 
 				result.clicked_continue = true;
 				for (let i = 0; i < 80; i += 1) {
 					await sleep(300);
-					const pageError = pageErrorProbe();
-					if (pageError.timed_out) {
-						result.operation_timed_out = true;
-						result.page_error = pageError.message;
-						break;
-					}
 					const probe = verificationProbe();
 					if (probe.ready) {
 						result.verification_ready = true;
 						result.verification_hint = probe.hint;
 						break;
+					}
+					const pageError = pageErrorProbe();
+					if (pageError.timed_out) {
+						result.operation_timed_out = true;
+						result.page_error = pageError.message;
+						result.transient_error_cleared = clearTransientPageError();
+						await sleep(500);
 					}
 				}
 			}
@@ -3982,8 +4000,10 @@ func runLoginCodeFillStep(conn *websocket.Conn, code string, profile japanesePro
 			const bodyText = document.body ? textOf(document.body).toLowerCase() : '';
 			const href = location.href.toLowerCase();
 			const composer = Array.from(document.querySelectorAll('#prompt-textarea, [data-testid*="composer"], textarea, [role="textbox"]')).some(visible);
-			const completed = href.includes('chatgpt.com') && !href.includes('auth.openai.com') && !href.includes('verification') && composer;
-			const hint = completed ? 'chatgpt composer detected' : (bodyText.includes('chatgpt') ? 'chatgpt text detected' : '');
+			const checkoutReady = href.includes('chatgpt.com/checkout/openai_llc/') || href.includes('pay.openai.com/c/pay/') || href.includes('checkout.stripe.com/c/pay/');
+			const chatReady = href.includes('chatgpt.com') && !href.includes('auth.openai.com') && !href.includes('/auth/') && !href.includes('verification') && (composer || href.includes('/c/') || href.includes('pricing') || bodyText.includes('chatgpt'));
+			const completed = checkoutReady || chatReady;
+			const hint = checkoutReady ? 'checkout page detected after login' : (completed && composer ? 'chatgpt composer detected' : (completed ? 'chatgpt logged-in page detected' : ''));
 			return { completed, hint };
 		};
 		const rejectionProbe = () => {
@@ -3995,6 +4015,14 @@ func runLoginCodeFillStep(conn *websocket.Conn, code string, profile japanesePro
 			return { rejected: Boolean(message), message: message || '' };
 		};
 		const result = { url: location.href, title: document.title, code_filled: false, code_submitted: false, code_rejected: false, profile_filled: false, login_completed: false };
+		const completionBeforeCode = completionProbe();
+		if (completionBeforeCode.completed) {
+			result.login_completed = true;
+			result.completion_hint = completionBeforeCode.hint;
+			result.url = location.href;
+			result.title = document.title;
+			return JSON.stringify(result);
+		}
 		const profileBeforeCode = await fillProfileIfNeeded();
 		if (profileBeforeCode.profile_filled) {
 			Object.assign(result, profileBeforeCode);
@@ -4156,6 +4184,24 @@ func isGopayCDPTargetURL(rawURL string) bool {
 		strings.Contains(lower, "midtrans.com")
 }
 
+type gopayCDPTargetScope struct {
+	TargetID    string
+	TargetURL   string
+	AccountID   string
+	CheckoutURL string
+}
+
+func normalizeGopayCDPTargetScope(scope gopayCDPTargetScope) gopayCDPTargetScope {
+	scope.TargetID = strings.TrimSpace(scope.TargetID)
+	scope.TargetURL = strings.TrimSpace(scope.TargetURL)
+	scope.AccountID = strings.TrimSpace(scope.AccountID)
+	scope.CheckoutURL = strings.TrimSpace(scope.CheckoutURL)
+	if scope.AccountID == "" && scope.TargetURL != "" {
+		scope.AccountID = midtransRedirectionAccountID(scope.TargetURL)
+	}
+	return scope
+}
+
 func gopayCDPTargetScore(target cdpTarget) int {
 	lower := strings.ToLower(strings.TrimSpace(target.URL))
 	if lower == "" {
@@ -4207,19 +4253,50 @@ func gopayCDPTargetScore(target cdpTarget) int {
 	return score
 }
 
-func findBestGopayCDPTarget(port int) (*cdpTarget, error) {
+func gopayCDPTargetScopeScore(target cdpTarget, scope gopayCDPTargetScope) int {
+	scope = normalizeGopayCDPTargetScope(scope)
+	lower := strings.ToLower(strings.TrimSpace(target.URL))
+	score := 0
+	if scope.TargetID != "" && target.ID == scope.TargetID {
+		score += 1400
+	}
+	if scope.TargetURL != "" && strings.EqualFold(strings.TrimSpace(target.URL), scope.TargetURL) {
+		score += 1000
+	}
+	if scope.AccountID != "" {
+		targetAccountID := midtransRedirectionAccountID(target.URL)
+		switch {
+		case targetAccountID == scope.AccountID:
+			score += 900
+		case targetAccountID != "":
+			score -= 500
+		case strings.Contains(lower, strings.ToLower(scope.AccountID)):
+			score += 600
+		}
+	}
+	if scope.CheckoutURL != "" {
+		if checkoutKey := checkoutAutoTriggerKey(scope.CheckoutURL); checkoutKey != "" && strings.Contains(lower, strings.ToLower(checkoutKey)) {
+			score += 200
+		}
+	}
+	return score
+}
+
+func findBestGopayCDPTarget(port int, scope gopayCDPTargetScope) (*cdpTarget, error) {
 	targets, err := getCDPTargets(port)
 	if err != nil {
 		return nil, err
 	}
+	scope = normalizeGopayCDPTargetScope(scope)
 	bestScore := -1
 	var best *cdpTarget
 	for i := range targets {
 		target := &targets[i]
-		if target.WebSocketDebuggerURL == "" || !isGopayCDPTargetURL(target.URL) {
+		exactScopedTarget := scope.TargetID != "" && target.ID == scope.TargetID
+		if target.WebSocketDebuggerURL == "" || (!exactScopedTarget && !isGopayCDPTargetURL(target.URL)) {
 			continue
 		}
-		score := gopayCDPTargetScore(*target)
+		score := gopayCDPTargetScore(*target) + gopayCDPTargetScopeScore(*target, scope)
 		if score > bestScore {
 			bestScore = score
 			copyTarget := *target
@@ -6618,6 +6695,10 @@ func gopayPaymentPINCandidates(preferred string) []string {
 		add(value)
 	}
 	return candidates
+}
+
+func gopayLinkingPINCandidates(preferred string) []string {
+	return gopayPaymentPINCandidates(preferred)
 }
 
 func completeGopayPaymentViaLocalMock(ctx context.Context, gopayGUID string, preferredPIN string) (gopayPaymentResolution, error) {
@@ -9132,6 +9213,26 @@ func resolveCheckoutPageTarget(targets []cdpTarget, expectedURL string) (*cdpTar
 		}
 	}
 	return nil, "", errors.New("未找到本工具最近一次打开的支付链接页面，请重新打开支付链接后再试。")
+}
+
+func resolveLatestCheckoutRuntimeTarget(targets []cdpTarget) (*cdpTarget, string) {
+	for i := len(targets) - 1; i >= 0; i-- {
+		target := &targets[i]
+		if target.Type != "page" {
+			continue
+		}
+		urlText := strings.TrimSpace(target.URL)
+		if urlText == "" {
+			continue
+		}
+		if normalized := normalizeManagedCheckoutURL(urlText); normalized != "" {
+			return target, normalized
+		}
+		if midtransRedirectionAccountID(urlText) != "" || isGopayCDPTargetURL(urlText) {
+			return target, urlText
+		}
+	}
+	return nil, ""
 }
 
 func checkoutResolveCandidateURLs(targets []cdpTarget) []string {
@@ -11752,6 +11853,8 @@ func handleGopayMidtransLinkingFill(w http.ResponseWriter, r *http.Request) {
 		"ok":               ok,
 		"stage":            stage,
 		"account_id":       accountID,
+		"cdp_target_id":    target.ID,
+		"cdp_target_url":   target.URL,
 		"target_url":       req.TargetURL,
 		"checkout_url":     req.CheckoutURL,
 		"country_code":     req.CountryCode,
@@ -11941,12 +12044,7 @@ func handleGopayAutoLink(w http.ResponseWriter, r *http.Request) {
 	response["stage"] = "validate_otp"
 	response["otp_used"] = validOTP
 	challengeID := gopayOTPChallengeID(otpResult)
-	sandboxPINs := []string{"123456", "111111", "000000", "654321", "145236"}
-	pinCands := make([]string, 0, len(sandboxPINs)+1)
-	if req.PIN != "" {
-		pinCands = append(pinCands, req.PIN)
-	}
-	pinCands = append(pinCands, sandboxPINs...)
+	pinCands := gopayLinkingPINCandidates(req.PIN)
 	var validPIN string
 	pinOK := false
 	pinTok := ""
@@ -12151,12 +12249,7 @@ func handleGopaySmartLink(w http.ResponseWriter, r *http.Request) {
 	}
 	challengeID := gopayOTPChallengeID(otpR)
 	addStage("otp-enum", map[string]any{"ok": true, "otp": vOTP, "challenge_id": challengeID})
-	sandboxPINs := []string{"123456", "111111", "000000", "654321", "145236"}
-	pinCands := make([]string, 0, len(sandboxPINs)+1)
-	if req.PIN != "" {
-		pinCands = append(pinCands, req.PIN)
-	}
-	pinCands = append(pinCands, sandboxPINs...)
+	pinCands := gopayLinkingPINCandidates(req.PIN)
 	var vPIN string
 	pinOk := false
 	pinT := ""
@@ -12205,8 +12298,12 @@ func handleGopayCDPOTP(w http.ResponseWriter, r *http.Request) {
 	}
 	defer r.Body.Close()
 	var req struct {
-		OTP string `json:"otp,omitempty"`
-		PIN string `json:"pin,omitempty"`
+		OTP         string `json:"otp,omitempty"`
+		PIN         string `json:"pin,omitempty"`
+		TargetID    string `json:"target_id,omitempty"`
+		TargetURL   string `json:"target_url,omitempty"`
+		AccountID   string `json:"account_id,omitempty"`
+		CheckoutURL string `json:"checkout_url,omitempty"`
 	}
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<17)).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid json")
@@ -12229,7 +12326,13 @@ func handleGopayCDPOTP(w http.ResponseWriter, r *http.Request) {
 		return ""
 	}
 
-	target, err := findBestGopayCDPTarget(cdpDebuggingPort)
+	scope := normalizeGopayCDPTargetScope(gopayCDPTargetScope{
+		TargetID:    req.TargetID,
+		TargetURL:   req.TargetURL,
+		AccountID:   req.AccountID,
+		CheckoutURL: req.CheckoutURL,
+	})
+	target, err := findBestGopayCDPTarget(cdpDebuggingPort, scope)
 	if err != nil {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"ok": false, "error": err.Error()})
 		return
@@ -12256,9 +12359,11 @@ func handleGopayCDPOTP(w http.ResponseWriter, r *http.Request) {
 	response := map[string]any{
 		"ok":                      true,
 		"stage":                   firstNonEmpty(stringifyJSONValue(result["page_stage"]), "page_observed"),
+		"selected_target_id":      target.ID,
 		"selected_target_url":     target.URL,
 		"selected_target_type":    target.Type,
-		"selected_target_score":   gopayCDPTargetScore(*target),
+		"selected_target_score":   gopayCDPTargetScore(*target) + gopayCDPTargetScopeScore(*target, scope),
+		"target_scope":            map[string]any{"target_id": scope.TargetID, "target_url": scope.TargetURL, "account_id": scope.AccountID, "checkout_url": scope.CheckoutURL},
 		"payment_completed":       boolMapValue(result, "payment_completed"),
 		"payment_complete_reason": stringifyJSONValue(result["payment_complete_reason"]),
 		"pin_stage":               stringifyJSONValue(result["pin_stage"]),
@@ -12316,6 +12421,23 @@ func gopayCDPFlowScript(preferredPIN string) string {
 		const visible = (el) => !!el && !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length);
 		const wait = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 		const normalizeText = (value) => String(value || '').replace(/\s+/g, ' ').trim();
+		const collectElements = (selector, root = document, seen = new Set()) => {
+			const out = [];
+			const visit = (node) => {
+				if (!node || seen.has(node)) return;
+				seen.add(node);
+				try {
+					if (node.querySelectorAll) {
+						node.querySelectorAll(selector).forEach((el) => out.push(el));
+						node.querySelectorAll('*').forEach((el) => {
+							if (el.shadowRoot) visit(el.shadowRoot);
+						});
+					}
+				} catch (_err) {}
+			};
+			visit(root);
+			return Array.from(new Set(out));
+		};
 		const hashText = (value) => {
 			let hash = 5381;
 			for (const ch of String(value || '')) {
@@ -12356,9 +12478,10 @@ func gopayCDPFlowScript(preferredPIN string) string {
 			result.page_stage = 'gopay_complete';
 			return JSON.stringify(result);
 		}
-		const allInputs = Array.from(document.querySelectorAll('input')).filter((el) => visible(el) && el.type !== 'hidden');
-		const allButtons = Array.from(document.querySelectorAll('button')).filter(visible);
-		const allActionElements = Array.from(document.querySelectorAll('button, [role="button"]')).filter(visible);
+		const inputElements = () => collectElements('input, textarea').filter((el) => visible(el) && el.type !== 'hidden');
+		const actionElements = () => collectElements('button, [role="button"], input[type="button"], input[type="submit"], a').filter(visible);
+		const allInputs = inputElements();
+		const allActionElements = actionElements();
 		const metaText = (el) => normalizeText([
 			el?.type,
 			el?.inputMode,
@@ -12368,7 +12491,9 @@ func gopayCDPFlowScript(preferredPIN string) string {
 			el?.autocomplete,
 			el?.getAttribute?.('aria-label'),
 			el?.getAttribute?.('data-testid'),
-			el?.getAttribute?.('data-test')
+			el?.getAttribute?.('data-test'),
+			Array.from(el?.labels || []).map((label) => label.innerText || label.textContent || '').join(' '),
+			el?.closest?.('label')?.innerText
 		].join(' ')).toLowerCase();
 		const isDisabled = (el) => !!el && (
 			!!el.disabled ||
@@ -12389,6 +12514,10 @@ func gopayCDPFlowScript(preferredPIN string) string {
 			return '';
 		};
 		const setNativeValue = (el, value) => {
+			if (!el) return;
+			try { el.focus(); } catch (_err) {}
+			try { el.dispatchEvent(new FocusEvent('focus', { bubbles: true })); } catch (_err) {}
+			try { el.dispatchEvent(new InputEvent('beforeinput', { bubbles: true, cancelable: true, inputType: 'insertReplacementText', data: String(value || '') })); } catch (_err) {}
 			const proto = el instanceof HTMLInputElement ? HTMLInputElement.prototype : HTMLElement.prototype;
 			const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
 			if (setter) {
@@ -12397,7 +12526,17 @@ func gopayCDPFlowScript(preferredPIN string) string {
 				el.value = value;
 			}
 			el.dispatchEvent(new Event('input', { bubbles: true }));
+			el.dispatchEvent(new KeyboardEvent('keyup', { key: String(value || '').slice(-1) || '0', bubbles: true }));
 			el.dispatchEvent(new Event('change', { bubbles: true }));
+		};
+		const typeDigit = (el, digit) => {
+			if (!el) return;
+			try { el.focus(); } catch (_err) {}
+			try { el.dispatchEvent(new KeyboardEvent('keydown', { key: digit, code: 'Digit' + digit, bubbles: true, cancelable: true })); } catch (_err) {}
+			try { el.dispatchEvent(new KeyboardEvent('keypress', { key: digit, code: 'Digit' + digit, bubbles: true, cancelable: true })); } catch (_err) {}
+			try { el.dispatchEvent(new InputEvent('beforeinput', { bubbles: true, cancelable: true, inputType: 'insertText', data: digit })); } catch (_err) {}
+			setNativeValue(el, digit);
+			try { el.dispatchEvent(new KeyboardEvent('keyup', { key: digit, code: 'Digit' + digit, bubbles: true })); } catch (_err) {}
 		};
 		const clickElement = (el) => {
 			if (!el || isDisabled(el)) return false;
@@ -12465,20 +12604,24 @@ func gopayCDPFlowScript(preferredPIN string) string {
 		});
 		result.has_otp_field = !!otpInput;
 		result.detected_otp = findOtp(pageText) || findOtp(allInputs.map((el) => el.value || '').join(' '));
-		const pinKeyword = (meta) => meta.includes('pin') || meta.includes('passcode') || meta.includes('security code');
+		const pinPageBySignal = urlHost.includes('pin-web-client.gopayapi.com') || lowerText.includes('pin kamu') || lowerText.includes('masukkan pin') || lowerText.includes('masukin pin') || lowerText.includes('enter your pin');
+		const pinKeyword = (meta) => meta.includes('pin') || meta.includes('passcode') || meta.includes('security code') || meta.includes('kode keamanan') || meta.includes('sandi');
 		const otpKeyword = (meta) => meta.includes('otp') || meta.includes('kode') || meta.includes('verification code');
 		const pinInputs = allInputs.filter((el) => {
 			const meta = metaText(el);
-			if (otpKeyword(meta)) return false;
 			if (pinKeyword(meta)) return true;
+			if (otpKeyword(meta)) return false;
 			if (el.type === 'password') return true;
 			if ((el.inputMode || '').toLowerCase() === 'numeric' && Number(el.maxLength || 0) === 1) return true;
+			if ((el.inputMode || '').toLowerCase() === 'numeric' && [4, 6, 8].includes(Number(el.maxLength || 0))) return true;
+			if (pinPageBySignal && /^(tel|number|text|password)?$/i.test(el.type || '') && /numeric|decimal|tel/i.test(el.inputMode || '')) return true;
 			return false;
 		});
 		result.has_pin_field = pinInputs.length > 0;
+		result.pin_input_candidates = pinInputs.map((el) => ({ type: el.type, inputMode: el.inputMode, maxLength: el.maxLength, name: el.name, id: el.id, autocomplete: el.autocomplete })).slice(0, 8);
 
 		const otpPage = urlPath.includes('/linking/otp') || lowerText.includes('otp') || lowerText.includes('verification code');
-		const pinPage = urlHost.includes('pin-web-client.gopayapi.com') || lowerText.includes('pin kamu') || lowerText.includes('masukkan pin') || lowerText.includes('enter your pin');
+		const pinPage = pinPageBySignal;
 		const paymentPath = urlPath.includes('/payment/validate-pin') || urlPath.includes('/payment/pin');
 		const bindingPath = urlPath.includes('/auth/pin/verify') || urlPath.includes('/linking/');
 		const paymentContext = paymentPath || lowerText.includes('payment') || lowerText.includes('bayar') || lowerText.includes('pembayaran') || lowerText.includes('total') || lowerText.includes('subscribe') || lowerText.includes('subscription');
@@ -12547,41 +12690,67 @@ func gopayCDPFlowScript(preferredPIN string) string {
 		const handledKey = 'gopay_cdp_handled_' + result.page_stage + '_' + actionScope + '_' + pinPageSignature;
 		result.already_handled = storageGet(handledKey);
 
-		const singlePinInput = pinInputs.find((el) => Number(el.maxLength || 0) >= 6 || Number(el.maxLength || 0) === 0 || el.type === 'password');
+		const singlePinInput = pinInputs.find((el) => {
+			const maxLength = Number(el.maxLength || 0);
+			return maxLength !== 1 && (maxLength >= 6 || maxLength === 0 || el.type === 'password' || (pinPage && pinInputs.length === 1));
+		});
 		const splitPinInputs = pinInputs.filter((el) => Number(el.maxLength || 0) === 1).slice(0, 6);
+		const digitButtons = () => actionElements().filter((button) => /^[0-9]$/.test(normalizeText(elementLabel(button))));
+		const submitPIN = async (activeInput) => {
+			await wait(300);
+			const actionButton = actionElements().find((button) => {
+				const text = normalizeText(elementLabel(button)).toLowerCase();
+				return text.includes('verify') || text.includes('continue') || text.includes('lanjut') || text.includes('lanjutkan') || text.includes('confirm') || text.includes('konfirmasi') || text.includes('pay') || text.includes('bayar') || text.includes('submit') || text.includes('selesai') || text.includes('oke') || text === 'ok';
+			});
+			if (actionButton && !isDisabled(actionButton)) {
+				clickElement(actionButton);
+				return true;
+			}
+			if (singlePinInput && typeof singlePinInput.form?.requestSubmit === 'function') {
+				try { singlePinInput.form.requestSubmit(); return true; } catch (_err) {}
+			}
+			if (activeInput) {
+				try {
+					activeInput.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', bubbles: true }));
+					activeInput.dispatchEvent(new KeyboardEvent('keyup', { key: 'Enter', code: 'Enter', bubbles: true }));
+					activeInput.dispatchEvent(new Event('change', { bubbles: true }));
+					return true;
+				} catch (_err) {}
+			}
+			return false;
+		};
 		if (!result.auto_action_paused && result.page_stage.startsWith('pin_entry_') && preferredPin && preferredPin.length === 6 && !result.already_handled) {
 			if (singlePinInput) {
 				setNativeValue(singlePinInput, preferredPin);
 				result.pin_auto_filled = true;
 				result.pin_input_strategy = 'single_input';
 			} else if (splitPinInputs.length >= 6) {
-				preferredPin.split('').slice(0, 6).forEach((digit, index) => {
-					setNativeValue(splitPinInputs[index], digit);
-				});
+				for (const [index, digit] of preferredPin.split('').slice(0, 6).entries()) {
+					typeDigit(splitPinInputs[index], digit);
+					await wait(45);
+				}
 				result.pin_auto_filled = true;
 				result.pin_input_strategy = 'split_inputs';
-			}
-			if (result.pin_auto_filled) {
-				const actionButton = allActionElements.find((button) => {
-					const text = normalizeText(button.textContent).toLowerCase();
-					return text.includes('verify') || text.includes('continue') || text.includes('lanjut') || text.includes('lanjutkan') || text.includes('confirm') || text.includes('pay') || text.includes('bayar') || text.includes('submit') || text.includes('selesai') || text.includes('oke');
-				});
-				if (actionButton && !actionButton.disabled) {
-					clickElement(actionButton);
-					result.pin_auto_submitted = true;
-				} else if (singlePinInput && typeof singlePinInput.form?.requestSubmit === 'function') {
-					try { singlePinInput.form.requestSubmit(); result.pin_auto_submitted = true; } catch (_err) {}
-				} else {
-					const activeInput = splitPinInputs.length >= 6 ? splitPinInputs[splitPinInputs.length - 1] : singlePinInput;
-					if (activeInput) {
-						try {
-							activeInput.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', bubbles: true }));
-							activeInput.dispatchEvent(new KeyboardEvent('keyup', { key: 'Enter', code: 'Enter', bubbles: true }));
-							activeInput.dispatchEvent(new Event('change', { bubbles: true }));
-							result.pin_auto_submitted = true;
-						} catch (_err) {}
+			} else {
+				const keypad = digitButtons();
+				if (keypad.length >= 10 || preferredPin.split('').every((digit) => keypad.some((button) => normalizeText(elementLabel(button)) === digit))) {
+					for (const digit of preferredPin.split('').slice(0, 6)) {
+						const button = digitButtons().find((item) => normalizeText(elementLabel(item)) === digit);
+						if (!button || !clickElement(button)) {
+							result.pin_keypad_missing_digit = digit;
+							break;
+						}
+						await wait(80);
+					}
+					if (!result.pin_keypad_missing_digit) {
+						result.pin_auto_filled = true;
+						result.pin_input_strategy = 'virtual_keypad';
 					}
 				}
+			}
+			if (result.pin_auto_filled) {
+				const activeInput = splitPinInputs.length >= 6 ? splitPinInputs[splitPinInputs.length - 1] : singlePinInput;
+				result.pin_auto_submitted = await submitPIN(activeInput);
 				if (result.pin_auto_submitted) {
 					storageSet(handledKey);
 				}
@@ -13385,9 +13554,7 @@ func handleGopayFullLink(w http.ResponseWriter, r *http.Request) {
 	}
 	challengeID := gopayOTPChallengeID(otpR)
 	addStage("otp-enum", map[string]any{"ok": true, "otp": vOTP, "challenge_id": challengeID})
-	sandboxPINs := []string{"123456", "111111", "000000", "654321", "145236"}
-	pinCands := make([]string, 0, len(sandboxPINs)+1)
-	pinCands = append(pinCands, sandboxPINs...)
+	pinCands := gopayLinkingPINCandidates(req.PIN)
 	var vPIN string
 	pinOk := false
 	pinT := ""
@@ -13577,6 +13744,22 @@ func handleCheckoutResolveTarget(w http.ResponseWriter, r *http.Request) {
 	}
 	target, currentURL, err := resolveCheckoutPageTarget(targets, req.OpenedURL)
 	if err != nil {
+		if fallbackTarget, fallbackURL := resolveLatestCheckoutRuntimeTarget(targets); fallbackTarget != nil {
+			writeJSON(w, http.StatusOK, map[string]any{
+				"ok":             true,
+				"opened_url":     req.OpenedURL,
+				"current_url":    fallbackURL,
+				"fallback":       true,
+				"fallback_error": err.Error(),
+				"candidate_urls": checkoutResolveCandidateURLs(targets),
+				"target": map[string]any{
+					"id":   fallbackTarget.ID,
+					"type": fallbackTarget.Type,
+					"url":  fallbackTarget.URL,
+				},
+			})
+			return
+		}
 		writeJSON(w, http.StatusOK, map[string]any{
 			"ok":             false,
 			"error":          err.Error(),

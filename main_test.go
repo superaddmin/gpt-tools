@@ -684,6 +684,7 @@ func TestLoginCodeFillAutoCompletesChineseProfilePage(t *testing.T) {
 		"profile_filled",
 		"profile_age",
 		"profile_name",
+		"checkout page detected after login",
 	} {
 		if !strings.Contains(script, want) {
 			t.Fatalf("login code fill flow missing %q", want)
@@ -691,6 +692,20 @@ func TestLoginCodeFillAutoCompletesChineseProfilePage(t *testing.T) {
 	}
 	if strings.Contains(script, "href.includes('chatgpt.com') && !href.includes('auth.openai.com') && !href.includes('verification');") {
 		t.Fatal("completion probe should not treat any chatgpt.com page as completed")
+	}
+}
+
+func TestResolveLatestCheckoutRuntimeTargetFallsBackToCheckoutPage(t *testing.T) {
+	targets := []cdpTarget{
+		{ID: "old", Type: "page", URL: "https://chatgpt.com/"},
+		{ID: "checkout", Type: "page", URL: "https://chatgpt.com/checkout/openai_llc/cs_live_runtime_123"},
+	}
+	target, currentURL := resolveLatestCheckoutRuntimeTarget(targets)
+	if target == nil || target.ID != "checkout" {
+		t.Fatalf("target = %#v, want checkout target", target)
+	}
+	if currentURL != "https://chatgpt.com/checkout/openai_llc/cs_live_runtime_123" {
+		t.Fatalf("currentURL = %q", currentURL)
 	}
 }
 
@@ -2298,6 +2313,45 @@ func TestGopayPaymentPINCandidatesPreferRequestedPIN(t *testing.T) {
 	}
 	if count != 1 {
 		t.Fatalf("candidate 654321 appears %d times, want 1", count)
+	}
+}
+
+func TestGopayLinkingPINCandidatesPreferRequestedPIN(t *testing.T) {
+	got := gopayLinkingPINCandidates("987654")
+	if len(got) == 0 {
+		t.Fatal("gopayLinkingPINCandidates returned empty slice")
+	}
+	if got[0] != "987654" {
+		t.Fatalf("first candidate = %q, want 987654", got[0])
+	}
+	for _, item := range got {
+		if item == "123456" {
+			return
+		}
+	}
+	t.Fatalf("default candidate 123456 missing from %#v", got)
+}
+
+func TestGopayCDPTargetScopeScorePrefersCurrentTargetAndAccount(t *testing.T) {
+	scope := normalizeGopayCDPTargetScope(gopayCDPTargetScope{
+		TargetID:  "target-current",
+		TargetURL: "https://app.midtrans.com/snap/v4/redirection/account-current#/gopay-tokenization/linking",
+	})
+	current := cdpTarget{
+		ID:   "target-current",
+		Type: "page",
+		URL:  "https://pin-web-client.gopayapi.com/payment/validate-pin",
+	}
+	other := cdpTarget{
+		ID:   "target-other",
+		Type: "page",
+		URL:  "https://app.midtrans.com/snap/v4/redirection/account-other#/gopay-tokenization/linking",
+	}
+	if got, want := gopayCDPTargetScopeScore(current, scope), gopayCDPTargetScopeScore(other, scope); got <= want {
+		t.Fatalf("current target scope score = %d, other = %d; want current higher", got, want)
+	}
+	if scope.AccountID != "account-current" {
+		t.Fatalf("normalized account id = %q, want account-current", scope.AccountID)
 	}
 }
 

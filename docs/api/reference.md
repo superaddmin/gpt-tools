@@ -395,27 +395,39 @@
 
 ### `POST /api/gopay/cdp-otp`
 
-通过 CDP 在 GoPay/Midtrans 页面内检测或填入 OTP。
+通过 CDP 在 GoPay/Midtrans 页面内观测 OTP/PIN 页面，并在 PIN 页面使用已知 PIN 自动填入。
 
 请求体：
 
 ```json
 {
-  "otp": "111111"
+  "otp": "111111",
+  "pin": "123456",
+  "target_id": "CDP target id，可选",
+  "target_url": "https://app.midtrans.com/snap/v4/redirection/account-id#/gopay-tokenization/linking",
+  "account_id": "account-id",
+  "checkout_url": "https://pay.openai.com/c/pay/cs_..."
 }
 ```
+
+`target_id`、`target_url`、`account_id`、`checkout_url` 均为可选上下文。自动触发链路会把 `/api/gopay/midtrans-linking-fill` 返回的 `cdp_target_id` 带回来，使 PIN 自动输入优先绑定到同一浏览器标签页。
 
 成功响应：
 
 ```json
 {
   "ok": true,
+  "stage": "pin_entry_payment",
+  "selected_target_id": "CDP target id",
+  "selected_target_url": "https://...",
+  "pin_stage": "payment",
+  "pin_auto_filled": true,
+  "pin_auto_submitted": true,
+  "pin_input_strategy": "single_input",
   "result": {
-    "hasOTPField": true,
+    "has_otp_field": false,
+    "has_pin_field": true,
     "detected_otp": "",
-    "used_otp": "111111",
-    "auto_filled": true,
-    "auto_submitted": false,
     "url": "https://...",
     "page_text_snippet": "..."
   }
@@ -640,6 +652,8 @@
   "ok": true,
   "stage": "midtrans_linking_submitted",
   "account_id": "account-id",
+  "cdp_target_id": "CDP target id",
+  "cdp_target_url": "https://...",
   "target_url": "https://...",
   "checkout_url": "https://...",
   "country_code": "86",

@@ -1496,10 +1496,17 @@ function renderGopayStageResults(stages) {
   }
 }
 
-function startGopayOTPAutoCapture() {
+function startGopayOTPAutoCapture(options) {
   if (typeof stopGopayOTPAutoCapture === "function") {
     stopGopayOTPAutoCapture();
   }
+  options = options || {};
+  var captureContext = {
+    target_id: (options.target_id || options.targetID || "").trim(),
+    target_url: (options.target_url || options.targetURL || "").trim(),
+    account_id: (options.account_id || options.accountID || "").trim(),
+    checkout_url: (options.checkout_url || options.checkoutURL || "").trim(),
+  };
   var stop = false;
   var attempts = 0;
   var maxAttempts = 120;
@@ -1511,13 +1518,17 @@ function startGopayOTPAutoCapture() {
     attempts++;
 
     try {
+      var payload = {
+        otp: (gopayOTPInput?.value || "").trim(),
+        pin: (gopayPINCodeInput?.value || "").trim(),
+      };
+      Object.keys(captureContext).forEach(function (key) {
+        if (captureContext[key]) payload[key] = captureContext[key];
+      });
       var resp = await fetch("/api/gopay/cdp-otp", {
         method: "POST",
         headers: buildRequestHeaders(),
-        body: JSON.stringify({
-          otp: (gopayOTPInput?.value || "").trim(),
-          pin: (gopayPINCodeInput?.value || "").trim(),
-        }),
+        body: JSON.stringify(payload),
       });
       var data = await resp.json();
       var result = data.result || {};
@@ -1643,12 +1654,19 @@ function checkoutAutoTriggerKey(rawURL) {
   if (!value) return "";
   try {
     var parsed = new URL(value);
-    if (parsed.hostname.toLowerCase() !== "pay.openai.com") return "";
-    if (!parsed.pathname.startsWith("/c/pay/cs_")) return "";
-    return parsed.protocol + "//" + parsed.host + parsed.pathname;
+    var host = parsed.hostname.toLowerCase();
+    var path = parsed.pathname;
+    var match = path.match(/\/(?:c\/pay|pay|checkout\/openai_llc)\/(cs_[^/?#]+)/i);
+    if (!match) return "";
+    if (host !== "pay.openai.com" && host !== "checkout.stripe.com" && host !== "chatgpt.com") return "";
+    return match[1];
   } catch (_err) {
     return "";
   }
+}
+
+function checkoutURLIsManagedCheckout(currentURL) {
+  return !!checkoutAutoTriggerKey(currentURL);
 }
 
 function checkoutAutoFillProbeText(data) {
@@ -1672,8 +1690,9 @@ function checkoutURLIndicatesSubmitted(currentURL, checkoutKey) {
     if (host.includes("midtrans") || host.includes("gopay")) return true;
     if (path.includes("/checkout/verify") || path.includes("/snap/") || path.includes("/redirection/")) return true;
     var currentKey = checkoutAutoTriggerKey(value);
-    if (checkoutKey && currentKey && currentKey !== checkoutKey) return true;
-    if (checkoutKey && !currentKey && host !== "pay.openai.com") return true;
+    if (checkoutKey && currentKey) return currentKey !== checkoutKey;
+    if (checkoutURLIsManagedCheckout(value)) return false;
+    if (checkoutKey && !currentKey && host !== "pay.openai.com" && host !== "checkout.stripe.com" && host !== "chatgpt.com") return true;
     return false;
   } catch (_err) {
     var lower = value.toLowerCase();
@@ -1908,7 +1927,12 @@ function startCheckoutSubmitWatcher(autoFillData) {
                   monitorBadge.textContent = "已提交绑定";
                   monitorBadge.className = "badge";
                 }
-                startGopayOTPAutoCapture();
+                startGopayOTPAutoCapture({
+                  target_id: fillResult.cdp_target_id || "",
+                  target_url: fillResult.cdp_target_url || fillResult.target_url || linkingURL,
+                  account_id: fillResult.account_id || midtransRedirectionAccountID(linkingURL),
+                  checkout_url: checkoutURL,
+                });
                 finishWatcher();
                 return;
               } else {
@@ -2011,7 +2035,7 @@ async function runGopayFullLinkPayment(options) {
 
     setText(gopayLinkBtn, "创建新链路中...");
     setGopayStep("linking", "active", "正在提取最新 Session 并生成新的 Plus 结账链路...");
-    startGopayOTPAutoCapture();
+    startGopayOTPAutoCapture({ checkout_url: latestOpenedCheckoutURL || "" });
 
     var payload = {
       access_token: accessToken,
@@ -2182,6 +2206,19 @@ const luckmailMailsList = document.querySelector("#luckmailMailsList");
 let latestLuckMailCode = "";
 let luckMailVerificationSinceUnixMS = 0;
 let lastVoicePromptKey = "";
+const luckmailVoicePromptStorageKey = "luckmail_voice_prompt_enabled";
+
+function restoreLuckMailVoicePromptPreference() {
+  if (!luckmailVoicePromptToggle) return;
+  try {
+    luckmailVoicePromptToggle.checked = window.localStorage?.getItem(luckmailVoicePromptStorageKey) === "1";
+  } catch (_err) {
+    luckmailVoicePromptToggle.checked = false;
+  }
+  if (luckmailVoicePromptText) {
+    setText(luckmailVoicePromptText, luckmailVoicePromptToggle.checked ? "语音播报已开启" : "未开启");
+  }
+}
 
 function voicePromptEnabled() {
   return !!(luckmailVoicePromptToggle && luckmailVoicePromptToggle.checked && "speechSynthesis" in window);
@@ -2203,6 +2240,9 @@ function announceLuckMailScene(key, message, force) {
 }
 
 luckmailVoicePromptToggle?.addEventListener("change", function () {
+  try {
+    window.localStorage?.setItem(luckmailVoicePromptStorageKey, luckmailVoicePromptToggle.checked ? "1" : "0");
+  } catch (_err) {}
   if (luckmailVoicePromptToggle.checked) {
     announceLuckMailScene("voice_enabled", "语音播报已开启", true);
   } else {
@@ -2211,6 +2251,8 @@ luckmailVoicePromptToggle?.addEventListener("change", function () {
     if (luckmailVoicePromptText) setText(luckmailVoicePromptText, "未开启");
   }
 });
+
+restoreLuckMailVoicePromptPreference();
 
 luckmailToken?.addEventListener("input", function () {
   if (hasLuckMailToken()) {
