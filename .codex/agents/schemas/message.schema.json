@@ -1,0 +1,79 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://checkout-workbench.local/.codex/agents/schemas/message.schema.json",
+  "title": "Checkout Workbench Agent Message",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "task_id",
+    "from_role",
+    "to_role",
+    "message_type",
+    "priority",
+    "context_refs",
+    "payload",
+    "requested_action",
+    "deadline_or_gate"
+  ],
+  "properties": {
+    "task_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "from_role": {
+      "$ref": "#/$defs/roleId"
+    },
+    "to_role": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/roleId"
+        },
+        {
+          "const": "all"
+        }
+      ]
+    },
+    "message_type": {
+      "enum": [
+        "brief",
+        "finding",
+        "proposal",
+        "decision",
+        "handoff",
+        "blocker",
+        "verification"
+      ]
+    },
+    "priority": {
+      "enum": ["P0", "P1", "P2", "P3", "P4"]
+    },
+    "context_refs": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      },
+      "default": []
+    },
+    "payload": {
+      "type": "object",
+      "additionalProperties": true
+    },
+    "requested_action": {
+      "type": "string"
+    },
+    "deadline_or_gate": {
+      "type": "string"
+    }
+  },
+  "$defs": {
+    "roleId": {
+      "enum": [
+        "automation-architect",
+        "backend-cdp-engineer",
+        "frontend-workflow-ux",
+        "operations-user-representative"
+      ]
+    }
+  }
+}

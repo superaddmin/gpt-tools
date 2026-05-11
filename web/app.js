@@ -15,7 +15,9 @@ const copyCheckoutLinkButton = document.querySelector("#copyCheckoutLinkButton")
 const openInIncognitoBtn = document.querySelector("#openInIncognitoBtn");
 const openIncognitoBtn = document.querySelector("#openIncognitoBtn");
 const fetchSessionBtn = document.querySelector("#fetchSessionBtn");
+const openPaymentShortcutBtn = document.querySelector("#openPaymentShortcutBtn");
 const exportSub2APIBtn = document.querySelector("#exportSub2APIBtn");
+const closeIncognitoBtn = document.querySelector("#closeIncognitoBtn");
 const incognitoDiagBadge = document.querySelector("#incognitoDiagBadge");
 const incognitoDiagCDP = document.querySelector("#incognitoDiagCDP");
 const incognitoDiagTargets = document.querySelector("#incognitoDiagTargets");
@@ -50,14 +52,37 @@ const wechatGroupModalCloseBtn = document.querySelector("#wechatGroupModalCloseB
 
 let latestCheckoutURL = "";
 let latestOpenedCheckoutURL = "";
+let latestOpenedCheckoutTargetID = "";
 let activePaymentLabel = "Popay";
 let incognitoWindowOpened = false;
 let loginClickReady = false;
+let autoFetchAndGenerateRunning = false;
+let activeAutomationTraceID = "";
+let plusSubscribeWatcherTimer = null;
+let plusSubscribeWatcherExpiresAt = 0;
+let plusSubscribeProbeInFlight = false;
+let plusSubscribeAutoTriggeredSignature = "";
+let plusSubscribeAutoTriggerLastAttemptAt = 0;
+let plusSubscribeWatcherReason = "watch";
+let plusSubscribeProbeConsecutiveMisses = 0;
+let plusSubscribeProbeLastSignature = "";
 const clientPerfState = {
   longTasks: [],
   slowInteractions: [],
   errors: [],
 };
+
+function createAutomationTraceID(prefix) {
+  var safePrefix = String(prefix || "flow").replace(/[^a-z0-9_-]+/gi, "").toLowerCase() || "flow";
+  return safePrefix + "-" + Date.now().toString(36) + "-" + Math.random().toString(36).slice(2, 8);
+}
+
+function ensureAutomationTraceID(prefix) {
+  if (!activeAutomationTraceID) {
+    activeAutomationTraceID = createAutomationTraceID(prefix);
+  }
+  return activeAutomationTraceID;
+}
 
 function safePerfURL(rawURL) {
   try {
@@ -213,6 +238,110 @@ function setText(node, value) {
   }
 }
 
+const workflowVoiceSteps = {
+  openIncognitoBtn: { order: 1, label: "打开无痕窗口" },
+  luckmailDeviceLoginGuideBtn: { order: 2, label: "设备登录引导" },
+  fetchSessionBtn: { order: 3, label: "获取 Session JSON" },
+  autoFillCheckoutBtn: { order: 4, label: "自动填地址" },
+  openPaymentShortcutBtn: { order: 5, label: "打开支付页" },
+  gopayLinkBtn: { order: 6, label: "GoPay 绑定" },
+  luckmailTokenCodeBtn: { order: 7, label: "LuckMail 接码" },
+  browserUseRunBtn: { order: 8, label: "Browser Use 分析" },
+  exportSub2APIBtn: { order: 9, label: "导出 sub2api 凭证" },
+  closeIncognitoBtn: { order: 10, label: "关闭窗口" },
+};
+
+const workflowVoiceStateMessages = {
+  running: "开始执行",
+  done: "已完成",
+  error: "执行失败",
+};
+
+const workflowVoiceStepMessages = {
+  openIncognitoBtn: {
+    running: "第一步，正在打开无痕窗口。",
+    done: "第一步完成，无痕窗口已打开。下一步进行设备登录引导。",
+    error: "第一步失败，无痕窗口没有成功打开，请检查 Chrome 或本地 CDP 服务。",
+  },
+  luckmailDeviceLoginGuideBtn: {
+    running: "第二步，正在执行设备登录引导，系统会准备邮箱并打开登录页面。",
+    done: "第二步完成，设备登录引导已结束。下一步获取 Session JSON。",
+    error: "第二步失败，设备登录引导没有完成，请查看 LuckMail 状态信息。",
+  },
+  fetchSessionBtn: {
+    running: "第三步，正在获取 Session JSON。",
+    done: "第三步完成，Session JSON 已获取。下一步自动填地址。",
+    error: "第三步失败，Session JSON 获取失败，请确认无痕窗口已登录。",
+  },
+  autoFillCheckoutBtn: {
+    running: "第四步，正在自动填写地址和结账信息。",
+    done: "第四步完成，地址信息已填写。下一步打开支付页。",
+    error: "第四步失败，自动填写地址没有完成，请检查页面状态。",
+  },
+  openPaymentShortcutBtn: {
+    running: "第五步，正在打开支付页并优先选择 GoPay。",
+    done: "第五步完成，支付页已打开。下一步执行 GoPay 绑定。",
+    error: "第五步失败，支付页没有成功打开，请重新生成支付链接。",
+  },
+  gopayLinkBtn: {
+    running: "第六步，正在执行 GoPay 绑定和支付辅助。",
+    done: "第六步完成，GoPay 流程已完成。",
+    error: "第六步失败，GoPay 流程出现异常，请查看 GoPay 实时状态。",
+  },
+  luckmailTokenCodeBtn: {
+    running: "第七步，正在通过 LuckMail 接收验证码。",
+    done: "第七步完成，LuckMail 验证码已处理。",
+    error: "第七步失败，LuckMail 未能完成接码，请检查 Token 或邮箱状态。",
+  },
+  browserUseRunBtn: {
+    running: "第八步，正在执行 Browser Use 分析。",
+    done: "第八步完成，Browser Use 分析已结束。",
+    error: "第八步失败，Browser Use 分析没有完成，请查看分析输出。",
+  },
+  exportSub2APIBtn: {
+    running: "第九步，正在导出 sub2api 凭证。",
+    done: "第九步完成，sub2api 凭证已导出。",
+    error: "第九步失败，sub2api 凭证导出失败，请检查登录状态。",
+  },
+  closeIncognitoBtn: {
+    running: "第十步，正在关闭无痕窗口。",
+    done: "第十步完成，无痕窗口已关闭，当前流程收尾完成。",
+    error: "第十步失败，无痕窗口没有关闭，请稍后重试或手动关闭。",
+  },
+};
+
+function announceWorkflowButtonState(button, state) {
+  var step = workflowVoiceSteps[button?.id || ""];
+  var stateText = workflowVoiceStateMessages[state || ""];
+  if (!step || !stateText) return;
+  if (button.dataset.voiceState === state) return;
+  button.dataset.voiceState = state;
+  try {
+    if (typeof voicePromptEnabled !== "function" || !voicePromptEnabled()) return;
+  } catch (_err) {
+    return;
+  }
+  if (typeof announceLuckMailScene !== "function") return;
+  var message = workflowVoiceStepMessages[button.id]?.[state] || ("推荐流程第 " + step.order + " 步，" + step.label + "，" + stateText);
+  announceLuckMailScene("workflow_" + button.id + "_" + state, message, true);
+}
+
+function setWorkflowButtonState(button, state) {
+  if (!button) return;
+  var nextState = state || "idle";
+  if (nextState === "idle") {
+    delete button.dataset.flowState;
+    delete button.dataset.voiceState;
+    button.removeAttribute("aria-busy");
+    return;
+  }
+  button.dataset.flowState = nextState;
+  button.setAttribute("aria-busy", nextState === "running" ? "true" : "false");
+  announceWorkflowButtonState(button, nextState);
+}
+
+window.setWorkflowButtonState = setWorkflowButtonState;
+
 function setWechatGroupCollapsed(collapsed) {
   if (!wechatGroupCard || !wechatGroupToggleBtn) {
     return;
@@ -280,7 +409,7 @@ function bindWechatGroupCard() {
   });
 }
 
-function extractAccessToken(rawValue) {
+function extractSessionAccessToken(rawValue) {
   const value = (rawValue || "").trim();
   if (!value) {
     return "";
@@ -306,6 +435,18 @@ function extractAccessToken(rawValue) {
         }
       }
     }
+  }
+  return "";
+}
+
+function extractAccessToken(rawValue) {
+  const value = (rawValue || "").trim();
+  if (!value) {
+    return "";
+  }
+  const token = extractSessionAccessToken(value);
+  if (token) {
+    return token;
   }
   return value;
 }
@@ -403,6 +544,7 @@ async function exportSub2APICredentials() {
   if (!window.confirm("即将导出 sub2api 登录凭证 JSON。该文件包含可用登录凭证，请只在本人账号和本机环境使用，并妥善保存。是否继续？")) return;
   var originalText = exportSub2APIBtn.textContent;
   exportSub2APIBtn.disabled = true;
+  setWorkflowButtonState(exportSub2APIBtn, "running");
   if (fetchSessionBtn) fetchSessionBtn.disabled = true;
   setText(exportSub2APIBtn, "读取 Session...");
   try {
@@ -414,9 +556,11 @@ async function exportSub2APICredentials() {
     }
     downloadJSONFile(result.filename, result.payload);
     if (monitorBadge) { monitorBadge.textContent = "凭证已导出"; monitorBadge.className = "badge"; }
+    setWorkflowButtonState(exportSub2APIBtn, "done");
     showAutoFillNotice("sub2api 凭证已导出", "成功", "已按参考文件格式生成 JSON 下载文件。" + (result.missing.length ? " 未获取字段：" + result.missing.join(", ") : ""), "请妥善保存该文件，不要上传到公开仓库或聊天窗口。", "");
   } catch (error) {
     if (monitorBadge) { monitorBadge.textContent = "导出失败"; monitorBadge.className = "badge error"; }
+    setWorkflowButtonState(exportSub2APIBtn, "error");
     showAutoFillNotice("sub2api 导出失败", "错误", error.message || "导出 sub2api 凭证失败", "请确认无痕窗口已登录 ChatGPT 后重试。", "error");
   } finally {
     sessionMonitorAbortController = null;
@@ -473,6 +617,7 @@ function buildStartPayload(options) {
       user_agent: fields.checkoutUserAgent.value.trim(),
     },
     customer_email: fields.customerEmail.value.trim(),
+    trace_id: ensureAutomationTraceID("checkout"),
   };
 }
 
@@ -486,6 +631,23 @@ function buildRequestHeaders(extraHeaders) {
     Object.assign(headers, extraHeaders);
   }
   return headers;
+}
+
+async function fetchJSONWithTimeout(url, options, timeoutMS) {
+  var controller = new AbortController();
+  var timer = window.setTimeout(function () { controller.abort(); }, timeoutMS || 30000);
+  try {
+    var response = await fetch(url, Object.assign({}, options || {}, { signal: controller.signal }));
+    var data = await response.json();
+    return { response: response, data: data };
+  } catch (error) {
+    if (error?.name === "AbortError") {
+      throw new Error("请求超时，请检查本机服务或 LuckMail 网络连接");
+    }
+    throw error;
+  } finally {
+    window.clearTimeout(timer);
+  }
 }
 
 async function postJSON(url, payload) {
@@ -549,6 +711,7 @@ async function openIncognito(url, newWindow) {
     if (response.ok && data.ok) {
       incognitoWindowOpened = true;
       loginClickReady = false;
+      startPlusSubscribeSessionTriggerWatcher("incognito_opened");
       return true;
     }
     console.error("incognito open failed:", data);
@@ -556,6 +719,44 @@ async function openIncognito(url, newWindow) {
   } catch (error) {
     console.error("incognito open error:", error);
     return false;
+  }
+}
+
+async function closeIncognitoWindow() {
+  if (!closeIncognitoBtn) return;
+  if (luckMailCodePollingActive) {
+    setWorkflowButtonState(closeIncognitoBtn, "error");
+    showAutoFillNotice("正在等待验证码", "请稍等", "LuckMail 正在等待验证码邮件返回，暂时不要关闭无痕窗口或刷新页面。", "等待完成后再关闭窗口。", "warning");
+    announceLuckMailScene("close_blocked_during_code_polling", "正在等待验证码，请先不要关闭窗口");
+    return false;
+  }
+  var originalText = closeIncognitoBtn.textContent || "关闭窗口";
+  closeIncognitoBtn.disabled = true;
+  setWorkflowButtonState(closeIncognitoBtn, "running");
+  setText(closeIncognitoBtn, "关闭中...");
+  try {
+    const response = await fetch("/api/incognito/close", {
+      method: "POST",
+      headers: buildRequestHeaders(),
+    });
+    const data = await response.json();
+    if (!response.ok || !data.ok) {
+      throw new Error(data.error || "关闭无痕窗口失败");
+    }
+    incognitoWindowOpened = false;
+    loginClickReady = false;
+    latestOpenedCheckoutURL = "";
+    stopPlusSubscribeSessionTriggerWatcher();
+    setWorkflowButtonState(closeIncognitoBtn, "done");
+    showAutoFillNotice("无痕窗口已关闭", "完成", data.stage === "incognito_close_no_targets" ? "没有发现需要关闭的无痕页面，流程已完成收尾。" : "已关闭本工具管理的无痕窗口/支付页面。", "", "success");
+    return true;
+  } catch (error) {
+    setWorkflowButtonState(closeIncognitoBtn, "error");
+    showAutoFillNotice("关闭窗口失败", "错误", error.message || "关闭无痕窗口失败", "可手动关闭 Chrome 无痕窗口后继续。", "error");
+    return false;
+  } finally {
+    closeIncognitoBtn.disabled = false;
+    setText(closeIncognitoBtn, originalText);
   }
 }
 
@@ -653,17 +854,21 @@ async function runLoginClickAfterIncognitoOpen(options) {
     var alreadyLoggedIn = data.stage === "already_logged_in";
     loginClickReady = !!(response.ok && data.ok && (data.email_input_ready || data.email_mode_switched || data.login_surface_ready || alreadyLoggedIn));
     var targetSwitching = data.stage && String(data.stage).includes("target_switching");
+    var popupNotOpened = data.stage === "login_popup_not_opened" || !!data.login_popup_not_opened;
+    var emailWatchFallback = targetSwitching || popupNotOpened || !!data.clicked_login;
     if (luckmailBadge) {
-      setText(luckmailBadge, alreadyLoggedIn ? "已登录" : (loginClickReady ? "登录窗已开" : (targetSwitching ? "页面跳转中" : "点击失败")));
-      luckmailBadge.className = loginClickReady || targetSwitching ? "badge neutral" : "badge error";
+      setText(luckmailBadge, alreadyLoggedIn ? "已登录" : (loginClickReady ? "登录窗已开" : (emailWatchFallback ? "继续监控" : "点击失败")));
+      luckmailBadge.className = loginClickReady || emailWatchFallback ? "badge neutral" : "badge error";
     }
-    setText(luckmailMailMeta, alreadyLoggedIn ? "检测到当前无痕页已处于登录状态，无需再点登录按钮，可直接进入 Session 读取或后续流程。" : (loginClickReady ? (data.email_mode_switched ? "已点击使用电子邮箱继续，登录/注册邮箱窗口已出现。" : (data.login_surface_ready && !data.email_input_ready ? "登录/注册窗口已出现，正在进入邮箱填入步骤。" : "已点击登录按钮，登录/注册邮箱窗口已出现。")) : (targetSwitching ? "登录页面正在跳转或切换目标页，系统会自动重试。" : (data.error || "未检测到登录/注册邮箱窗口。"))));
+    setText(luckmailMailMeta, alreadyLoggedIn ? "检测到当前无痕页已处于登录状态，无需再点登录按钮，可直接进入 Session 读取或后续流程。" : (loginClickReady ? (data.email_mode_switched ? "已点击使用电子邮箱继续，登录/注册邮箱窗口已出现。" : (data.login_surface_ready && !data.email_input_ready ? "登录/注册窗口已出现，正在进入邮箱填入步骤。" : "已点击登录按钮，登录/注册邮箱窗口已出现。")) : (targetSwitching ? "登录页面正在跳转或切换目标页，后续邮箱填入会继续监控。" : (popupNotOpened ? "登录弹窗未立即出现，已停留在当前页面；后续邮箱填入会持续监控，弹窗出现后自动填写邮箱。" : (data.error || "未检测到登录/注册邮箱窗口。")))));
     if (alreadyLoggedIn) {
       announceLuckMailScene("already_logged_in", "检测到当前页面已登录，无需再点登录按钮");
     } else if (loginClickReady) {
       announceLuckMailScene("login_window_ready", data.email_mode_switched ? "已切换为电子邮箱登录，邮箱输入窗口已出现" : "登录窗口已出现，可以填写邮箱");
     } else if (targetSwitching) {
-      announceLuckMailScene("login_target_switching", "登录页面正在跳转，系统正在重试识别");
+      announceLuckMailScene("login_target_switching", "登录页面正在跳转，后续邮箱填入会继续监控");
+    } else if (popupNotOpened) {
+      announceLuckMailScene("login_popup_not_opened", "登录弹窗未立即出现，系统会继续监控并在弹窗出现后填写邮箱");
     } else {
       announceLuckMailScene("login_click_failed", data.error || "未检测到登录窗口，需要检查无痕页面");
     }
@@ -839,11 +1044,22 @@ async function fetchLatestSessionJSON(options) {
     renderSessionConclusion(diagnostics.conclusion);
   }
 
-  if (resultJSON) {
+  const sessionAccessToken = extractSessionAccessToken(resultJSON);
+  const sessionReady = diagnostics?.has_access_token || diagnostics?.conclusion?.status === "session_ready";
+  if (resultJSON && (sessionReady || sessionAccessToken)) {
     fields.token.value = resultJSON;
     if (sessionText) setText(sessionText, "已提取 Session JSON");
     if (monitorBadge) { monitorBadge.textContent = "Session 已获取"; monitorBadge.className = "badge"; }
     return resultJSON;
+  }
+
+  if (resultJSON && !sessionAccessToken) {
+    appendMonitorEvent({
+      domain: "Error",
+      method: "session-missing-access-token",
+      summary: diagnostics?.conclusion?.message || "Session 响应没有 accessToken，本次不作为成功结果",
+      ts: Date.now(),
+    });
   }
 
   if (diagnostics?.conclusion && allowRecovery) {
@@ -854,7 +1070,7 @@ async function fetchLatestSessionJSON(options) {
   }
 
   if (monitorBadge) { monitorBadge.textContent = "Session 失败"; monitorBadge.className = "badge error"; }
-  throw new Error(finalError || diagnostics?.session_preview || "获取 Session JSON 失败，请确认已在无痕窗口中登录 ChatGPT");
+  throw new Error(finalError || diagnostics?.conclusion?.message || diagnostics?.session_preview || "获取 Session JSON 失败，请确认已在无痕窗口中登录 ChatGPT");
 }
 
 function renderSessionConclusion(conclusion) {
@@ -896,6 +1112,48 @@ function showAutoFillNotice(title, badge, message, hint, kind) {
   }
 }
 
+async function resolveOpenedCheckoutTarget(openedURL, options) {
+  options = options || {};
+  var deadline = Date.now() + (options.timeoutMS || 5000);
+  var delayMS = options.initialDelayMS || 0;
+  var lastData = null;
+  var traceID = ensureAutomationTraceID("checkout");
+  var openedCheckoutKey = typeof checkoutAutoTriggerKey === "function" ? checkoutAutoTriggerKey(openedURL) : "";
+
+  while (Date.now() <= deadline) {
+    if (delayMS > 0) {
+      await new Promise(function (r) { setTimeout(r, delayMS); });
+    }
+    try {
+      const resp = await fetch("/api/checkout/resolve-target", {
+        method: "POST",
+        headers: buildRequestHeaders(),
+        body: JSON.stringify({
+          opened_url: openedURL,
+          target_id: latestOpenedCheckoutTargetID,
+          trace_id: traceID,
+        }),
+      });
+      const data = await resp.json();
+      lastData = data;
+      if (resp.ok && data.ok) {
+        var currentURL = data.current_url || data.target?.url || "";
+        var currentCheckoutKey = typeof checkoutAutoTriggerKey === "function" ? checkoutAutoTriggerKey(currentURL) : "";
+        var acceptsResolvedTarget = !data.fallback || !openedCheckoutKey || currentCheckoutKey === openedCheckoutKey;
+        if (acceptsResolvedTarget) {
+          if (data.current_url) latestOpenedCheckoutURL = data.current_url;
+          if (data.target?.id || data.target_id) latestOpenedCheckoutTargetID = data.target?.id || data.target_id;
+          return data;
+        }
+      }
+    } catch (error) {
+      console.debug("resolve checkout target retry:", error);
+    }
+    delayMS = Math.min(delayMS > 0 ? delayMS * 2 : 250, 500);
+  }
+  return lastData;
+}
+
 /**
  * 在已有的无痕窗口中打开指定 URL（不创建新窗口）
  * @param {string} url - 要打开的 URL
@@ -911,16 +1169,12 @@ async function openInSameIncognito(url) {
     return false;
   }
   latestOpenedCheckoutURL = url;
+  latestOpenedCheckoutTargetID = "";
   try {
-    await new Promise(function (r) { setTimeout(r, 1800); });
-    const resp = await fetch("/api/checkout/resolve-target", {
-      method: "POST",
-      headers: buildRequestHeaders(),
-      body: JSON.stringify({ opened_url: url }),
-    });
-    const data = await resp.json();
-    if (resp.ok && data.ok && data.current_url) {
-      latestOpenedCheckoutURL = data.current_url;
+    const data = await resolveOpenedCheckoutTarget(url, { timeoutMS: 5000, initialDelayMS: 250 });
+    if (data?.ok && !data.fallback && (data.current_url || data.target?.id || data.target_id)) {
+      if (data.current_url) latestOpenedCheckoutURL = data.current_url;
+      if (data.target?.id || data.target_id) latestOpenedCheckoutTargetID = data.target?.id || data.target_id;
     } else {
       console.error("resolve checkout target failed:", data);
     }
@@ -930,16 +1184,195 @@ async function openInSameIncognito(url) {
   return true;
 }
 
+async function autoSelectOpenedCheckoutPaymentMethod(expectedURL) {
+  if (!expectedURL) return null;
+  try {
+    const resp = await fetch("/api/checkout/payment-method-select", {
+      method: "POST",
+      headers: buildRequestHeaders(),
+      body: JSON.stringify({
+        expected_url: expectedURL,
+        target_id: latestOpenedCheckoutTargetID,
+        trace_id: ensureAutomationTraceID("checkout"),
+      }),
+    });
+    const data = await resp.json();
+    if (data?.target?.id || data?.target_id) {
+      latestOpenedCheckoutTargetID = data.target?.id || data.target_id;
+    }
+    if (data?.current_url) {
+      latestOpenedCheckoutURL = data.current_url;
+    }
+    if (resp.ok && data.ok) {
+      var selected = data.selected_payment_method === "paypal" ? "PayPal" : "GoPay";
+      showAutoFillNotice("支付方式已选择", "完成", "已自动选择 " + selected + " 支付方式。", "如页面没有 GoPay，系统会自动选择 PayPal；最终订阅仍需你本人确认。", "success");
+    } else {
+      showAutoFillNotice("支付方式未自动选择", "提示", data.error || "未检测到可选 GoPay 或 PayPal。", "请在支付页面手动选择支付方式。", "warning");
+    }
+    return data;
+  } catch (error) {
+    console.error("auto payment method select error:", error);
+    return null;
+  }
+}
+
 /**
  * 在无痕窗口中打开支付链接
  */
 async function openPaymentInIncognito() {
-  if (!latestCheckoutURL) return;
-  await openInSameIncognito(latestCheckoutURL);
+  if (!latestCheckoutURL) return false;
+  var opened = await openInSameIncognito(latestCheckoutURL);
+  if (opened) {
+    await autoSelectOpenedCheckoutPaymentMethod(latestOpenedCheckoutURL || latestCheckoutURL);
+  }
+  return opened;
+}
+
+const PLUS_SUBSCRIBE_WATCH_INITIAL_DELAY_MS = 1800;
+const PLUS_SUBSCRIBE_WATCH_MIN_INTERVAL_MS = 3500;
+const PLUS_SUBSCRIBE_WATCH_MAX_INTERVAL_MS = 60000;
+const PLUS_SUBSCRIBE_WATCH_WINDOW_MS = 8 * 60 * 1000;
+const PLUS_SUBSCRIBE_TRIGGER_COOLDOWN_MS = 30000;
+
+function plusSubscribeProbeSignature(data) {
+  return [
+    data?.url || data?.target?.url || "",
+    data?.button_text || "",
+    data?.title || "",
+  ].join("|").slice(0, 500);
+}
+
+function stopPlusSubscribeSessionTriggerWatcher() {
+  if (plusSubscribeWatcherTimer) {
+    window.clearTimeout(plusSubscribeWatcherTimer);
+    plusSubscribeWatcherTimer = null;
+  }
+}
+
+function schedulePlusSubscribeSessionTriggerWatcher(reason, delayMS) {
+  if (!fetchSessionBtn || Date.now() > plusSubscribeWatcherExpiresAt) {
+    stopPlusSubscribeSessionTriggerWatcher();
+    return;
+  }
+  if (plusSubscribeWatcherTimer) {
+    window.clearTimeout(plusSubscribeWatcherTimer);
+  }
+  plusSubscribeWatcherReason = reason || plusSubscribeWatcherReason || "watch";
+  plusSubscribeWatcherTimer = window.setTimeout(function () {
+    plusSubscribeWatcherTimer = null;
+    void probePlusSubscribeSessionTrigger(plusSubscribeWatcherReason);
+  }, Math.max(0, delayMS || PLUS_SUBSCRIBE_WATCH_MIN_INTERVAL_MS));
+}
+
+function startPlusSubscribeSessionTriggerWatcher(reason) {
+  if (!fetchSessionBtn) return;
+  plusSubscribeWatcherReason = reason || plusSubscribeWatcherReason || "watch";
+  plusSubscribeWatcherExpiresAt = Math.max(plusSubscribeWatcherExpiresAt, Date.now() + PLUS_SUBSCRIBE_WATCH_WINDOW_MS);
+  if (!plusSubscribeWatcherTimer && !plusSubscribeProbeInFlight) {
+    plusSubscribeProbeConsecutiveMisses = 0;
+    plusSubscribeProbeLastSignature = "";
+    schedulePlusSubscribeSessionTriggerWatcher(plusSubscribeWatcherReason, PLUS_SUBSCRIBE_WATCH_INITIAL_DELAY_MS);
+  }
+}
+
+function nextPlusSubscribeProbeDelay(data) {
+  const signature = plusSubscribeProbeSignature(data || {});
+  if (signature && signature !== plusSubscribeProbeLastSignature) {
+    plusSubscribeProbeConsecutiveMisses = 0;
+    plusSubscribeProbeLastSignature = signature;
+  } else {
+    plusSubscribeProbeConsecutiveMisses += 1;
+  }
+  if (data?.safe_trigger_fetch_session) {
+    return PLUS_SUBSCRIBE_WATCH_MIN_INTERVAL_MS;
+  }
+  const stage = String(data?.stage || "");
+  const baseDelay = (!data?.cdp_ready || data?.chatgpt_target_count === 0 || stage === "chatgpt_target_not_found") ? 10000 : PLUS_SUBSCRIBE_WATCH_MIN_INTERVAL_MS;
+  const multiplier = Math.pow(1.55, Math.min(plusSubscribeProbeConsecutiveMisses, 7));
+  return Math.min(PLUS_SUBSCRIBE_WATCH_MAX_INTERVAL_MS, Math.round(baseDelay * multiplier));
+}
+
+async function probePlusSubscribeSessionTrigger(reason, options) {
+  options = options || {};
+  if (plusSubscribeProbeInFlight) return null;
+  if (Date.now() > plusSubscribeWatcherExpiresAt) {
+    stopPlusSubscribeSessionTriggerWatcher();
+    return null;
+  }
+  if (autoFetchAndGenerateRunning || sessionMonitorAbortController) {
+    if (!options.singleShot) {
+      schedulePlusSubscribeSessionTriggerWatcher(reason || "watch", PLUS_SUBSCRIBE_WATCH_MIN_INTERVAL_MS);
+    }
+    return null;
+  }
+  plusSubscribeProbeInFlight = true;
+  let data = null;
+  let keepWatching = !options.singleShot;
+  try {
+    const response = await fetch("/api/pricing/plus-subscribe-probe", {
+      method: "POST",
+      headers: buildRequestHeaders(),
+      body: JSON.stringify({ reason: reason || "watch", trace_id: ensureAutomationTraceID("plus") }),
+    });
+    data = await response.json();
+    if (!response.ok || !data?.safe_trigger_fetch_session) {
+      return data;
+    }
+    const signature = plusSubscribeProbeSignature(data);
+    if (signature && signature === plusSubscribeAutoTriggeredSignature) {
+      return data;
+    }
+    if (Date.now() - plusSubscribeAutoTriggerLastAttemptAt < PLUS_SUBSCRIBE_TRIGGER_COOLDOWN_MS) {
+      return data;
+    }
+    plusSubscribeAutoTriggerLastAttemptAt = Date.now();
+    appendMonitorEvent({
+      domain: "Log",
+      method: "plus-subscribe-detected",
+      summary: "检测到 Plus 套餐与订阅并付款按钮，自动触发获取 Session JSON 流程",
+      ts: Date.now(),
+    });
+    showAutoFillNotice(
+      "检测到 Plus 订阅确认",
+      "自动",
+      "已识别「Plus 套餐 / 订阅并付款」页面，正在自动获取 Session JSON 并打开订阅支付页。",
+      "系统不会自动点击最终订阅付款按钮。",
+      "success"
+    );
+    const completed = await autoFetchAndGenerate({ source: "plus_subscribe_card" });
+    if (completed && signature) {
+      plusSubscribeAutoTriggeredSignature = signature;
+      stopPlusSubscribeSessionTriggerWatcher();
+      keepWatching = false;
+    }
+    return data;
+  } catch (error) {
+    console.debug("plus subscribe probe skipped:", error);
+    return null;
+  } finally {
+    plusSubscribeProbeInFlight = false;
+    if (keepWatching && Date.now() <= plusSubscribeWatcherExpiresAt && !plusSubscribeWatcherTimer) {
+      schedulePlusSubscribeSessionTriggerWatcher(reason || "watch", nextPlusSubscribeProbeDelay(data));
+    }
+  }
+}
+
+async function bootstrapPlusSubscribeSessionTriggerWatcher() {
+  plusSubscribeWatcherExpiresAt = Date.now() + 10000;
+  var data = await probePlusSubscribeSessionTrigger("startup_probe", { singleShot: true });
+  if (data?.cdp_ready && data?.chatgpt_target_count > 0) {
+    startPlusSubscribeSessionTriggerWatcher("startup_existing_window");
+  } else {
+    plusSubscribeWatcherExpiresAt = 0;
+    stopPlusSubscribeSessionTriggerWatcher();
+  }
 }
 
 function resetResult() {
   latestCheckoutURL = "";
+  latestOpenedCheckoutURL = "";
+  latestOpenedCheckoutTargetID = "";
+  activeAutomationTraceID = createAutomationTraceID("checkout");
   setText(statusText, "生成中");
   setText(sessionText, "-");
   setText(hostText, "-");
@@ -978,6 +1411,9 @@ function resetResult() {
   if (openInIncognitoBtn) {
     openInIncognitoBtn.hidden = true;
     openInIncognitoBtn.disabled = true;
+  }
+  if (openPaymentShortcutBtn) {
+    openPaymentShortcutBtn.disabled = true;
   }
 }
 
@@ -1109,6 +1545,9 @@ function errorPresentation(data) {
 function renderResult(data, elapsedMs, ok) {
   const checkoutURL = data.checkout_url || data.url || "";
   latestCheckoutURL = checkoutURL;
+  if (data?.trace_id) {
+    activeAutomationTraceID = data.trace_id;
+  }
 
   let host = "-";
   if (checkoutURL) {
@@ -1169,6 +1608,9 @@ function renderResult(data, elapsedMs, ok) {
     openInIncognitoBtn.hidden = !checkoutURL;
     openInIncognitoBtn.disabled = !checkoutURL;
   }
+  if (openPaymentShortcutBtn) {
+    openPaymentShortcutBtn.disabled = !checkoutURL;
+  }
 }
 
 async function runCheckoutGenerate(activeSubmitButton, options) {
@@ -1224,25 +1666,35 @@ paypalSubmitButton?.addEventListener("click", async () => {
 /**
  * 全自动管道：提取 Session JSON → 粘贴到输入框 → 自动生成支付链接 → 自动打开
  */
-async function autoFetchAndGenerate() {
-  if (!fetchSessionBtn) return;
+async function autoFetchAndGenerate(options) {
+  options = options || {};
+  if (!fetchSessionBtn || autoFetchAndGenerateRunning) return false;
+  autoFetchAndGenerateRunning = true;
   fetchSessionBtn.disabled = true;
+  setWorkflowButtonState(fetchSessionBtn, "running");
   const origText = "获取 Session JSON";
   setText(fetchSessionBtn, "启动窗口...");
 
   try {
+    if (options.source === "plus_subscribe_card") {
+      appendMonitorEvent({ domain: "Log", method: "session-auto-trigger", summary: "Plus 订阅确认页触发获取 Session JSON", ts: Date.now() });
+    }
     setText(fetchSessionBtn, "监控并读取 Session...");
     await fetchLatestSessionJSON();
+    setWorkflowButtonState(fetchSessionBtn, "done");
     setText(fetchSessionBtn, "生成链接...");
     form.dispatchEvent(new Event("submit", { cancelable: true, bubbles: true }));
-    return;
+    return true;
   } catch (error) {
     if (monitorBadge) { monitorBadge.textContent = "Session 失败"; monitorBadge.className = "badge error"; }
+    setWorkflowButtonState(fetchSessionBtn, "error");
     showAutoFillNotice("获取 Session 失败", "错误", error.message || "获取 Session JSON 失败，请确认已在无痕窗口中登录 ChatGPT", "", "error");
+    return false;
   } finally {
     sessionMonitorAbortController = null;
     fetchSessionBtn.disabled = false;
     setText(fetchSessionBtn, origText);
+    autoFetchAndGenerateRunning = false;
   }
 }
 
@@ -1254,16 +1706,35 @@ openInIncognitoBtn?.addEventListener("click", () => {
   void openPaymentInIncognito();
 });
 
-openIncognitoBtn?.addEventListener("click", async () => {
-  var opened = await ensureIncognitoWindow();
-  if (!opened) return;
-  var loginReady = await runLoginClickAfterIncognitoOpen();
-  if (!loginReady) return;
-  if (!purchasedEmailValue()) {
-    await runLuckMailLoadPurchase();
+openPaymentShortcutBtn?.addEventListener("click", async () => {
+  if (!latestCheckoutURL) {
+    setWorkflowButtonState(openPaymentShortcutBtn, "error");
+    showAutoFillNotice("打开支付页失败", "提示", "还没有可打开的支付链接。", "请先完成获取 Session JSON 和生成链接步骤。", "error");
+    return;
   }
-  if (purchasedEmailValue()) {
-    await runLuckMailLoginEmailFill({ codeRetry: { maxAttempts: 3 } });
+  setWorkflowButtonState(openPaymentShortcutBtn, "running");
+  var opened = await openPaymentInIncognito();
+  setWorkflowButtonState(openPaymentShortcutBtn, opened ? "done" : "error");
+});
+
+openIncognitoBtn?.addEventListener("click", async () => {
+  if (!openIncognitoBtn) return;
+  var originalText = openIncognitoBtn.textContent || "打开无痕窗口";
+  openIncognitoBtn.disabled = true;
+  setWorkflowButtonState(openIncognitoBtn, "running");
+  setText(openIncognitoBtn, "打开中...");
+  try {
+    var opened = await ensureIncognitoWindow();
+    if (!opened) {
+      setWorkflowButtonState(openIncognitoBtn, "error");
+      showAutoFillNotice("打开无痕窗口失败", "错误", "无法启动 Chrome 无痕窗口，请确认系统已安装 Chrome 浏览器。", "", "error");
+      return;
+    }
+    setWorkflowButtonState(openIncognitoBtn, "done");
+    showAutoFillNotice("无痕窗口已打开", "完成", "已打开 ChatGPT 无痕窗口。", "下一步请执行「设备登录引导」。", "success");
+  } finally {
+    openIncognitoBtn.disabled = false;
+    setText(openIncognitoBtn, originalText);
   }
 });
 
@@ -1283,19 +1754,26 @@ exportSub2APIBtn?.addEventListener("click", () => {
   void exportSub2APICredentials();
 });
 
+closeIncognitoBtn?.addEventListener("click", () => {
+  void closeIncognitoWindow();
+});
+
 autoFillCheckoutBtn?.addEventListener("click", async () => {
   if (!autoFillCheckoutBtn) return;
   autoFillCheckoutBtn.disabled = true;
+  setWorkflowButtonState(autoFillCheckoutBtn, "running");
   var origText = "自动填地址";
   setText(autoFillCheckoutBtn, "探测表单...");
 
   try {
     var ensured = await ensureIncognitoWindow();
     if (!ensured) {
+      setWorkflowButtonState(autoFillCheckoutBtn, "error");
       showAutoFillNotice("自动填地址失败", "错误", "无法启动 Chrome 无痕窗口", "", "error");
       return;
     }
     if (!latestOpenedCheckoutURL) {
+      setWorkflowButtonState(autoFillCheckoutBtn, "error");
       showAutoFillNotice("自动填地址失败", "错误", "未找到本工具最近一次打开的支付链接页面。", "请先用本工具打开支付链接后再试。", "error");
       return;
     }
@@ -1306,28 +1784,42 @@ autoFillCheckoutBtn?.addEventListener("click", async () => {
     var resp = await fetch("/api/checkout/auto-fill", {
       method: "POST",
       headers: buildRequestHeaders(),
-      body: JSON.stringify({ expected_url: latestOpenedCheckoutURL }),
+      body: JSON.stringify({
+        expected_url: latestOpenedCheckoutURL,
+        target_id: latestOpenedCheckoutTargetID,
+        trace_id: ensureAutomationTraceID("checkout"),
+      }),
     });
     var data = await resp.json();
+    if (data?.page_target?.id || data?.target_id) {
+      latestOpenedCheckoutTargetID = data.page_target?.id || data.target_id;
+    }
+    if (data?.current_url) {
+      latestOpenedCheckoutURL = data.current_url;
+    }
 
     if (resp.ok && data.ok) {
       var a = data.address;
       var fields = data.filled || {};
       var validation = data.address_validation || fields.validation || {};
+      var selectedPayment = data.selected_payment_method === "paypal" ? "PayPal" : (data.selected_payment_method === "gopay" ? "GoPay" : "");
       var msg = "随机美国地址已填入：" + "\n" +
         "姓名: " + (a.first_name || "") + " " + (a.last_name || "") + "\n" +
         "地址: " + (a.line1 || "") + "\n" +
         "城市: " + (a.city || "") + ", " + (a.state || "") + " " + (a.zip_code || "") + "\n\n" +
-        "GoPay: " + (data.gopay_selected ? "已选择" : "已保持当前选择") + "\n" +
+        "支付方式: " + (selectedPayment ? ("已选择 " + selectedPayment) : "已保持当前选择") + "\n" +
         "地址校验: " + (validation.ok === false ? "未通过" : "通过") + "\n" +
         "填入结果: " + JSON.stringify(fields);
       showAutoFillNotice("安全辅助完成", "成功", msg, "请你本人在支付页面确认条款复选框，并手动点击订阅。系统会在提交后自动触发 GoPay 一键绑定。", "");
+      setWorkflowButtonState(autoFillCheckoutBtn, "done");
       setText(autoFillCheckoutBtn, "已填入 ✓");
       startCheckoutSubmitWatcher(data);
     } else {
+      setWorkflowButtonState(autoFillCheckoutBtn, "error");
       showAutoFillNotice("自动填地址失败", "错误", data.error || "自动填地址失败", "请先在无痕窗口中手动进入 ChatGPT Plus 升级结账页面。", "error");
     }
   } catch (err) {
+    setWorkflowButtonState(autoFillCheckoutBtn, "error");
     showAutoFillNotice("自动填地址失败", "错误", "网络错误: " + (err.message || "未知"), "", "error");
   } finally {
     autoFillCheckoutBtn.disabled = false;
@@ -1372,6 +1864,41 @@ const gopayStepTexts = {
   pin:      document.querySelector("#gopayPINText"),
   success:  document.querySelector("#gopaySuccessText"),
 };
+const gopayVoiceStepLabels = {
+  linking: "GoPay 绑定",
+  reference: "引用验证",
+  consent: "OTP 触发",
+  otp: "OTP 验证",
+  pin: "PIN 验证",
+  success: "支付结果",
+};
+const gopayVoiceStateLabels = {
+  active: "正在处理",
+  done: "已完成",
+  warning: "需要注意",
+  error: "发生错误",
+};
+let gopayStepVoiceState = {};
+
+function announceGopayStep(step, state, text) {
+  if (!step || !state || state === "idle") return;
+  var stepLabel = gopayVoiceStepLabels[step] || step;
+  var stateLabel = gopayVoiceStateLabels[state] || state;
+  var detail = normalizeVoicePromptMessage(text || "");
+  if (!detail || detail === "等待提交") return;
+  var key = "gopay_step_" + step + "_" + state + "_" + detail;
+  if (gopayStepVoiceState[step] === key) return;
+  gopayStepVoiceState[step] = key;
+  announceLuckMailScene(key, stepLabel + stateLabel + "，" + detail, state === "error" || state === "warning" || state === "done");
+}
+
+function normalizeGopayPINValue(value) {
+  return String(value || "").replace(/\D/g, "").slice(0, 6);
+}
+
+function currentGopayPINValue() {
+  return normalizeGopayPINValue(gopayPINCodeInput?.value || "");
+}
 
 // GoPay 表单记忆功能
 (function initGopayFormMemory() {
@@ -1403,10 +1930,16 @@ const gopayStepTexts = {
         f.el.checked = f.defaultValue === "1";
       }
     } else if (saved !== null && saved !== undefined) {
-      f.el.value = saved;
+      f.el.value = f.key === "pin_code" ? normalizeGopayPINValue(saved) : saved;
     }
     // 监听变化并保存
     var persistField = function () {
+      if (f.key === "pin_code") {
+        var normalizedPIN = normalizeGopayPINValue(f.el.value);
+        if (f.el.value !== normalizedPIN) f.el.value = normalizedPIN;
+        localStorage.setItem(GPM + f.key, normalizedPIN);
+        return;
+      }
       localStorage.setItem(GPM + f.key, f.type === "checkbox" ? (f.el.checked ? "1" : "0") : f.el.value);
     };
     f.el.addEventListener("input", persistField);
@@ -1421,9 +1954,11 @@ function setGopayStep(step, state, text) {
   if (state) item.classList.add(state);
   const target = gopayStepTexts[step];
   if (target) setText(target, text || "-");
+  announceGopayStep(step, state, text || "");
 }
 
 function resetGopaySteps() {
+  gopayStepVoiceState = {};
   ["linking","reference","consent","otp","pin","success"].forEach(function (s) {
     setGopayStep(s, "", "等待提交");
   });
@@ -1481,7 +2016,7 @@ function renderGopayStageResults(stages) {
     if (stageMap["pin-enum"].message) {
       setGopayStep("pin", "done", stageMap["pin-enum"].message);
     } else if (stageMap["pin-enum"].ok) {
-      setGopayStep("pin", "done", "PIN 通过 (" + (stageMap["pin-enum"].pin || "?") + ")");
+      setGopayStep("pin", "done", "PIN 已通过");
     } else if (stageMap["pin-enum"].tried && stageMap["pin-enum"].tried.length > 0) {
       setGopayStep("pin", "warning", "自动尝试 " + stageMap["pin-enum"].tried.length + " 个 PIN 均失败");
     } else {
@@ -1492,8 +2027,47 @@ function renderGopayStageResults(stages) {
   // validate-pin
   if (stageMap["validate-pin"]) {
     setGopayStep("success", stageMap["validate-pin"].ok ? "done" : "error",
-      stageMap["validate-pin"].message || (stageMap["validate-pin"].ok ? "✅ GoPay 绑定成功！" : (stageMap["validate-pin"].error || "失败")));
+      stageMap["validate-pin"].message || (stageMap["validate-pin"].ok ? "GoPay 绑定成功" : (stageMap["validate-pin"].error || "失败")));
   }
+}
+
+function releaseGopayAutomationAfterTerminal() {
+  gopayAutoTriggerRunning = false;
+  gopayPaymentFlowRunning = false;
+  gopayCheckoutWatcherActive = false;
+  if (gopayLinkBtn) gopayLinkBtn.disabled = false;
+  if (gopayMonitorBtn) gopayMonitorBtn.disabled = false;
+}
+
+function nextGopayPollDelayMs(data, result, unchangedPolls) {
+  data = data || {};
+  result = result || {};
+  var pageStage = String(data.stage || result.page_stage || "").trim();
+  var pinStage = String(data.pin_stage || result.pin_stage || "").trim();
+  var balanceState = String(data.balance_state || result.balance_state || "").trim();
+  var insufficientBalance = balanceState === "insufficient" || pageStage === "gopay_insufficient_balance";
+  var autoActionStage = String(data.auto_action_stage || result.auto_action_stage || "").trim();
+  var payNowBlockReason = String(data.pay_now_block_reason || result.pay_now_block_reason || "").trim();
+  var hasPinField = !!(data.has_pin_field ?? result.has_pin_field);
+  var hasOTPField = !!(data.has_otp_field ?? result.has_otp_field ?? result.hasOTPField);
+  var payNowButtonDetected = !!(data.pay_now_button_detected ?? result.pay_now_button_detected);
+  var payNowAttemptLimitReached = !!(data.pay_now_attempt_limit_reached ?? result.pay_now_attempt_limit_reached) || /attempt_limit/i.test(payNowBlockReason);
+  var paymentCompleted = !!(data.payment_completed ?? result.payment_completed);
+  var paymentExpired = !!(data.payment_expired ?? result.payment_expired);
+  var paymentFailed = !!(data.payment_failed ?? result.payment_failed);
+  var stableCount = Math.max(0, Number(unchangedPolls || 0));
+
+  if (paymentCompleted || paymentExpired || paymentFailed) return 0;
+  if (pageStage === "pin_entry_payment" || pageStage === "pin_entry_binding" || pinStage || hasPinField) return 550;
+  if (pageStage === "otp_entry" || hasOTPField) return 900;
+  if (["pay_now_post_click_wait", "pay_now_trusted_click"].includes(pageStage) || autoActionStage === "pay_now_trusted_click") return 650;
+  if (insufficientBalance) return Math.min(7000, 3000 + stableCount * 600);
+  if (payNowButtonDetected && !payNowAttemptLimitReached) return 800;
+  if (balanceState === "rp0" || pageStage === "balance_wait_rp0") return Math.min(5000, 2400 + stableCount * 500);
+  if (payNowAttemptLimitReached || payNowBlockReason === "synthetic_click_attempt_limit") return Math.min(5000, 2600 + stableCount * 400);
+  if (stableCount >= 8) return 4000;
+  if (stableCount >= 3) return 2500;
+  return 1500;
 }
 
 function startGopayOTPAutoCapture(options) {
@@ -1512,6 +2086,9 @@ function startGopayOTPAutoCapture(options) {
   var maxAttempts = 120;
   var pollDelayMs = 1500;
   var lastStageKey = "";
+  var unchangedPolls = 0;
+  var payNowStalledNoticeShown = false;
+  var insufficientBalanceNoticeShown = false;
 
   var poll = async function () {
     if (stop || attempts >= maxAttempts) return;
@@ -1520,7 +2097,9 @@ function startGopayOTPAutoCapture(options) {
     try {
       var payload = {
         otp: (gopayOTPInput?.value || "").trim(),
-        pin: (gopayPINCodeInput?.value || "").trim(),
+        pin: currentGopayPINValue(),
+        trace_id: ensureAutomationTraceID("gopay"),
+        poll_delay_ms: pollDelayMs,
       };
       Object.keys(captureContext).forEach(function (key) {
         if (captureContext[key]) payload[key] = captureContext[key];
@@ -1542,29 +2121,60 @@ function startGopayOTPAutoCapture(options) {
       var inputStrategy = (data.pin_input_strategy || result.pin_input_strategy || "").trim();
       var balanceState = (data.balance_state || result.balance_state || "").trim();
       var balanceAmount = data.balance_amount ?? result.balance_amount;
+      var orderAmount = data.order_amount ?? result.order_amount;
+      var balanceShortfall = data.balance_shortfall ?? result.balance_shortfall;
+      var insufficientBalanceReason = (data.insufficient_balance_reason || result.insufficient_balance_reason || "").trim();
       var hubungkanAutoClicked = !!(data.hubungkan_auto_clicked ?? result.hubungkan_auto_clicked);
       var payNowAutoClicked = !!(data.pay_now_auto_clicked ?? result.pay_now_auto_clicked);
+      var payNowButtonDetected = !!(data.pay_now_button_detected ?? result.pay_now_button_detected);
+      var payNowTrustedClicked = !!(data.pay_now_trusted_clicked ?? result.pay_now_trusted_clicked);
+      var payNowBlockReason = (data.pay_now_block_reason || result.pay_now_block_reason || "").trim();
+      var payNowAttemptLimitReached = !!(data.pay_now_attempt_limit_reached ?? result.pay_now_attempt_limit_reached) || /attempt_limit/i.test(payNowBlockReason);
+      var payNowPostClickElapsedMS = Number(data.pay_now_post_click_elapsed_ms ?? result.pay_now_post_click_elapsed_ms ?? 0) || 0;
       var autoActionPaused = !!(data.auto_action_paused ?? result.auto_action_paused);
       var autoActionStage = (data.auto_action_stage || result.auto_action_stage || "").trim();
+      var pinAutoBlockReason = (data.pin_auto_block_reason || result.pin_auto_block_reason || "").trim();
+      var pinAttemptCount = data.pin_attempt_count ?? result.pin_attempt_count ?? "";
       var paymentCompleted = !!(data.payment_completed ?? result.payment_completed);
+      var paymentExpired = !!(data.payment_expired ?? result.payment_expired);
+      var paymentFailed = !!(data.payment_failed ?? result.payment_failed) || pageStage === "gopay_payment_failed";
+      var paymentFailureReason = (data.payment_failure_reason || result.payment_failure_reason || "").trim();
       var stageKey = [
         pageStage,
         pinStage,
         autoActionStage,
         paymentCompleted ? "payment-completed" : "",
         balanceState,
+        orderAmount,
+        paymentExpired ? "payment-expired" : "",
+        paymentFailed ? "payment-failed" : "",
+        paymentFailureReason,
         balanceAmount,
+        balanceShortfall,
+        insufficientBalanceReason,
         hubungkanAutoClicked ? "hubungkan-clicked" : "",
         payNowAutoClicked ? "pay-now-clicked" : "",
+        payNowTrustedClicked ? "pay-now-trusted-clicked" : "",
+        payNowButtonDetected ? "pay-now-detected" : "",
+        payNowAttemptLimitReached ? "pay-now-attempt-limit" : "",
+        payNowBlockReason,
+        payNowPostClickElapsedMS,
         autoActionPaused ? "paused" : "",
         otpManualRequired ? "otp-manual" : "",
         pinAutoFilled ? "pin-filled" : "",
         pinAutoSubmitted ? "pin-submitted" : "",
+        pinAutoBlockReason,
+        pinAttemptCount,
         inputStrategy,
       ].join("|");
+      var stageChanged = stageKey && stageKey !== lastStageKey;
+      if (stageKey) {
+        unchangedPolls = stageChanged ? 0 : unchangedPolls + 1;
+      }
+      pollDelayMs = nextGopayPollDelayMs(data, result, unchangedPolls) || pollDelayMs;
 
       if (paymentCompleted || pageStage === "gopay_complete") {
-        setGopayStep("success", "done", "✅ 支付已完成");
+        setGopayStep("success", "done", "支付已完成");
         appendCheckoutWatcherEvent("gopay-complete", "检测到 GoPay 支付完成，开始保存 GPT Plus 成功记录");
         if (gopayBadge) {
           setText(gopayBadge, "支付完成");
@@ -1574,8 +2184,46 @@ function startGopayOTPAutoCapture(options) {
         stop = true;
         return;
       }
+      if (paymentExpired || pageStage === "gopay_session_expired") {
+        setGopayStep("success", "error", "GoPay 会话已超时，请关闭旧支付页并重新生成结账链路");
+        appendCheckoutWatcherEvent("gopay-session-expired", "检测到 GoPay 页面提示 Yah, waktunya habis，当前支付会话已失效");
+        showAutoFillNotice(
+          "GoPay 支付页已过期",
+          "已停止",
+          "当前 Midtrans/GoPay 支付会话已经失效，继续点击旧页面不会完成扣款。",
+          "请关闭旧支付页，重新生成支付链接后再打开新的 GoPay 支付页。",
+          "error"
+        );
+        if (gopayBadge) {
+          setText(gopayBadge, "已超时");
+          gopayBadge.className = "badge error";
+        }
+        releaseGopayAutomationAfterTerminal();
+        stopGopayOTPAutoCapture = null;
+        stop = true;
+        return;
+      }
+      if (paymentFailed) {
+        setGopayStep("success", "error", "GoPay 支付页返回失败，请重新生成结账链路");
+        appendCheckoutWatcherEvent("gopay-payment-failed", "检测到支付页失败态：" + (paymentFailureReason || pageStage || "payment_failed"));
+        showAutoFillNotice(
+          "GoPay 支付失败",
+          "已停止",
+          "支付页提示 Failed to complete payment，需要重新下单或更换支付方式。",
+          "请关闭当前旧支付页，重新生成 OpenAI 结账链接后再触发 GoPay。",
+          "error"
+        );
+        if (gopayBadge) {
+          setText(gopayBadge, "支付失败");
+          gopayBadge.className = "badge error";
+        }
+        releaseGopayAutomationAfterTerminal();
+        stopGopayOTPAutoCapture = null;
+        stop = true;
+        return;
+      }
 
-      if (stageKey && stageKey !== lastStageKey) {
+      if (stageChanged) {
         lastStageKey = stageKey;
         if (pageStage === "gopay_consent_hubungkan" || hubungkanAutoClicked) {
           setGopayStep("consent", "done", "Hubungkan 已出现并自动确认");
@@ -1585,23 +2233,75 @@ function startGopayOTPAutoCapture(options) {
             gopayBadge.className = "badge";
           }
         }
-        if (pageStage === "balance_wait_rp0" || autoActionPaused || balanceState === "rp0") {
+        if (pageStage === "gopay_insufficient_balance" || balanceState === "insufficient" || payNowBlockReason === "insufficient_balance") {
+          setGopayStep("success", "warning", "GoPay 余额不足，已暂停 Pay now 自动点击");
+          var amountText = orderAmount && balanceAmount ? "订单 Rp" + orderAmount + "，余额 Rp" + balanceAmount : "当前余额不足以覆盖订单金额";
+          appendCheckoutWatcherEvent("gopay-insufficient-balance", "检测到 GoPay 余额不足：" + amountText + (balanceShortfall ? "，缺口 Rp" + balanceShortfall : ""));
+          if (!insufficientBalanceNoticeShown) {
+            insufficientBalanceNoticeShown = true;
+            showAutoFillNotice(
+              "GoPay 余额不足",
+              "已暂停",
+              "支付页提示余额不足，系统已停止自动点击 Pay now。",
+              "请完成充值并在支付页点击 Refresh；余额满足订单金额后监听会继续判断下一步。",
+              "warning"
+            );
+          }
+          if (gopayBadge) {
+            setText(gopayBadge, "余额不足");
+            gopayBadge.className = "badge neutral";
+          }
+        } else if (pageStage === "balance_wait_rp0" || autoActionPaused || balanceState === "rp0") {
           setGopayStep("success", "warning", "余额 Rp0，已暂停自动操作并等待余额变化");
           appendCheckoutWatcherEvent("gopay-balance-wait", "检测到账户余额 Rp0，自动操作已暂停");
           if (gopayBadge) {
             setText(gopayBadge, "等余额");
             gopayBadge.className = "badge neutral";
           }
-        } else if (pageStage === "pay_now_rp1" || payNowAutoClicked) {
-          setGopayStep("success", "active", "余额 Rp1，已自动点击 Pay now");
-          appendCheckoutWatcherEvent("gopay-pay-now", "检测到账户余额 Rp1，已点击 Pay now");
+        } else if (pageStage === "pay_now_post_click_wait" && payNowBlockReason === "trusted_click_no_transition") {
+          setGopayStep("success", "warning", "Pay now 已真实点击一次，停止重复点击并继续监听 PIN 页面");
+          if (!payNowStalledNoticeShown) {
+            payNowStalledNoticeShown = true;
+            appendCheckoutWatcherEvent("gopay-pay-now-stalled", "Pay now 真实点击后 " + Math.round(payNowPostClickElapsedMS / 1000) + " 秒仍未进入 PIN/成功页；已停止重复点击，但继续被动监听 PIN 页面");
+            showAutoFillNotice(
+              "Pay now 未立即推进",
+              "继续监听",
+              "系统只执行了一次 CDP 真实鼠标点击，不会重复点击 Pay now。",
+              "如果 GoPay PIN 页面延迟出现或你手动推进到 PIN 页面，自动 PIN 输入仍会继续工作。",
+              "warning"
+            );
+          }
+          if (gopayBadge) {
+            setText(gopayBadge, "监听 PIN");
+            gopayBadge.className = "badge neutral";
+          }
+        } else if (pageStage === "pay_now_post_click_wait") {
+          setGopayStep("success", "active", "Pay now 已真实点击一次，正在等待支付确认页");
+          appendCheckoutWatcherEvent("gopay-pay-now-wait-after-click", "Pay now 已真实点击一次，等待页面进入 PIN/成功页");
+          if (gopayBadge) {
+            setText(gopayBadge, "等待跳转");
+            gopayBadge.className = "badge neutral";
+          }
+        } else if (payNowButtonDetected && payNowAttemptLimitReached) {
+          setGopayStep("success", "warning", "Pay now 已达到自动点击上限，请在支付页手动确认或重新生成支付链接");
+          appendCheckoutWatcherEvent("gopay-pay-now-limit", "Pay now 自动点击已达上限，停止重复点击；请手动确认支付页状态");
+          if (gopayBadge) {
+            setText(gopayBadge, "需手动");
+            gopayBadge.className = "badge neutral";
+          }
+        } else if (pageStage === "pay_now_trusted_click" || pageStage === "pay_now_ready" || pageStage === "pay_now_rp1" || payNowTrustedClicked || payNowAutoClicked) {
+          setGopayStep("success", "active", payNowTrustedClicked ? "检测到可用余额，已用真实点击触发 Pay now" : "检测到可用余额，已自动点击 Pay now");
+          appendCheckoutWatcherEvent("gopay-pay-now", payNowTrustedClicked ? "检测到 Pay now，已通过 CDP 真实鼠标点击" : "检测到可用余额与 Pay now，已自动点击");
           if (gopayBadge) {
             setText(gopayBadge, "Pay now");
             gopayBadge.className = "badge";
           }
-        } else if (pageStage === "balance_rp1_observed" || balanceState === "rp1") {
-          setGopayStep("success", "active", "余额 Rp1，正在等待 Pay now 可点击");
-          appendCheckoutWatcherEvent("gopay-pay-now-wait", "检测到账户余额 Rp1，等待 Pay now 按钮可点击");
+        } else if (pageStage === "pay_now_ready_observed" || payNowButtonDetected) {
+          setGopayStep("success", "active", "检测到 Pay now，等待页面响应或下一次自动点击");
+          appendCheckoutWatcherEvent("gopay-pay-now-wait", "检测到 Pay now 按钮" + (payNowBlockReason ? "（" + payNowBlockReason + "）" : ""));
+        } else if (pageStage === "balance_ready_observed" || pageStage === "balance_rp1_observed" || balanceState === "rp1" || balanceState === "other") {
+          setGopayStep("success", "active", "检测到 GoPay 可用余额，正在等待 Pay now 可点击");
+          appendCheckoutWatcherEvent("gopay-pay-now-wait", "检测到 GoPay 可用余额，等待 Pay now 按钮可点击");
         }
         if (pageStage === "otp_entry" || hasOTPField || otpManualRequired) {
           setGopayStep("otp", "active", "检测到 OTP 页面，等待手动输入");
@@ -1620,7 +2320,12 @@ function startGopayOTPAutoCapture(options) {
             pinState = "done";
           } else if (pinAutoFilled) {
             pinMessage = pinLabel + " 已自动填入，等待页面继续";
-          } else if (!(gopayPINCodeInput?.value || "").trim()) {
+          } else if (pinAutoBlockReason === "cooldown") {
+            pinMessage = pinLabel + " 自动输入冷却中，稍后会再次尝试";
+          } else if (pinAutoBlockReason === "attempt_limit") {
+            pinMessage = pinLabel + " 已多次自动尝试，等待人工确认";
+            pinState = "warning";
+          } else if (!currentGopayPINValue()) {
             pinMessage = "检测到 " + pinLabel + " 页面，但面板里还没有可复用的 PIN";
             pinState = "warning";
           }
@@ -1727,6 +2432,41 @@ function midtransRedirectionAccountID(currentURL) {
   }
 }
 
+const checkoutWatcherVoiceEventMessages = {
+  "checkout-submitted": "检测到订阅付款页面已提交，正在等待 GoPay 支付页面。",
+  "auto-trigger-ready": "GoPay 支付页面已识别，正在自动填写绑定信息。",
+  "midtrans-linking-fill": "GoPay 绑定信息已填写并提交。",
+  "midtrans-phone-binding-required": "GoPay 手机号不可用，需要先解除手机绑定。",
+  "gopay-hubungkan": "GoPay 授权确认已自动处理。",
+  "gopay-insufficient-balance": "GoPay 余额不足，已暂停自动点击 Pay now。请充值后点击 Refresh。",
+  "gopay-balance-wait": "GoPay 余额为零，自动操作已暂停，等待余额变化。",
+  "gopay-pay-now": "检测到 Pay now，已执行一次真实点击。",
+  "gopay-pay-now-wait-after-click": "Pay now 已点击，正在等待进入 PIN 或成功页面。",
+  "gopay-pay-now-stalled": "Pay now 点击后页面没有推进，已停止重复点击并继续监听 PIN 页面。",
+  "gopay-pay-now-limit": "Pay now 已达到自动点击上限，请人工确认支付页状态。",
+  "gopay-otp-manual": "已进入 GoPay OTP 页面，请手动输入 OTP 验证码。",
+  "gopay-binding-pin": "已检测到绑定授权 PIN 页面，正在尝试自动输入 PIN。",
+  "gopay-payment-pin": "已检测到支付确认 PIN 页面，正在尝试自动输入 PIN。",
+  "gopay-complete": "GoPay 支付已完成，正在保存成功记录。",
+  "gopay-session-expired": "GoPay 支付会话已超时，请重新生成支付链接。",
+  "gopay-payment-failed": "GoPay 支付页返回失败，请重新生成结账链路。",
+  "gptpls-record": "GPT Plus 成功记录已保存。",
+  "gptpls-record-error": "GPT Plus 成功记录保存失败。",
+  "auto-trigger-timeout": "等待订阅提交超时，未自动触发 GoPay。",
+  "auto-trigger-error": "自动触发监控出现错误。",
+};
+
+function announceCheckoutWatcherVoice(method, summary) {
+  var eventKey = String(method || "").trim();
+  if (!eventKey) return;
+  var message = checkoutWatcherVoiceEventMessages[eventKey] || "";
+  if (!message && /^(gopay-|midtrans-|auto-trigger-|gptpls-record)/.test(eventKey)) {
+    message = summary || "";
+  }
+  if (!message) return;
+  announceLuckMailScene("watcher_" + eventKey + "_" + normalizeVoicePromptMessage(message), message, false);
+}
+
 function appendCheckoutWatcherEvent(method, summary) {
   if (gopayMonitor) {
     gopayMonitor.hidden = false;
@@ -1734,6 +2474,7 @@ function appendCheckoutWatcherEvent(method, summary) {
   if (typeof appendMonitorEvent === "function") {
     appendMonitorEvent({ domain: "Log", method: method, summary: summary, ts: Date.now() });
   }
+  announceCheckoutWatcherVoice(method, summary);
 }
 
 function prepareCheckoutWatcherMonitor() {
@@ -1750,6 +2491,7 @@ function prepareCheckoutWatcherMonitor() {
 }
 
 async function checkGopayAutoTriggerReady(payload) {
+  payload = Object.assign({ trace_id: ensureAutomationTraceID("gopay") }, payload || {});
   var response = await fetch("/api/gopay/auto-trigger-check", {
     method: "POST",
     headers: buildRequestHeaders(),
@@ -1783,6 +2525,7 @@ async function fillCurrentMidtransLinkingPage(targetURL, checkoutURL) {
       phone_number: phoneNumber,
       aggressive_retry: aggressiveRetry,
       debug_network: debugNetworkOnce,
+      trace_id: ensureAutomationTraceID("gopay"),
     }),
   });
   var data = await response.json();
@@ -1790,6 +2533,27 @@ async function fillCurrentMidtransLinkingPage(targetURL, checkoutURL) {
     throw new Error(data.error || "Midtrans GoPay 页面填充失败");
   }
   return data;
+}
+
+function midtransPhoneBindingRequired(data) {
+  var result = data?.browser_result || data?.result || {};
+  var text = [
+    data?.stage,
+    data?.phone_binding_error_text,
+    data?.error,
+    result?.stage,
+    result?.phone_binding_error_text,
+    result?.page_text_snippet,
+  ].filter(Boolean).join(" ").toLowerCase();
+  return !!(
+    data?.stage === "midtrans_phone_binding_required" ||
+    data?.phone_binding_error ||
+    result?.phone_binding_error ||
+    text.includes("please use another phone number") ||
+    text.includes("use another phone number") ||
+    text.includes("gunakan nomor telepon lain") ||
+    text.includes("pakai nomor telepon lain")
+  );
 }
 
 function startCheckoutSubmitWatcher(autoFillData) {
@@ -1853,9 +2617,19 @@ function startCheckoutSubmitWatcher(autoFillData) {
       var response = await fetch("/api/checkout/resolve-target", {
         method: "POST",
         headers: buildRequestHeaders(),
-        body: JSON.stringify({ opened_url: checkoutURL }),
+        body: JSON.stringify({
+          opened_url: checkoutURL,
+          target_id: latestOpenedCheckoutTargetID,
+          trace_id: ensureAutomationTraceID("checkout"),
+        }),
       });
       var data = await response.json();
+      if (data?.target?.id || data?.target_id) {
+        latestOpenedCheckoutTargetID = data.target?.id || data.target_id;
+      }
+      if (data?.current_url) {
+        latestOpenedCheckoutURL = data.current_url;
+      }
       var currentURL = data.current_url || data.target?.url || "";
       var candidateURLs = Array.isArray(data.candidate_urls) ? data.candidate_urls : [];
       var submittedCandidateURL = candidateURLs.find(function (url) {
@@ -1936,6 +2710,23 @@ function startCheckoutSubmitWatcher(autoFillData) {
                 finishWatcher();
                 return;
               } else {
+                if (midtransPhoneBindingRequired(fillResult)) {
+                  var phoneBindingPrompt = fillResult.voice_prompt || fillResult.browser_result?.voice_prompt || "请解除手机绑定";
+                  var phoneBindingText = fillResult.phone_binding_error_text || fillResult.browser_result?.phone_binding_error_text || "Please use another phone number";
+                  appendCheckoutWatcherEvent("midtrans-phone-binding-required", "检测到手机号不可用：" + phoneBindingText);
+                  setGopayStep("linking", "error", "手机号已绑定或不可用，请先解除手机绑定");
+                  if (gopayBadge) {
+                    setText(gopayBadge, "解绑手机");
+                    gopayBadge.className = "badge error";
+                  }
+                  if (monitorBadge) {
+                    monitorBadge.textContent = "需解绑";
+                    monitorBadge.className = "badge error";
+                  }
+                  announceLuckMailScene("gopay_phone_binding_required_" + (fillResult.phone_number || ""), phoneBindingPrompt);
+                  finishWatcher();
+                  return;
+                }
                 var retryHint = fillResult.aggressive_retry ? "（保守恢复已开启）" : "";
                 var fillStage = fillResult.stage || fillResult.error || "unknown";
                 var retryAfterMs = Number(fillResult.retry_after_ms || fillResult.cooldown_ms || 0);
@@ -2007,10 +2798,11 @@ async function runGopayFullLinkPayment(options) {
   var phoneNumber = (gopayPhone?.value || "18120322232").trim();
   var otpChannel = gopayOTPChannel?.value || "whatsapp";
   var otpCode = (gopayOTPInput?.value || "").trim();
-  var pinCode = (gopayPINCodeInput?.value || "").trim();
+  var pinCode = currentGopayPINValue();
   var accessToken = extractAccessToken(fields.token?.value || "");
 
   if (!phoneNumber) {
+    setWorkflowButtonState(gopayLinkBtn, "error");
     showAutoFillNotice("GoPay 绑定失败", "错误", "请输入手机号。", "", "error");
     return;
   }
@@ -2018,6 +2810,7 @@ async function runGopayFullLinkPayment(options) {
   resetGopaySteps();
   gopayPaymentFlowRunning = true;
   if (gopayLinkBtn) gopayLinkBtn.disabled = true;
+  setWorkflowButtonState(gopayLinkBtn, "running");
   if (gopayMonitorBtn) gopayMonitorBtn.disabled = true;
   var origText = gopayLinkBtn ? gopayLinkBtn.textContent : "";
   setText(gopayLinkBtn, triggerSource === "auto-trigger" ? "自动触发中..." : "提取 Session 中...");
@@ -2042,6 +2835,7 @@ async function runGopayFullLinkPayment(options) {
       country_code: countryCode,
       phone_number: phoneNumber,
       otp_channel: otpChannel,
+      trace_id: ensureAutomationTraceID("gopay"),
     };
     if (otpCode) payload.otp = otpCode;
     if (pinCode) payload.pin = pinCode;
@@ -2063,13 +2857,13 @@ async function runGopayFullLinkPayment(options) {
     if (gopayResult) gopayResult.hidden = false;
     if (gopayLatency) setText(gopayLatency, elapsed + "ms");
     if (gopayLinkStatus) {
-      var okText = "✅ 已绑定";
+      var okText = "已绑定";
       if (data.stage === "gopay_complete") {
-        okText = "✅ 支付已完成";
+        okText = "支付已完成";
       } else if (data.reused_existing) {
-        okText = "✅ 已复用已绑定账号";
+        okText = "已复用已绑定账号";
       }
-      setText(gopayLinkStatus, data.ok ? okText : "❌ " + (data.stage || "失败"));
+      setText(gopayLinkStatus, data.ok ? okText : "失败：" + (data.stage || "未知阶段"));
     }
     if (gopayRefID) setText(gopayRefID, (data.reference_id || data.account_id || "-").slice(0, 36));
     if (gopayOutput) setText(gopayOutput, JSON.stringify(data, null, 2));
@@ -2109,22 +2903,25 @@ async function runGopayFullLinkPayment(options) {
     }
 
     if (data.ok) {
-      var successText = "✅ GoPay 绑定成功！";
+      var successText = "GoPay 绑定成功";
       var badgeText = data.reused_existing ? "已复用" : "已绑定";
       if (data.stage === "gopay_complete") {
-        successText = "✅ 支付已完成";
+        successText = "支付已完成";
         badgeText = "支付完成";
       } else if (data.reused_existing) {
-        successText = "✅ 已绑定账号，已直接复用";
+        successText = "已绑定账号，已直接复用";
       }
       setGopayStep("success", "done", successText);
       if (gopayBadge) { setText(gopayBadge, badgeText); gopayBadge.className = "badge"; }
+      setWorkflowButtonState(gopayLinkBtn, "done");
       if (data.stage === "gopay_complete") await saveGPTPlusSuccessRecord(data);
     } else if (data.stage === "otp_all_failed") {
       if (gopayBadge) { setText(gopayBadge, "需真实验证码"); gopayBadge.className = "badge error"; }
+      setWorkflowButtonState(gopayLinkBtn, "error");
       showAutoFillNotice("需要真实 OTP", "提示", "自动尝试沙箱测试码均失败。", "请输入从 WhatsApp/SMS 收到的 6 位真实 OTP 验证码后重试。", "error");
     } else if (data.stage === "pin_all_failed" || data.stage === "payment_pin_all_failed") {
       if (gopayBadge) { setText(gopayBadge, data.stage === "payment_pin_all_failed" ? "需支付 PIN" : "PIN 未通过"); gopayBadge.className = "badge error"; }
+      setWorkflowButtonState(gopayLinkBtn, "error");
       showAutoFillNotice(
         data.stage === "payment_pin_all_failed" ? "需要支付 PIN" : "需要真实 GoPay PIN",
         "提示",
@@ -2136,18 +2933,31 @@ async function runGopayFullLinkPayment(options) {
           : "",
         "error"
       );
+    } else if (data.stage === "gopay_payment_failed") {
+      if (gopayBadge) { setText(gopayBadge, "支付失败"); gopayBadge.className = "badge error"; }
+      setGopayStep("success", "error", "GoPay 支付页返回失败，请重新生成结账链路");
+      setWorkflowButtonState(gopayLinkBtn, "error");
+      showAutoFillNotice(
+        "GoPay 支付失败",
+        "已停止",
+        "支付页未完成最终扣款，旧结账链路不能继续复用。",
+        "请关闭当前旧支付页，重新生成 OpenAI 结账链接后再触发 GoPay。",
+        "error"
+      );
     } else {
       if (gopayBadge) { setText(gopayBadge, "失败"); gopayBadge.className = "badge error"; }
+      setWorkflowButtonState(gopayLinkBtn, "error");
     }
 
     return data;
   } catch (err) {
     var elapsed = Math.round(performance.now() - startedAt);
     if (gopayLatency) setText(gopayLatency, elapsed + "ms");
-    if (gopayLinkStatus) setText(gopayLinkStatus, "❌ 网络错误");
+    if (gopayLinkStatus) setText(gopayLinkStatus, "网络错误");
     if (gopayOutput) setText(gopayOutput, JSON.stringify({ error: err.message }));
     if (gopayBadge) { setText(gopayBadge, "错误"); gopayBadge.className = "badge error"; }
     setGopayStep("linking", "error", "网络错误: " + err.message);
+    setWorkflowButtonState(gopayLinkBtn, "error");
     return null;
   } finally {
     gopayPaymentFlowRunning = false;
@@ -2191,7 +3001,23 @@ const luckmailShareCodeLinkBtn = document.querySelector("#luckmailShareCodeLinkB
 const luckmailCreateAndWaitBtn = document.querySelector("#luckmailCreateAndWaitBtn");
 const luckmailCopyCodeBtn = document.querySelector("#luckmailCopyCodeBtn");
 const luckmailBadge = document.querySelector("#luckmailBadge");
+const luckmailApiProfileSelect = document.querySelector("#luckmailApiProfileSelect");
+const luckmailApiProfileName = document.querySelector("#luckmailApiProfileName");
+const luckmailApiKey = document.querySelector("#luckmailApiKey");
+const luckmailApiBaseUrl = document.querySelector("#luckmailApiBaseUrl");
+const luckmailApiProjectCode = document.querySelector("#luckmailApiProjectCode");
+const luckmailApiEmailType = document.querySelector("#luckmailApiEmailType");
+const luckmailApiDomain = document.querySelector("#luckmailApiDomain");
+const luckmailApiTimeoutS = document.querySelector("#luckmailApiTimeoutS");
+const luckmailApiIntervalS = document.querySelector("#luckmailApiIntervalS");
+const luckmailApiTestBtn = document.querySelector("#luckmailApiTestBtn");
+const luckmailApiSaveBtn = document.querySelector("#luckmailApiSaveBtn");
+const luckmailApiActivateBtn = document.querySelector("#luckmailApiActivateBtn");
+const luckmailApiDeleteBtn = document.querySelector("#luckmailApiDeleteBtn");
+const luckmailApiStatus = document.querySelector("#luckmailApiStatus");
 const luckmailVoicePromptToggle = document.querySelector("#luckmailVoicePromptToggle");
+const luckmailVoiceVolume = document.querySelector("#luckmailVoiceVolume");
+const luckmailVoiceRate = document.querySelector("#luckmailVoiceRate");
 const luckmailVoicePromptText = document.querySelector("#luckmailVoicePromptText");
 const luckmailResult = document.querySelector("#luckmailResult");
 const luckmailEmailAddress = document.querySelector("#luckmailEmailAddress");
@@ -2205,38 +3031,237 @@ const luckmailMailsEmail = document.querySelector("#luckmailMailsEmail");
 const luckmailMailsList = document.querySelector("#luckmailMailsList");
 let latestLuckMailCode = "";
 let luckMailVerificationSinceUnixMS = 0;
+let luckMailCodePollingActive = false;
 let lastVoicePromptKey = "";
+let activeLuckMailVoiceUtterance = null;
+let cachedLuckMailVoices = [];
+let voicePromptPlaybackQueue = Promise.resolve();
+let voicePromptRecentKeys = new Map();
 const luckmailVoicePromptStorageKey = "luckmail_voice_prompt_enabled";
+const luckmailVoiceVolumeStorageKey = "luckmail_voice_prompt_volume";
+const luckmailVoiceRateStorageKey = "luckmail_voice_prompt_rate";
+const voicePromptDedupeWindowMS = 6000;
+
+function speechPromptSupported() {
+  return "speechSynthesis" in window && "SpeechSynthesisUtterance" in window;
+}
+
+function setLuckMailVoicePromptStatus(message) {
+  if (luckmailVoicePromptText) setText(luckmailVoicePromptText, message);
+}
+
+function clampVoiceNumber(value, fallback, min, max) {
+  var number = Number(value);
+  if (!Number.isFinite(number)) number = fallback;
+  return Math.min(max, Math.max(min, Math.round(number)));
+}
+
+function voicePromptVolume() {
+  return clampVoiceNumber(luckmailVoiceVolume?.value, 100, 0, 100);
+}
+
+function voicePromptRate() {
+  return clampVoiceNumber(luckmailVoiceRate?.value, 0, -4, 4);
+}
+
+function browserVoiceRate() {
+  return Math.min(1.8, Math.max(0.5, 1 + voicePromptRate() / 10));
+}
+
+function normalizeVoicePromptMessage(message) {
+  var text = String(message || "")
+    .replace(/<script[^>]*>[\s\S]*?<\/script>|<style[^>]*>[\s\S]*?<\/style>/gi, " ")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/[\u0000-\u001f\u007f-\u009f]/g, " ")
+    .replace(/[\u200b-\u200d\ufeff\ufe0e\ufe0f]/gi, "")
+    .replace(/[\u{1f000}-\u{1faff}\u2600-\u27bf]/gu, " ");
+  text = text.replace(/\s+/g, " ").trim();
+  var chars = Array.from(text);
+  if (chars.length > 160) text = chars.slice(0, 160).join("");
+  return text;
+}
+
+function voicePromptSettingsSummary() {
+  return "音量 " + voicePromptVolume() + "% · 语速 " + voicePromptRate();
+}
+
+function pruneVoicePromptRecentKeys(now) {
+  now = now || Date.now();
+  voicePromptRecentKeys.forEach(function (lastAt, key) {
+    if (now - lastAt > Math.max(voicePromptDedupeWindowMS, 12000)) {
+      voicePromptRecentKeys.delete(key);
+    }
+  });
+}
+
+function shouldAnnounceVoicePrompt(key, force, windowMS) {
+  var promptKey = String(key || "");
+  if (!promptKey) return true;
+  var now = Date.now();
+  pruneVoicePromptRecentKeys(now);
+  var dedupeMS = Math.max(800, Number(windowMS || voicePromptDedupeWindowMS));
+  var lastAt = Number(voicePromptRecentKeys.get(promptKey) || 0);
+  if (!force && lastAt > 0 && now - lastAt < dedupeMS) return false;
+  voicePromptRecentKeys.set(promptKey, now);
+  return true;
+}
+
+function refreshLuckMailVoices() {
+  if (!speechPromptSupported()) {
+    cachedLuckMailVoices = [];
+    return cachedLuckMailVoices;
+  }
+  try {
+    cachedLuckMailVoices = window.speechSynthesis.getVoices() || [];
+  } catch (_err) {
+    cachedLuckMailVoices = [];
+  }
+  return cachedLuckMailVoices;
+}
+
+function selectLuckMailVoice() {
+  var voices = cachedLuckMailVoices.length ? cachedLuckMailVoices : refreshLuckMailVoices();
+  return voices.find(function (voice) {
+    return /zh[-_]?cn|zh[-_]?hans|mandarin|chinese|xiaoxiao|yunxi|huihui|普通话|中文/i.test((voice.lang || "") + " " + (voice.name || ""));
+  }) || voices.find(function (voice) {
+    return /^zh/i.test(voice.lang || "");
+  }) || null;
+}
+
+function luckMailVoiceErrorMessage(reason) {
+  if (reason === "not-allowed") return "语音被浏览器拦截，请再点一次开关";
+  if (reason === "synthesis-failed") return "语音启动失败，请检查系统音量或浏览器语音包";
+  if (reason === "audio-busy") return "语音设备忙，请稍后重试";
+  return "语音播放失败：" + (reason || "未知错误");
+}
+
+async function speakLuckMailPromptLocally(message) {
+  var speechText = normalizeVoicePromptMessage(message);
+  if (!speechText) throw new Error("empty voice message");
+  var result = await fetchJSONWithTimeout("/api/voice/speak", {
+    method: "POST",
+    headers: buildRequestHeaders(),
+    body: JSON.stringify({ message: speechText, volume: voicePromptVolume(), rate: voicePromptRate() }),
+  }, 18000);
+  if (!result.data?.ok) {
+    throw new Error(result.data?.error || result.data?.stage || "本机语音接口失败");
+  }
+  return result.data;
+}
+
+function speakLuckMailPromptInBrowser(key, message, force) {
+  if (!speechPromptSupported()) {
+    setLuckMailVoicePromptStatus("浏览器不支持语音");
+    return false;
+  }
+  var speechText = normalizeVoicePromptMessage(message);
+  if (!speechText) return false;
+  var promptKey = String(key || message);
+  if (!force && lastVoicePromptKey === promptKey) return false;
+  lastVoicePromptKey = promptKey;
+  try {
+    refreshLuckMailVoices();
+    var utterance = new SpeechSynthesisUtterance(speechText);
+    var selectedVoice = selectLuckMailVoice();
+    if (selectedVoice) {
+      utterance.voice = selectedVoice;
+      utterance.lang = selectedVoice.lang || "zh-CN";
+    } else {
+      utterance.lang = "zh-CN";
+    }
+    utterance.rate = browserVoiceRate();
+    utterance.pitch = 1;
+    utterance.volume = voicePromptVolume() / 100;
+    utterance.onstart = function () {
+      setLuckMailVoicePromptStatus(speechText);
+    };
+    utterance.onend = function () {
+      if (activeLuckMailVoiceUtterance === utterance) {
+        activeLuckMailVoiceUtterance = null;
+      }
+    };
+    utterance.onerror = function (event) {
+      if (activeLuckMailVoiceUtterance === utterance) {
+        activeLuckMailVoiceUtterance = null;
+      }
+      var reason = event?.error || "unknown";
+      if (reason === "interrupted" || reason === "canceled") return;
+      setLuckMailVoicePromptStatus(luckMailVoiceErrorMessage(reason));
+    };
+    activeLuckMailVoiceUtterance = utterance;
+    window.speechSynthesis.cancel();
+    if (typeof window.speechSynthesis.resume === "function") {
+      window.speechSynthesis.resume();
+    }
+    setLuckMailVoicePromptStatus(speechText);
+    window.speechSynthesis.speak(utterance);
+    window.setTimeout(function () {
+      if (luckmailVoicePromptToggle?.checked && window.speechSynthesis.paused && typeof window.speechSynthesis.resume === "function") {
+        window.speechSynthesis.resume();
+      }
+    }, 250);
+    return true;
+  } catch (error) {
+    setLuckMailVoicePromptStatus(luckMailVoiceErrorMessage(error?.message || "未知错误"));
+    return false;
+  }
+}
+
+function speakLuckMailPrompt(key, message, force) {
+  var speechText = normalizeVoicePromptMessage(message);
+  if (!speechText) return false;
+  if (!voicePromptEnabled()) return false;
+  var promptKey = String(key || speechText);
+  if (!shouldAnnounceVoicePrompt(promptKey, force, voicePromptDedupeWindowMS)) return false;
+  lastVoicePromptKey = promptKey;
+  setLuckMailVoicePromptStatus("中文语音排队中...");
+  voicePromptPlaybackQueue = voicePromptPlaybackQueue.catch(function () {}).then(async function () {
+    if (!voicePromptEnabled()) return;
+    setLuckMailVoicePromptStatus("本机语音播报中...");
+    try {
+      await speakLuckMailPromptLocally(speechText);
+      setLuckMailVoicePromptStatus(speechText);
+    } catch (error) {
+      var usedBrowserFallback = speakLuckMailPromptInBrowser(promptKey, speechText, true);
+      if (!usedBrowserFallback) {
+        setLuckMailVoicePromptStatus("本机语音失败：" + (error?.message || "未知错误"));
+      }
+    }
+  });
+  return true;
+}
+
+if (speechPromptSupported()) {
+  refreshLuckMailVoices();
+  if (typeof window.speechSynthesis.addEventListener === "function") {
+    window.speechSynthesis.addEventListener("voiceschanged", refreshLuckMailVoices);
+  } else {
+    window.speechSynthesis.onvoiceschanged = refreshLuckMailVoices;
+  }
+}
 
 function restoreLuckMailVoicePromptPreference() {
   if (!luckmailVoicePromptToggle) return;
   try {
     luckmailVoicePromptToggle.checked = window.localStorage?.getItem(luckmailVoicePromptStorageKey) === "1";
+    if (luckmailVoiceVolume) luckmailVoiceVolume.value = String(clampVoiceNumber(window.localStorage?.getItem(luckmailVoiceVolumeStorageKey), 100, 0, 100));
+    if (luckmailVoiceRate) luckmailVoiceRate.value = String(clampVoiceNumber(window.localStorage?.getItem(luckmailVoiceRateStorageKey), 0, -4, 4));
   } catch (_err) {
     luckmailVoicePromptToggle.checked = false;
   }
-  if (luckmailVoicePromptText) {
-    setText(luckmailVoicePromptText, luckmailVoicePromptToggle.checked ? "语音播报已开启" : "未开启");
-  }
+  setLuckMailVoicePromptStatus(luckmailVoicePromptToggle.checked ? ("语音播报已开启 · " + voicePromptSettingsSummary()) : "未开启");
 }
 
 function voicePromptEnabled() {
-  return !!(luckmailVoicePromptToggle && luckmailVoicePromptToggle.checked && "speechSynthesis" in window);
+  return !!(luckmailVoicePromptToggle && luckmailVoicePromptToggle.checked);
 }
 
 function announceLuckMailScene(key, message, force) {
-  if (!message) return;
-  if (luckmailVoicePromptText) setText(luckmailVoicePromptText, message);
+  var speechText = normalizeVoicePromptMessage(message);
+  if (!speechText) return;
+  setLuckMailVoicePromptStatus(speechText);
   if (!voicePromptEnabled()) return;
-  var promptKey = String(key || message);
-  if (!force && lastVoicePromptKey === promptKey) return;
-  lastVoicePromptKey = promptKey;
-  window.speechSynthesis.cancel();
-  var utterance = new SpeechSynthesisUtterance(message);
-  utterance.lang = "zh-CN";
-  utterance.rate = 1;
-  utterance.pitch = 1;
-  window.speechSynthesis.speak(utterance);
+  speakLuckMailPrompt(key, speechText, force);
 }
 
 luckmailVoicePromptToggle?.addEventListener("change", function () {
@@ -2244,15 +3269,311 @@ luckmailVoicePromptToggle?.addEventListener("change", function () {
     window.localStorage?.setItem(luckmailVoicePromptStorageKey, luckmailVoicePromptToggle.checked ? "1" : "0");
   } catch (_err) {}
   if (luckmailVoicePromptToggle.checked) {
-    announceLuckMailScene("voice_enabled", "语音播报已开启", true);
+    setLuckMailVoicePromptStatus("正在试播...");
+    speakLuckMailPrompt("voice_enabled", "语音播报已开启", true);
   } else {
     if ("speechSynthesis" in window) window.speechSynthesis.cancel();
+    activeLuckMailVoiceUtterance = null;
     lastVoicePromptKey = "";
-    if (luckmailVoicePromptText) setText(luckmailVoicePromptText, "未开启");
+    setLuckMailVoicePromptStatus("未开启");
   }
 });
 
+function persistLuckMailVoiceSettings(announce) {
+  try {
+    window.localStorage?.setItem(luckmailVoiceVolumeStorageKey, String(voicePromptVolume()));
+    window.localStorage?.setItem(luckmailVoiceRateStorageKey, String(voicePromptRate()));
+  } catch (_err) {}
+  if (voicePromptEnabled()) {
+    setLuckMailVoicePromptStatus("语音设置已更新 · " + voicePromptSettingsSummary());
+    if (announce) speakLuckMailPrompt("voice_settings_updated", "语音设置已更新", true);
+  }
+}
+
+luckmailVoiceVolume?.addEventListener("input", function () { persistLuckMailVoiceSettings(false); });
+luckmailVoiceVolume?.addEventListener("change", function () { persistLuckMailVoiceSettings(true); });
+luckmailVoiceRate?.addEventListener("input", function () { persistLuckMailVoiceSettings(false); });
+luckmailVoiceRate?.addEventListener("change", function () { persistLuckMailVoiceSettings(true); });
+
 restoreLuckMailVoicePromptPreference();
+
+let luckmailApiConfigState = {
+  profiles: [],
+  fallback_config: null,
+  active_id: "",
+  active_source: "config",
+};
+const luckmailLegacyConfigProfileID = "__config__";
+let luckmailApiFormDirty = false;
+
+function profileKeySummary(summary) {
+  var key = summary?.api_key || {};
+  if (!key.present) return "未配置密钥";
+  return "密钥已配置" + (key.suffix ? " · 尾号 " + key.suffix : "") + (key.length ? " · " + key.length + " 位" : "");
+}
+
+function allLuckMailAPIProfiles() {
+  var profiles = Array.isArray(luckmailApiConfigState.profiles) ? luckmailApiConfigState.profiles.slice() : [];
+  if (luckmailApiConfigState.fallback_config) profiles.push(luckmailApiConfigState.fallback_config);
+  return profiles;
+}
+
+function findLuckMailAPIProfile(id) {
+  id = String(id || "");
+  return allLuckMailAPIProfiles().find(function (profile) { return profile && profile.id === id; }) || null;
+}
+
+function isEditableLuckMailAPIProfileID(id) {
+  return !!id && id !== luckmailLegacyConfigProfileID;
+}
+
+function selectedLuckMailAPIProfileID() {
+  return luckmailApiProfileSelect?.value || "";
+}
+
+function luckMailAPIContextPayload() {
+  var id = selectedLuckMailAPIProfileID();
+  if (!id) return {};
+  return { luckmail_api_key_profile_id: id };
+}
+
+function fillLuckMailAPIForm(profile) {
+  profile = profile || {};
+  if (luckmailApiProfileName) luckmailApiProfileName.value = profile.locked ? "" : (profile.name || "");
+  if (luckmailApiKey && !(luckmailApiFormDirty && luckmailApiKey.value.trim())) luckmailApiKey.value = "";
+  if (luckmailApiBaseUrl) luckmailApiBaseUrl.value = profile.base_url || "";
+  if (luckmailApiProjectCode) luckmailApiProjectCode.value = profile.project_code || "";
+  if (luckmailApiEmailType) luckmailApiEmailType.value = profile.email_type || "ms_graph";
+  if (luckmailApiDomain) luckmailApiDomain.value = profile.domain || "";
+  if (luckmailApiTimeoutS) luckmailApiTimeoutS.value = profile.timeout_s || "";
+  if (luckmailApiIntervalS) luckmailApiIntervalS.value = profile.interval_s || "";
+
+  if (profile.project_code && luckmailProjectCode) luckmailProjectCode.value = profile.project_code;
+  if (profile.email_type && luckmailEmailType) luckmailEmailType.value = profile.email_type;
+  if (profile.domain && luckmailDomain) luckmailDomain.value = profile.domain;
+  if (profile.timeout_s) {
+    if (luckmailTimeoutS) luckmailTimeoutS.value = profile.timeout_s;
+    if (luckmailTokenTimeoutS) luckmailTokenTimeoutS.value = profile.timeout_s;
+  }
+  if (profile.interval_s) {
+    if (luckmailIntervalS) luckmailIntervalS.value = profile.interval_s;
+    if (luckmailTokenIntervalS) luckmailTokenIntervalS.value = profile.interval_s;
+  }
+}
+
+function renderLuckMailAPIConfig(data, preferredID) {
+  if (!data) return;
+  luckmailApiConfigState = {
+    profiles: Array.isArray(data.profiles) ? data.profiles : [],
+    fallback_config: data.fallback_config || null,
+    active_id: data.active_id || "",
+    active_source: data.active_source || "config",
+  };
+  if (!luckmailApiProfileSelect) return;
+  var previous = preferredID || luckmailApiProfileSelect.value || "";
+  var options = [];
+  options.push({ value: "", label: "自动使用活动配置" });
+  if (luckmailApiConfigState.fallback_config) {
+    options.push({ value: luckmailLegacyConfigProfileID, label: "配置文件 / 环境变量" });
+  }
+  luckmailApiConfigState.profiles.forEach(function (profile) {
+    options.push({
+      value: profile.id,
+      label: (profile.active ? "默认 · " : "") + (profile.name || profile.id || "未命名配置"),
+    });
+  });
+  luckmailApiProfileSelect.innerHTML = "";
+  options.forEach(function (item) {
+    var option = document.createElement("option");
+    option.value = item.value;
+    option.textContent = item.label;
+    luckmailApiProfileSelect.appendChild(option);
+  });
+  var selected = previous;
+  if (selected && !options.some(function (item) { return item.value === selected; })) selected = "";
+  if (!selected) selected = luckmailApiConfigState.active_id || luckmailLegacyConfigProfileID;
+  if (!options.some(function (item) { return item.value === selected; })) selected = "";
+  luckmailApiProfileSelect.value = selected;
+  updateLuckMailAPIConfigFormFromSelection();
+}
+
+function updateLuckMailAPIConfigFormFromSelection() {
+  var selectedID = selectedLuckMailAPIProfileID();
+  var profile = selectedID ? findLuckMailAPIProfile(selectedID) : (findLuckMailAPIProfile(luckmailApiConfigState.active_id) || luckmailApiConfigState.fallback_config);
+  fillLuckMailAPIForm(profile);
+  var locked = !!profile?.locked;
+  if (luckmailApiDeleteBtn) luckmailApiDeleteBtn.disabled = locked || !isEditableLuckMailAPIProfileID(selectedID);
+  if (luckmailApiActivateBtn) luckmailApiActivateBtn.disabled = locked || !isEditableLuckMailAPIProfileID(selectedID) || !!profile?.active;
+  if (luckMailCodePollingActive) {
+    if (luckmailApiSaveBtn) luckmailApiSaveBtn.disabled = true;
+    if (luckmailApiTestBtn) luckmailApiTestBtn.disabled = true;
+    if (luckmailApiDeleteBtn) luckmailApiDeleteBtn.disabled = true;
+    if (luckmailApiActivateBtn) luckmailApiActivateBtn.disabled = true;
+  }
+  if (luckmailApiStatus) {
+    var activeText = profile?.active ? "当前默认" : (selectedID ? "可设为默认" : "自动选择");
+    setText(luckmailApiStatus, luckMailCodePollingActive ? "正在等待验证码，已暂时锁定配置与关闭窗口操作" : [activeText, profile?.name || "配置文件 / 环境变量", profileKeySummary(profile)].filter(Boolean).join(" · "));
+  }
+}
+
+function setLuckMailCodePollingActive(active) {
+  luckMailCodePollingActive = !!active;
+  if (closeIncognitoBtn) closeIncognitoBtn.disabled = luckMailCodePollingActive;
+  updateLuckMailAPIConfigFormFromSelection();
+}
+
+async function loadLuckMailAPIConfig(preferredID) {
+  if (!luckmailApiProfileSelect) return;
+  try {
+    var result = await fetchJSONWithTimeout("/api/luckmail/config", { method: "GET", headers: buildRequestHeaders() }, 12000);
+    var data = result.data;
+    if (!data.ok) throw new Error(data.error || "读取 LuckMail API 配置失败");
+    renderLuckMailAPIConfig(data, preferredID);
+  } catch (error) {
+    if (luckmailApiStatus) setText(luckmailApiStatus, error.message || "读取 LuckMail API 配置失败");
+  }
+}
+
+function luckMailAPIConfigFormPayload(setActive) {
+  var selectedID = selectedLuckMailAPIProfileID();
+  return {
+    id: isEditableLuckMailAPIProfileID(selectedID) ? selectedID : "",
+    name: (luckmailApiProfileName?.value || "").trim(),
+    api_key: (luckmailApiKey?.value || "").trim(),
+    base_url: (luckmailApiBaseUrl?.value || "").trim(),
+    project_code: (luckmailApiProjectCode?.value || "").trim(),
+    email_type: (luckmailApiEmailType?.value || "").trim(),
+    domain: (luckmailApiDomain?.value || "").trim(),
+    timeout_s: numberInputValue(luckmailApiTimeoutS, 0),
+    interval_s: numberInputValue(luckmailApiIntervalS, 0),
+    set_active: setActive !== false,
+  };
+}
+
+async function saveLuckMailAPIConfig(setActive) {
+  if (!luckmailApiSaveBtn) return;
+  var payload = luckMailAPIConfigFormPayload(true);
+  if (!payload.name && !payload.id) payload.name = "主力 API";
+  var originalText = setActive ? (luckmailApiActivateBtn?.textContent || "设为默认") : (luckmailApiSaveBtn.textContent || "保存配置");
+  var targetButton = setActive ? luckmailApiActivateBtn : luckmailApiSaveBtn;
+  if (targetButton) {
+    targetButton.disabled = true;
+    setText(targetButton, setActive ? "设置中..." : "保存中...");
+  }
+  if (luckmailApiStatus) setText(luckmailApiStatus, setActive ? "正在设置默认配置..." : "正在保存配置...");
+  try {
+    var result = await fetchJSONWithTimeout("/api/luckmail/config", {
+      method: "POST",
+      headers: buildRequestHeaders(),
+      body: JSON.stringify(payload),
+    }, 12000);
+    var resp = result.response;
+    var data = result.data;
+    if (!resp.ok || !data.ok) throw new Error(data.error || "保存 LuckMail API 配置失败");
+    if (luckmailApiKey) luckmailApiKey.value = "";
+    luckmailApiFormDirty = false;
+    var nextID = data.saved_id || data.active_id || payload.id || "";
+    renderLuckMailAPIConfig(data, nextID);
+    if (luckmailApiStatus) setText(luckmailApiStatus, (setActive ? "已设为默认" : "配置已保存并设为当前使用") + " · " + profileKeySummary(findLuckMailAPIProfile(nextID)));
+  } catch (error) {
+    if (luckmailApiStatus) setText(luckmailApiStatus, error.message || "保存 LuckMail API 配置失败");
+  } finally {
+    if (targetButton) {
+      targetButton.disabled = false;
+      setText(targetButton, originalText);
+    }
+  }
+}
+
+async function deleteLuckMailAPIConfig() {
+  var selectedID = selectedLuckMailAPIProfileID();
+  if (!isEditableLuckMailAPIProfileID(selectedID)) {
+    if (luckmailApiStatus) setText(luckmailApiStatus, "请选择一个已保存配置后再删除。");
+    return;
+  }
+  if (luckmailApiDeleteBtn) {
+    luckmailApiDeleteBtn.disabled = true;
+    setText(luckmailApiDeleteBtn, "删除中...");
+  }
+  if (luckmailApiStatus) setText(luckmailApiStatus, "正在删除配置...");
+  try {
+    var result = await fetchJSONWithTimeout("/api/luckmail/config", {
+      method: "DELETE",
+      headers: buildRequestHeaders(),
+      body: JSON.stringify({ id: selectedID }),
+    }, 12000);
+    var resp = result.response;
+    var data = result.data;
+    if (!resp.ok || !data.ok) throw new Error(data.error || "删除 LuckMail API 配置失败");
+    renderLuckMailAPIConfig(data, data.active_id || luckmailLegacyConfigProfileID);
+    if (luckmailApiStatus) setText(luckmailApiStatus, "配置已删除");
+  } catch (error) {
+    if (luckmailApiStatus) setText(luckmailApiStatus, error.message || "删除 LuckMail API 配置失败");
+  } finally {
+    if (luckmailApiDeleteBtn) {
+      luckmailApiDeleteBtn.disabled = false;
+      setText(luckmailApiDeleteBtn, "删除配置");
+    }
+    updateLuckMailAPIConfigFormFromSelection();
+  }
+}
+
+async function testLuckMailAPIConfig() {
+  if (!luckmailApiTestBtn) return;
+  var payload = luckMailAPIConfigFormPayload(false);
+  if (!payload.api_key && isEditableLuckMailAPIProfileID(selectedLuckMailAPIProfileID())) {
+    payload.id = selectedLuckMailAPIProfileID();
+  } else if (!payload.api_key && selectedLuckMailAPIProfileID() === luckmailLegacyConfigProfileID) {
+    payload.id = luckmailLegacyConfigProfileID;
+  }
+  luckmailApiTestBtn.disabled = true;
+  setText(luckmailApiTestBtn, "测试中...");
+  if (luckmailApiStatus) setText(luckmailApiStatus, "正在测试 LuckMail API Key，最多等待 25 秒...");
+  try {
+    var result = await fetchJSONWithTimeout("/api/luckmail/config/test", {
+      method: "POST",
+      headers: buildRequestHeaders(),
+      body: JSON.stringify(payload),
+    }, 26000);
+    var resp = result.response;
+    var data = result.data;
+    if (!resp.ok || !data.ok) throw new Error(data.error || "密钥测试失败");
+    var account = data.user_info?.username || data.user_info?.email || "账号可用";
+    if (luckmailApiStatus) setText(luckmailApiStatus, "测试通过 · " + account + (data.user_info?.balance ? " · 余额 " + data.user_info.balance : ""));
+  } catch (error) {
+    if (luckmailApiStatus) setText(luckmailApiStatus, error.message || "密钥测试失败");
+  } finally {
+    luckmailApiTestBtn.disabled = false;
+    setText(luckmailApiTestBtn, "测试密钥");
+  }
+}
+
+function markLuckMailAPIFormDirty() {
+  luckmailApiFormDirty = true;
+}
+
+luckmailApiProfileSelect?.addEventListener("change", function () {
+  luckmailApiFormDirty = false;
+  updateLuckMailAPIConfigFormFromSelection();
+});
+[
+  luckmailApiProfileName,
+  luckmailApiKey,
+  luckmailApiBaseUrl,
+  luckmailApiProjectCode,
+  luckmailApiEmailType,
+  luckmailApiDomain,
+  luckmailApiTimeoutS,
+  luckmailApiIntervalS,
+].forEach(function (node) {
+  node?.addEventListener("input", markLuckMailAPIFormDirty);
+  node?.addEventListener("change", markLuckMailAPIFormDirty);
+});
+luckmailApiSaveBtn?.addEventListener("click", function () { saveLuckMailAPIConfig(false); });
+luckmailApiActivateBtn?.addEventListener("click", function () { saveLuckMailAPIConfig(true); });
+luckmailApiDeleteBtn?.addEventListener("click", deleteLuckMailAPIConfig);
+luckmailApiTestBtn?.addEventListener("click", testLuckMailAPIConfig);
+loadLuckMailAPIConfig();
 
 luckmailToken?.addEventListener("input", function () {
   if (hasLuckMailToken()) {
@@ -2343,12 +3664,7 @@ async function waitTokenCodeAndFillLoginCode(options) {
     setText(luckmailMailMeta, attempt > 1 ? ("验证码页仍在等待，正在第 " + attempt + " 次获取新的 LuckMail 验证码...") : "验证码页已出现，正在通过 LuckMail 已购邮箱 Token 等待验证码...");
     announceLuckMailScene(attempt > 1 ? "verification_code_retry_waiting" : "verification_page_ready", attempt > 1 ? "正在等待新的邮箱验证码" : "已进入验证码页面，正在等待邮箱验证码");
     if (luckmailBadge) { setText(luckmailBadge, attempt > 1 ? ("重试 " + attempt + "/" + maxAttempts) : "等验证码"); luckmailBadge.className = "badge neutral"; }
-    var response = await fetch("/api/luckmail/token-code", {
-      method: "POST",
-      headers: buildRequestHeaders(),
-      body: JSON.stringify(luckMailTokenPayload()),
-    });
-    var data = await response.json();
+    var data = await fetchLuckMailTokenCodeWithRecovery({ retryableAttempts: Math.max(3, Number(options?.retryableAttempts || 3)) });
     if (data.email_address) applyLuckMailPurchase({ email_address: data.email_address, luckmail_token: (luckmailToken?.value || "").trim() });
     latestLuckMailCode = data.verification_code || "";
     setText(luckmailEmailAddress, data.email_address || purchasedEmailValue() || "-");
@@ -2356,6 +3672,12 @@ async function waitTokenCodeAndFillLoginCode(options) {
     setText(luckmailLatency, (data.elapsed_ms || "-") + "ms");
     renderLuckMailOutput(data);
     if (!latestLuckMailCode) {
+      if (isLuckMailTokenCodeRetryable(data)) {
+        if (luckmailBadge) { setText(luckmailBadge, "等待中断"); luckmailBadge.className = "badge error"; }
+        setText(luckmailMailMeta, "LuckMail 验证码等待被连续中断，请保持页面不刷新后再次点击 LuckMail 接码。");
+        announceLuckMailScene("token_code_retryable_failed", "验证码等待连续中断，请再次点击 LuckMail 接码");
+        return data;
+      }
       if (luckmailBadge) { setText(luckmailBadge, "手动模式"); luckmailBadge.className = "badge neutral"; }
       switchLuckMailManualMode(tokenFallbackMessage(data));
       renderLuckMailOutput(Object.assign({}, data, { manual_mode: true }));
@@ -2376,11 +3698,11 @@ async function waitTokenCodeAndFillLoginCode(options) {
 }
 
 function luckMailTokenPayload() {
-  var payload = {
+  var payload = Object.assign({
     luckmail_token: (luckmailToken?.value || "").trim(),
     timeout_s: numberInputValue(luckmailTokenTimeoutS, 300),
     interval_s: numberInputValue(luckmailTokenIntervalS, 3),
-  };
+  }, luckMailAPIContextPayload());
   if (luckMailVerificationSinceUnixMS > 0) payload.since_unix_ms = luckMailVerificationSinceUnixMS;
   return payload;
 }
@@ -2446,7 +3768,23 @@ async function saveGPTPlusSuccessRecord(paymentData) {
 }
 
 function hasLuckMailToken() {
-  return !!(luckmailToken?.value || "").trim();
+  return isLikelyLuckMailMailboxToken(luckMailTokenValue());
+}
+
+function luckMailTokenValue() {
+  return (luckmailToken?.value || "").trim();
+}
+
+function hasLuckMailTokenInput() {
+  return !!luckMailTokenValue();
+}
+
+function isLikelyLuckMailMailboxToken(value) {
+  return /^tok_[a-z0-9_-]{6,}$/i.test(String(value || "").trim());
+}
+
+function invalidLuckMailTokenInputMessage() {
+  return "LuckMail Token 输入框中的值不是已购邮箱 Token（应以 tok_ 开头）。已改用 API Key 配置读取已购邮箱列表。";
 }
 
 function setLuckMailMode(mode, message) {
@@ -2469,11 +3807,71 @@ function switchLuckMailAutoMode(message) {
 
 function tokenFallbackMessage(data) {
   var raw = String(data?.error || data?.message || "").trim();
+  if (hasLuckMailTokenInput() && !hasLuckMailToken()) return "LuckMail Token 格式不正确，已切换为手动模式；API Key 请保存到 LuckMail API 配置区域。";
   if (!hasLuckMailToken()) return "未填写 LuckMail Token，已切换为手动模式。";
+  if (/context canceled|cancelled|aborted|中断|取消/i.test(raw)) {
+    return "验证码等待被中断。系统会自动恢复等待；等待期间不要刷新页面、关闭无痕窗口或修改 LuckMail 配置。";
+  }
   if (/expired|expire|过期|invalid|无效|not found|不存在|alive|disabled|不可用/i.test(raw)) {
     return "LuckMail Token 无效、过期或邮箱不可用，已切换为手动模式。";
   }
   return raw ? (raw + "，已切换为手动模式。") : "未读取到有效 LuckMail Token，已切换为手动模式。";
+}
+
+function isLuckMailTokenCodeRetryable(data) {
+  var raw = String(data?.error || data?.message || data?.stage || "").trim();
+  return !!(data?.retryable || data?.interrupted || /context canceled|cancelled|canceled|aborted|operation was aborted|client disconnected|connection reset|broken pipe|中断|取消/i.test(raw));
+}
+
+function luckMailTokenCodeRetryDelayMS(attempt) {
+  return Math.min(3500, 900 + attempt * 650);
+}
+
+async function fetchLuckMailTokenCodeOnce() {
+  var response;
+  setLuckMailCodePollingActive(true);
+  try {
+    response = await fetch("/api/luckmail/token-code", {
+      method: "POST",
+      headers: buildRequestHeaders(),
+      body: JSON.stringify(luckMailTokenPayload()),
+    });
+  } finally {
+    setLuckMailCodePollingActive(false);
+  }
+  return await response.json();
+}
+
+async function fetchLuckMailTokenCodeWithRecovery(options) {
+  options = options || {};
+  var maxRetryableAttempts = Math.max(1, Number(options.retryableAttempts || 3));
+  var lastData = null;
+  for (var retryAttempt = 1; retryAttempt <= maxRetryableAttempts; retryAttempt += 1) {
+    try {
+      lastData = await fetchLuckMailTokenCodeOnce();
+    } catch (error) {
+      lastData = {
+        ok: false,
+        stage: "luckmail_token_code_request_interrupted",
+        retryable: true,
+        interrupted: true,
+        error: error.message || "LuckMail 验证码请求被中断",
+      };
+    }
+    if (!isLuckMailTokenCodeRetryable(lastData) || retryAttempt >= maxRetryableAttempts) {
+      return lastData;
+    }
+    var delayMS = luckMailTokenCodeRetryDelayMS(retryAttempt);
+    if (luckmailBadge) {
+      setText(luckmailBadge, "恢复等待 " + retryAttempt + "/" + maxRetryableAttempts);
+      luckmailBadge.className = "badge neutral";
+    }
+    setText(luckmailMailMeta, "LuckMail 验证码等待连接被中断，正在自动恢复轮询；请不要刷新页面或关闭无痕窗口。");
+    announceLuckMailScene("token_code_retryable_interrupted", "验证码等待被中断，正在自动恢复等待");
+    renderLuckMailOutput(Object.assign({}, lastData, { auto_retry_attempt: retryAttempt, auto_retry_delay_ms: delayMS }));
+    await new Promise(function (resolve) { setTimeout(resolve, delayMS); });
+  }
+  return lastData;
 }
 
 function formatLuckMailDate(value) {
@@ -2508,8 +3906,45 @@ function sanitizeLuckMailDisplayPayload(value) {
   return result;
 }
 
+const luckMailStageVoiceMessages = {
+  login_click_started: "正在监控登录入口与邮箱登录窗口。",
+  login_click_error: "登录按钮自动点击失败，请查看无痕窗口状态。",
+  luckmail_purchases_loading: "正在读取 LuckMail 已购邮箱。",
+  luckmail_email_preloaded: "已按当前 Token 读取并填入已购邮箱。",
+  luckmail_email_preloaded_from_purchases: "已从已购邮箱列表读取并填入邮箱。",
+  luckmail_email_preload_failed: "已购邮箱读取失败，请手动检查 Token 或邮箱状态。",
+  device_login_guide_started: "设备登录引导已启动。",
+  device_login_guide_failed: "设备登录引导失败，请查看页面状态。",
+  login_email_fill_started: "正在填写登录邮箱，并等待验证码页面出现。",
+  manual_email_required: "需要手动填写邮箱或检查 LuckMail Token。",
+  luckmail_token_waiting: "正在等待已购邮箱验证码。",
+  luckmail_token_code_received: "已购邮箱验证码已收到，正在自动填入。",
+  luckmail_token_code_interrupted: "验证码等待被中断，正在尝试恢复。",
+  luckmail_token_invalid_format: "LuckMail Token 格式不正确，请重新粘贴。",
+  luckmail_token_mails_loading: "正在查询已购邮箱邮件列表。",
+  luckmail_waiting: "正在创建临时接码订单并等待验证码。",
+  manual_code_required: "需要手动输入验证码。",
+  manual_code_fill_failed: "手动验证码填入失败，请查看页面提示。",
+  luckmail_manual_mode: "已进入手动模式，请手动处理邮箱或验证码。",
+  luckmail_share_link_copied: "验证码查看链接已复制。",
+  luckmail_share_link_failed: "验证码查看链接生成失败。",
+};
+
+function announceLuckMailDataStage(data) {
+  var stage = String(data?.stage || data?.status || "").trim();
+  if (!stage) return;
+  var message = luckMailStageVoiceMessages[stage] || "";
+  if (!message) {
+    if (data?.ok === false && data?.error) message = String(data.error);
+    if (data?.verification_code || data?.code) message = "验证码已收到，正在处理。";
+  }
+  if (!message) return;
+  announceLuckMailScene("luckmail_stage_" + stage, message, false);
+}
+
 function renderLuckMailOutput(data) {
   setText(luckmailOutput, JSON.stringify(sanitizeLuckMailDisplayPayload(data), null, 2));
+  announceLuckMailDataStage(data);
 }
 
 function renderLuckMailMails(data) {
@@ -2585,12 +4020,12 @@ function clearLuckMailResolvedEmailAfterCompletion() {
 
 async function resolveLuckMailEmailByToken() {
   if (!hasLuckMailToken()) {
-    return { ok: false, manual_mode: true, error: "luckmail_token is required" };
+    return { ok: false, manual_mode: true, error: hasLuckMailTokenInput() ? invalidLuckMailTokenInputMessage() : "luckmail_token is required" };
   }
   setText(luckmailMailMeta, "正在按当前 Token 精确读取对应邮箱...");
   announceLuckMailScene("purchase_loading", "正在按 Token 读取对应邮箱");
   var startedAt = performance.now();
-  var tokenValue = luckmailToken?.value?.trim() || "";
+  var tokenValue = luckMailTokenValue();
   var tokenResp = await fetch("/api/luckmail/token-mails", {
     method: "POST",
     headers: buildRequestHeaders(),
@@ -2614,6 +4049,41 @@ async function resolveLuckMailEmailByToken() {
   return { ok: false, manual_mode: true, error: fallback, data: tokenData, token_mode: true };
 }
 
+async function resolveLuckMailEmailByPurchaseList(options) {
+  options = options || {};
+  var startedAt = performance.now();
+  if (options.reason) {
+    setText(luckmailMailMeta, options.reason);
+  } else {
+    setText(luckmailMailMeta, "正在从 LuckMail 已购邮箱列表读取可用邮箱...");
+  }
+  var resp = await fetch("/api/luckmail/purchases", {
+    method: "POST",
+    headers: buildRequestHeaders(),
+    body: JSON.stringify(Object.assign({ page: 1, page_size: 20 }, luckMailAPIContextPayload())),
+  });
+  var data = await resp.json();
+  var elapsed = Math.round(performance.now() - startedAt);
+  var selected = data.selected || (data.list || []).find(function (item) { return item.email_address && item.luckmail_token && item.user_disabled === 0; }) || null;
+  var applied = resp.ok && data.ok && applyLuckMailPurchase(selected);
+  setText(luckmailLatency, (data.elapsed_ms || elapsed) + "ms");
+  setText(luckmailMailMeta, applied ? ("已读取并填入：" + selected.email_address) : (data.error || "未找到可用已购邮箱"));
+  renderLuckMailOutput(applied ? Object.assign({}, data, { stage: "luckmail_email_preloaded_from_purchases" }) : Object.assign({}, data, { stage: "luckmail_email_preload_failed", manual_mode: true }));
+  if (luckmailBadge) {
+    setText(luckmailBadge, applied ? "已读取" : "未找到");
+    luckmailBadge.className = applied ? "badge" : "badge error";
+  }
+  if (applied) {
+    switchLuckMailAutoMode("已通过 API Key 配置读取并填入已购邮箱");
+    announceLuckMailScene("purchase_loaded", "已读取并填入已购邮箱");
+    return { ok: true, email: selected.email_address, data: data, purchase_list_mode: true };
+  }
+  var fallback = data.error || "未找到可用已购邮箱，请手动填写邮箱地址和验证码。";
+  switchLuckMailManualMode(fallback);
+  announceLuckMailScene("purchase_load_failed", fallback);
+  return { ok: false, manual_mode: true, error: fallback, data: data, purchase_list_mode: true };
+}
+
 async function ensureLuckMailEmailForGuide() {
   if (hasLuckMailToken()) return await resolveLuckMailEmailByToken();
   var existingEmail = purchasedEmailValue();
@@ -2623,17 +4093,17 @@ async function ensureLuckMailEmailForGuide() {
     setLuckMailMode("manual", "已使用手动邮箱，验证码需要手动填写");
     return { ok: true, email: existingEmail, reused: true };
   }
-  if (!hasLuckMailToken()) {
-    switchLuckMailManualMode("未读取到有效 LuckMail Token，请先手动填写邮箱地址。填写后可继续执行登录页填入邮箱。");
-    return { ok: false, manual_mode: true, error: "luckmail_token is required" };
+  if (hasLuckMailTokenInput() && !hasLuckMailToken()) {
+    return await resolveLuckMailEmailByPurchaseList({ reason: invalidLuckMailTokenInputMessage() });
   }
-  return { ok: false, manual_mode: true, error: "luckmail_token is required" };
+  return await resolveLuckMailEmailByPurchaseList();
 }
 
 async function runLuckMailDeviceLoginGuide() {
   if (!luckmailDeviceLoginGuideBtn) return;
   var originalText = luckmailDeviceLoginGuideBtn.textContent;
   luckmailDeviceLoginGuideBtn.disabled = true;
+  setWorkflowButtonState(luckmailDeviceLoginGuideBtn, "running");
   if (luckmailLoadPurchaseBtn) luckmailLoadPurchaseBtn.disabled = true;
   if (luckmailLoginEmailFillBtn) luckmailLoginEmailFillBtn.disabled = true;
   if (luckmailTokenCodeBtn) luckmailTokenCodeBtn.disabled = true;
@@ -2658,9 +4128,10 @@ async function runLuckMailDeviceLoginGuide() {
     var loginData = await runLoginClickAfterIncognitoOpen({ returnData: true });
     var loginReady = !!(loginData && loginData.ok && (loginData.email_input_ready || loginData.email_mode_switched || loginData.login_surface_ready));
     if (!loginReady) {
-      var detail = Object.assign({}, loginData || {}, { ok: false, stage: "device_login_guide_login_click_failed", device_login_guide_failed: true });
+      var detail = Object.assign({}, loginData || {}, { ok: false, stage: "device_login_guide_login_click_watch_continues", device_login_guide_watch_continues: true });
       renderLuckMailOutput(detail);
-      throw Object.assign(new Error((loginData && loginData.error) || "登录按钮未触发或未检测到登录/注册邮箱窗口"), { detail: detail });
+      setText(luckmailMailMeta, "登录弹窗未立即出现，仍将继续监控；只要登录或注册邮箱窗口出现就会自动填写邮箱。");
+      announceLuckMailScene("device_login_guide_login_watch_continues", "登录弹窗未立即出现，系统继续监控邮箱输入窗口");
     }
     if (!purchasedEmailValue()) {
       switchLuckMailManualMode("未读取到可用邮箱，请手动填写邮箱地址和验证码。");
@@ -2669,19 +4140,28 @@ async function runLuckMailDeviceLoginGuide() {
     if (fields.customerEmail) fields.customerEmail.value = purchasedEmailValue();
     setText(luckmailDeviceLoginGuideBtn, "填邮箱...");
     setText(luckmailMailMeta, "已准备邮箱，正在填入登录页并等待验证码...");
-    var guideResult = await runLuckMailLoginEmailFill({ codeRetry: { maxAttempts: 3 } });
+    var guideResult = await runLuckMailLoginEmailFill({ codeRetry: { maxAttempts: 3 }, controlButton: luckmailDeviceLoginGuideBtn });
     if (guideResult?.login_completed) {
       if (luckmailBadge) { setText(luckmailBadge, "登录完成"); luckmailBadge.className = "badge"; }
+      setWorkflowButtonState(luckmailDeviceLoginGuideBtn, "done");
       announceLuckMailScene("device_login_guide_finished", "设备登录引导已完成，登录成功", true);
+    } else if (isLuckMailTokenCodeRetryable(guideResult)) {
+      if (luckmailBadge) { setText(luckmailBadge, "等待中断"); luckmailBadge.className = "badge error"; }
+      setWorkflowButtonState(luckmailDeviceLoginGuideBtn, "error");
+      setText(luckmailMailMeta, "设备登录引导已提交邮箱，但验证码等待连接被连续中断；请保持页面不刷新后重新点击 LuckMail 接码。");
+      announceLuckMailScene("device_login_guide_code_wait_interrupted", "验证码等待连续中断，请重新点击 LuckMail 接码");
     } else if (guideResult?.code_rejected) {
       if (luckmailBadge) { setText(luckmailBadge, "验证码错误"); luckmailBadge.className = "badge error"; }
+      setWorkflowButtonState(luckmailDeviceLoginGuideBtn, "error");
       announceLuckMailScene("device_login_guide_finished_with_code_error", "设备登录引导已重试，但验证码仍被页面判定错误");
     } else {
       if (luckmailBadge && latestLuckMailCode) { setText(luckmailBadge, "已填验证码"); luckmailBadge.className = "badge"; }
+      setWorkflowButtonState(luckmailDeviceLoginGuideBtn, "done");
       announceLuckMailScene("device_login_guide_finished", latestLuckMailCode ? "设备登录引导已完成，验证码已填入" : "设备登录引导已执行，请查看页面状态", true);
     }
   } catch (error) {
     if (luckmailBadge) { setText(luckmailBadge, "引导失败"); luckmailBadge.className = "badge error"; }
+    setWorkflowButtonState(luckmailDeviceLoginGuideBtn, "error");
     setText(luckmailMailMeta, error.message || "设备登录引导失败");
     announceLuckMailScene("device_login_guide_failed", error.message || "设备登录引导失败");
     renderLuckMailOutput(error.detail || { ok: false, stage: "device_login_guide_failed", error: error.message });
@@ -2706,39 +4186,17 @@ async function runLuckMailLoadPurchase() {
   setText(luckmailLoadPurchaseBtn, "读取中...");
   if (luckmailBadge) { setText(luckmailBadge, "读取中"); luckmailBadge.className = "badge neutral"; }
   if (luckmailResult) luckmailResult.hidden = false;
-  setText(luckmailMailMeta, (luckmailToken?.value?.trim() ? "正在按当前 Token 精确读取绑定邮箱..." : "正在从 LuckMail 已购邮箱列表读取可用邮箱..."));
+  setText(luckmailMailMeta, (hasLuckMailToken() ? "正在按当前 Token 精确读取绑定邮箱..." : "正在从 LuckMail 已购邮箱列表读取可用邮箱..."));
   announceLuckMailScene("purchase_loading", "正在读取已购邮箱");
   renderLuckMailOutput({ stage: "luckmail_purchases_loading" });
 
   try {
-    var tokenValue = luckmailToken?.value?.trim() || "";
-    if (!tokenValue) {
-      switchLuckMailManualMode("未填写 LuckMail Token，请手动填写邮箱地址和验证码。");
-      setText(luckmailLatency, Math.round(performance.now() - startedAt) + "ms");
-      renderLuckMailOutput({ ok: false, stage: "luckmail_manual_mode", manual_mode: true, error: "luckmail_token is required" });
-      return;
-    }
-    if (tokenValue) {
+    if (hasLuckMailToken()) {
       await resolveLuckMailEmailByToken();
       return;
     }
-    var resp = await fetch("/api/luckmail/purchases", {
-      method: "POST",
-      headers: buildRequestHeaders(),
-      body: JSON.stringify({ page: 1, page_size: 20 }),
-    });
-    var data = await resp.json();
-    var elapsed = Math.round(performance.now() - startedAt);
-    var selected = data.selected || (data.list || []).find(function (item) { return item.email_address && item.luckmail_token && item.user_disabled === 0; }) || null;
-    var applied = data.ok && applyLuckMailPurchase(selected);
-    setText(luckmailLatency, (data.elapsed_ms || elapsed) + "ms");
-    setText(luckmailMailMeta, applied ? ("已读取并填入：" + selected.email_address) : (data.error || "未找到可用已购邮箱"));
-    renderLuckMailOutput(data);
-    if (luckmailBadge) {
-      setText(luckmailBadge, applied ? "已读取" : "未找到");
-      luckmailBadge.className = applied ? "badge" : "badge error";
-    }
-    announceLuckMailScene("purchase_loaded", applied ? "已读取并填入已购邮箱" : (data.error || "未找到可用已购邮箱"));
+    var reason = hasLuckMailTokenInput() ? invalidLuckMailTokenInputMessage() : "";
+    await resolveLuckMailEmailByPurchaseList(reason ? { reason: reason } : {});
   } catch (error) {
     var elapsed = Math.round(performance.now() - startedAt);
     setText(luckmailLatency, elapsed + "ms");
@@ -2756,7 +4214,8 @@ async function runLuckMailLoadPurchase() {
 }
 
 async function runLuckMailLoginEmailFill(options) {
-  if (!luckmailLoginEmailFillBtn) return;
+  options = options || {};
+  var controlButton = options.controlButton || luckmailLoginEmailFillBtn || null;
   var emailReady = hasLuckMailToken() ? await ensureLuckMailEmailForGuide() : { ok: !!purchasedEmailValue(), email: purchasedEmailValue() };
   var email = String(emailReady?.email || purchasedEmailValue() || "").trim();
   if (fields.customerEmail) fields.customerEmail.value = email;
@@ -2768,12 +4227,12 @@ async function runLuckMailLoginEmailFill(options) {
     return;
   }
 
-  var originalText = luckmailLoginEmailFillBtn.textContent;
+  var originalText = controlButton?.textContent || "登录页填入邮箱";
   var startedAt = performance.now();
-  luckmailLoginEmailFillBtn.disabled = true;
+  if (controlButton) controlButton.disabled = true;
   if (luckmailTokenCodeBtn) luckmailTokenCodeBtn.disabled = true;
   if (luckmailTokenMailsBtn) luckmailTokenMailsBtn.disabled = true;
-  setText(luckmailLoginEmailFillBtn, "提交邮箱...");
+  setText(controlButton, "提交邮箱...");
   if (luckmailBadge) { setText(luckmailBadge, "提交邮箱"); luckmailBadge.className = "badge neutral"; }
   if (luckmailResult) luckmailResult.hidden = false;
   setText(luckmailEmailAddress, email);
@@ -2792,7 +4251,7 @@ async function runLuckMailLoginEmailFill(options) {
     var resp = await fetch("/api/login/email-fill", {
       method: "POST",
       headers: buildRequestHeaders(),
-      body: JSON.stringify({ email: email, timeout_s: 120 }),
+      body: JSON.stringify({ email: email, timeout_s: 300 }),
     });
     var data = await resp.json();
     if (data.email_filled || data.clicked_continue || data.verification_ready) {
@@ -2832,10 +4291,10 @@ async function runLuckMailLoginEmailFill(options) {
     renderLuckMailOutput({ ok: false, error: error.message });
     if (luckmailBadge) { setText(luckmailBadge, "错误"); luckmailBadge.className = "badge error"; }
   } finally {
-    luckmailLoginEmailFillBtn.disabled = false;
+    if (controlButton) controlButton.disabled = false;
     if (luckmailTokenCodeBtn) luckmailTokenCodeBtn.disabled = false;
     if (luckmailTokenMailsBtn) luckmailTokenMailsBtn.disabled = false;
-    setText(luckmailLoginEmailFillBtn, originalText || "登录页填入邮箱");
+    setText(controlButton, originalText || "登录页填入邮箱");
   }
 }
 
@@ -2845,6 +4304,7 @@ async function runLuckMailTokenCode() {
   var startedAt = performance.now();
   latestLuckMailCode = "";
   luckmailTokenCodeBtn.disabled = true;
+  setWorkflowButtonState(luckmailTokenCodeBtn, "running");
   if (luckmailTokenMailsBtn) luckmailTokenMailsBtn.disabled = true;
   if (luckmailCopyCodeBtn) luckmailCopyCodeBtn.disabled = true;
   setText(luckmailTokenCodeBtn, "等待已购邮箱中...");
@@ -2853,9 +4313,11 @@ async function runLuckMailTokenCode() {
   setText(luckmailEmailAddress, "-");
   setText(luckmailVerificationCode, "-");
   if (!hasLuckMailToken()) {
-    switchLuckMailManualMode("未填写 LuckMail Token，请手动填写邮箱地址和验证码。");
+    var tokenMessage = hasLuckMailTokenInput() ? "LuckMail Token 格式不正确，验证码轮询需要以 tok_ 开头的已购邮箱 Token。" : "未填写 LuckMail Token，请手动填写邮箱地址和验证码。";
+    switchLuckMailManualMode(tokenMessage);
     setText(luckmailLatency, Math.round(performance.now() - startedAt) + "ms");
-    renderLuckMailOutput({ ok: false, stage: "luckmail_manual_mode", manual_mode: true, error: "luckmail_token is required" });
+    renderLuckMailOutput({ ok: false, stage: "luckmail_manual_mode", manual_mode: true, error: hasLuckMailTokenInput() ? "luckmail_token invalid format" : "luckmail_token is required" });
+    setWorkflowButtonState(luckmailTokenCodeBtn, "error");
     luckmailTokenCodeBtn.disabled = false;
     if (luckmailTokenMailsBtn) luckmailTokenMailsBtn.disabled = false;
     setText(luckmailTokenCodeBtn, originalText || "等待已购邮箱验证码");
@@ -2866,16 +4328,20 @@ async function runLuckMailTokenCode() {
   renderLuckMailOutput({ stage: "luckmail_token_waiting" });
 
   try {
-    var resp = await fetch("/api/luckmail/token-code", {
-      method: "POST",
-      headers: buildRequestHeaders(),
-      body: JSON.stringify(luckMailTokenPayload()),
-    });
-    var data = await resp.json();
+    var data = await fetchLuckMailTokenCodeWithRecovery({ retryableAttempts: 3 });
     renderLuckMailData(data, Math.round(performance.now() - startedAt));
     if (!data.ok) {
-      switchLuckMailManualMode(tokenFallbackMessage(data));
-      renderLuckMailOutput(Object.assign({}, data, { manual_mode: true }));
+      setWorkflowButtonState(luckmailTokenCodeBtn, "error");
+      if (isLuckMailTokenCodeRetryable(data)) {
+        setText(luckmailMailMeta, "LuckMail 验证码等待被连续中断，请保持页面不刷新后再次点击 LuckMail 接码。");
+        announceLuckMailScene("token_code_retryable_failed", "验证码等待连续中断，请再次点击 LuckMail 接码");
+        renderLuckMailOutput(Object.assign({}, data, { auto_retry_exhausted: true }));
+      } else {
+        switchLuckMailManualMode(tokenFallbackMessage(data));
+        renderLuckMailOutput(Object.assign({}, data, { manual_mode: true }));
+      }
+    } else {
+      setWorkflowButtonState(luckmailTokenCodeBtn, "done");
     }
   } catch (error) {
     var elapsed = Math.round(performance.now() - startedAt);
@@ -2884,6 +4350,7 @@ async function runLuckMailTokenCode() {
     announceLuckMailScene("token_code_error", error.message || "LuckMail 已购邮箱请求失败");
     renderLuckMailOutput({ ok: false, error: error.message });
     if (luckmailBadge) { setText(luckmailBadge, "错误"); luckmailBadge.className = "badge error"; }
+    setWorkflowButtonState(luckmailTokenCodeBtn, "error");
   } finally {
     luckmailTokenCodeBtn.disabled = false;
     if (luckmailTokenMailsBtn) luckmailTokenMailsBtn.disabled = false;
@@ -2902,10 +4369,11 @@ async function runLuckMailTokenMails() {
   if (luckmailResult) luckmailResult.hidden = false;
   setText(luckmailMailMeta, "正在查询已购邮箱邮件列表...");
   if (!hasLuckMailToken()) {
-    switchLuckMailManualMode("未填写 LuckMail Token，无法自动查询邮件列表，请手动填写邮箱地址和验证码。");
+    var tokenMessage = hasLuckMailTokenInput() ? "LuckMail Token 格式不正确，邮件查询需要以 tok_ 开头的已购邮箱 Token。" : "未填写 LuckMail Token，无法自动查询邮件列表，请手动填写邮箱地址和验证码。";
+    switchLuckMailManualMode(tokenMessage);
     setText(luckmailLatency, Math.round(performance.now() - startedAt) + "ms");
-    renderLuckMailMails({ ok: false, error: "luckmail_token is required", mails: [] });
-    renderLuckMailOutput({ ok: false, stage: "luckmail_manual_mode", manual_mode: true, error: "luckmail_token is required" });
+    renderLuckMailMails({ ok: false, error: tokenMessage, mails: [] });
+    renderLuckMailOutput({ ok: false, stage: "luckmail_manual_mode", manual_mode: true, error: hasLuckMailTokenInput() ? "luckmail_token invalid format" : "luckmail_token is required" });
     luckmailTokenMailsBtn.disabled = false;
     if (luckmailTokenCodeBtn) luckmailTokenCodeBtn.disabled = false;
     setText(luckmailTokenMailsBtn, originalText || "查询邮件列表");
@@ -2971,14 +4439,14 @@ async function runLuckMailCreateAndWait() {
   announceLuckMailScene("temp_order_waiting", "正在创建临时接码订单并等待验证码");
   renderLuckMailOutput({ stage: "luckmail_waiting" });
 
-  var payload = {
+  var payload = Object.assign({
     project_code: (luckmailProjectCode?.value || "openai").trim(),
     email_type: (luckmailEmailType?.value || "ms_graph").trim(),
     domain: (luckmailDomain?.value || "").trim(),
     specified_email: (luckmailSpecifiedEmail?.value || "").trim(),
     timeout_s: numberInputValue(luckmailTimeoutS, 300),
     interval_s: numberInputValue(luckmailIntervalS, 3),
-  };
+  }, luckMailAPIContextPayload());
 
   try {
     var resp = await fetch("/api/luckmail/create-and-wait", {
@@ -3078,11 +4546,11 @@ let gopayMonitorRunning = false;
 let sessionMonitorAbortController = null;
 
 const DOMAIN_ICONS = {
-  Network:  "\uD83C\uDF10",
-  Page:     "\uD83D\uDCC4",
-  Console:  "\uD83D\uDCDD",
-  Error:    "\u274C",
-  Log:      "\u2139\uFE0F",
+  Network:  "NET",
+  Page:     "PG",
+  Console:  "JS",
+  Error:    "ERR",
+  Log:      "LOG",
 };
 
 const DOMAIN_COLORS = {
@@ -3255,3 +4723,4 @@ gopayMonitorBtn?.addEventListener("click", async function () {
 
 bindWechatGroupCard();
 void checkHealth();
+void bootstrapPlusSubscribeSessionTriggerWatcher();

@@ -1,26 +1,36 @@
 :root {
-  color-scheme: dark;
-  --bg: #0a0e27;
-  --bg-grid: rgba(30, 38, 80, 0.36);
-  --panel: rgba(15, 22, 53, 0.78);
-  --panel-strong: rgba(15, 22, 53, 0.92);
-  --ink: #ffffff;
-  --muted: #8b92b3;
-  --line: rgba(30, 38, 80, 0.72);
-  --soft: rgba(30, 38, 80, 0.38);
-  --accent: #0080ff;
-  --accent-dark: #00a3ff;
-  --success: #39ff14;
-  --asset: #f7931a;
-  --info: #627eea;
-  --warning: #f59e0b;
-  --error: #ef4444;
-  --panel-shadow: 0 24px 80px rgba(0, 0, 0, 0.34);
-  --panel-shadow-soft: 0 18px 54px rgba(0, 0, 0, 0.24);
+  color-scheme: light;
+  --bg: #f5f7fb;
+  --bg-grid: rgba(100, 116, 139, 0.14);
+  --panel: #ffffff;
+  --panel-strong: #ffffff;
+  --ink: #111827;
+  --muted: #526071;
+  --line: #d8dee8;
+  --soft: #f1f5f9;
+  --accent: #0f766e;
+  --accent-dark: #0b5f59;
+  --success: #166534;
+  --asset: #b45309;
+  --info: #2563eb;
+  --warning: #b45309;
+  --error: #dc2626;
+  --focus: rgba(37, 99, 235, 0.2);
+  --control-bg: #ffffff;
+  --control-muted: #f8fafc;
+  --mono-bg: #0b1020;
+  --mono-line: #243047;
+  --mono-ink: #dbeafe;
+  --panel-shadow: 0 20px 56px rgba(15, 23, 42, 0.14);
+  --panel-shadow-soft: 0 10px 28px rgba(15, 23, 42, 0.08);
 }
 
 * {
   box-sizing: border-box;
+}
+
+[hidden] {
+  display: none !important;
 }
 
 body {
@@ -29,11 +39,41 @@ body {
   background:
     linear-gradient(var(--bg-grid) 1px, transparent 1px),
     linear-gradient(90deg, var(--bg-grid) 1px, transparent 1px),
-    linear-gradient(135deg, #0a0e27 0%, #0f1635 48%, #0a0e27 100%);
+    linear-gradient(180deg, #f9fbff 0%, var(--bg) 48%, #eef4f8 100%);
   background-attachment: fixed;
   background-size: 56px 56px, 56px 56px, auto;
   color: var(--ink);
   font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  line-height: 1.5;
+}
+
+html {
+  scroll-behavior: smooth;
+}
+
+::selection {
+  background: rgba(15, 118, 110, 0.18);
+}
+
+.skip-link {
+  position: fixed;
+  left: 16px;
+  top: 12px;
+  z-index: 100;
+  transform: translateY(-160%);
+  border: 1px solid var(--accent);
+  border-radius: 8px;
+  background: var(--panel);
+  color: var(--accent-dark);
+  box-shadow: var(--panel-shadow-soft);
+  padding: 9px 12px;
+  font-size: 13px;
+  font-weight: 900;
+  text-decoration: none;
+}
+
+.skip-link:focus-visible {
+  transform: translateY(0);
 }
 
 
@@ -259,6 +299,39 @@ textarea {
   flex-wrap: wrap;
   justify-content: flex-end;
   gap: 8px;
+}
+
+.workbench-token-field {
+  display: inline-flex;
+  min-height: 34px;
+  width: min(360px, 34vw);
+  min-width: 260px;
+  align-items: center;
+  gap: 8px;
+  border: 1px solid rgba(75, 130, 243, 0.44);
+  border-radius: 8px;
+  background: rgba(30, 41, 59, 0.72);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.08), 0 0 18px rgba(75, 130, 243, 0.1);
+  padding: 4px 8px 4px 10px;
+}
+
+.workbench-token-field span {
+  flex: 0 0 auto;
+  color: #dbeafe;
+  font-size: 12px;
+  font-weight: 900;
+  white-space: nowrap;
+}
+
+.workbench-token-field input {
+  min-width: 0;
+  height: 24px;
+  flex: 1 1 auto;
+  border-color: rgba(96, 165, 250, 0.34);
+  border-radius: 6px;
+  background: rgba(15, 23, 42, 0.74);
+  padding: 3px 8px;
+  font-size: 12px;
 }
 
 .flow-nav,
@@ -739,6 +812,21 @@ details.section-box > *:not(summary) {
   accent-color: var(--success);
 }
 
+.voice-prompt-control {
+  display: inline-flex;
+  min-width: 86px;
+  align-items: center;
+  gap: 6px;
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.voice-prompt-control input {
+  width: 54px;
+  accent-color: var(--bank-blue, var(--accent));
+}
+
 .voice-prompt-text {
   min-width: 0;
   color: var(--muted);
@@ -798,6 +886,7 @@ details[open] > summary.section-title::after {
 .payment-method-toolbar {
   grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 8px;
+  margin-top: 10px;
 }
 
 .paypal-button {
@@ -806,6 +895,10 @@ details[open] > summary.section-title::after {
 
 .paypal-button:hover {
   background: linear-gradient(135deg, #0042b8, #19b8ff);
+}
+
+#checkoutForm .payment-method-toolbar button {
+  min-height: 34px;
 }
 
 .incognito-toolbar {
@@ -872,6 +965,52 @@ button:disabled {
 .secondary-button:hover {
   border-color: rgba(0, 128, 255, 0.5);
   background: rgba(0, 128, 255, 0.12);
+}
+
+.danger-button {
+  border-color: rgba(255, 92, 92, 0.36);
+  color: #ffd3d3;
+}
+
+.danger-button:hover {
+  border-color: rgba(255, 92, 92, 0.62);
+  background: rgba(255, 92, 92, 0.12);
+}
+
+.flow-nav .flow-action-button {
+  width: auto;
+  height: 28px;
+  min-height: 28px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  box-shadow: none;
+  color: var(--accent-dark);
+  padding: 0 2px;
+  font-size: 13px;
+  font-weight: 900;
+  white-space: nowrap;
+}
+
+.flow-nav .flow-action-button:hover {
+  background: rgba(15, 118, 110, 0.08);
+  box-shadow: none;
+  color: var(--accent);
+}
+
+.flow-nav .flow-action-button:disabled {
+  background: transparent;
+  color: #94a3b8;
+  opacity: 0.75;
+}
+
+.flow-nav .danger-flow-action {
+  color: var(--error);
+}
+
+.flow-nav .danger-flow-action:hover {
+  background: rgba(239, 68, 68, 0.09);
+  color: var(--error);
 }
 
 .ghost-button {
@@ -1240,6 +1379,10 @@ pre {
   grid-template-columns: 1fr 1fr;
 }
 
+.gopay-three-col {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
 .gopay-field {
   display: grid;
   gap: 6px;
@@ -1309,6 +1452,22 @@ pre {
 
 .luckmail-mail-meta {
   margin: 0 0 10px;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+
+.luckmail-api-config {
+  border-color: rgba(57, 255, 20, 0.2);
+}
+
+.luckmail-api-toolbar {
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+}
+
+.luckmail-api-status {
+  min-height: 18px;
   color: var(--muted);
   font-size: 12px;
   line-height: 1.5;
@@ -1683,12 +1842,452 @@ pre {
   word-break: break-all;
 }
 
+/* ===== Workbench clarity pass ===== */
+
+.workbench-header,
+.flow-nav,
+.mobile-anchor-nav,
+.panel,
+.wechat-group-card,
+.wechat-group-modal__dialog {
+  background: rgba(255, 255, 255, 0.92);
+  border-color: var(--line);
+  box-shadow: var(--panel-shadow-soft);
+  backdrop-filter: blur(16px);
+}
+
+.workbench-header {
+  align-items: center;
+  padding: 16px 18px;
+}
+
+.workbench-kicker,
+.flow-nav > span,
+.step-flow-item.done .step-dot,
+.wechat-group-card__number {
+  color: var(--accent);
+}
+
+.workbench-title h1,
+h1,
+h2,
+.section-title span,
+.summary strong,
+.final-status strong,
+.gopay-field,
+.browser-use-field,
+.monitor-head h3,
+.luckmail-mails-summary strong,
+.luckmail-mail-card__subject,
+.incognito-diag-grid strong,
+.alert-message,
+.wechat-group-card__name,
+.wechat-group-modal__close:hover {
+  color: var(--ink);
+}
+
+.workbench-title p:last-child,
+.panel-subtitle,
+.field-hint,
+label,
+.gopay-field span,
+.browser-use-field,
+.browser-use-help,
+.metric-label,
+.section-title small,
+.step-flow-item p,
+.luckmail-api-status,
+.luckmail-mail-meta,
+.luckmail-mails-empty,
+.luckmail-mail-card__from,
+.luckmail-mail-card__id,
+.luckmail-mail-card__time,
+.voice-prompt-text,
+.monitor-empty,
+.modal-card p {
+  color: var(--muted);
+}
+
+.flow-nav a,
+.mobile-anchor-nav a,
+.tool-tab,
+.next-action-link,
+.checkout-link,
+.help-link {
+  color: var(--accent-dark);
+}
+
+.flow-nav li:not(:last-child)::after {
+  color: #94a3b8;
+}
+
+.mobile-anchor-nav a,
+.tool-tab,
+.next-action-link,
+.help-link,
+.secondary-button,
+.ghost-button,
+.incognito-link-button,
+.copy-button {
+  border-color: var(--line);
+  background: #ffffff;
+}
+
+.mobile-anchor-nav a:hover,
+.tool-tab:hover,
+.next-action-link:hover,
+.help-link:hover,
+.secondary-button:hover,
+.ghost-button:hover,
+.incognito-link-button:hover,
+.copy-button:hover {
+  border-color: rgba(15, 118, 110, 0.36);
+  background: #ecfdf5;
+  color: var(--accent-dark);
+  box-shadow: none;
+  text-decoration: none;
+}
+
+.status-chip {
+  border-color: rgba(37, 99, 235, 0.22);
+  background: #eff6ff;
+  color: #1e3a8a;
+}
+
+.status-chip.muted {
+  border-color: var(--line);
+  background: #f8fafc;
+  color: var(--muted);
+}
+
+.status-chip > strong:not(.badge) {
+  color: var(--ink);
+}
+
+.badge {
+  border-color: rgba(22, 101, 52, 0.24);
+  background: #f0fdf4;
+  color: var(--success);
+}
+
+.badge.neutral {
+  border-color: var(--line);
+  background: #f8fafc;
+  color: #475569;
+}
+
+.badge.error,
+.alert-badge {
+  border-color: rgba(220, 38, 38, 0.24);
+  background: #fef2f2;
+  color: var(--error);
+}
+
+.workspace {
+  grid-template-areas: none;
+  grid-template-columns: minmax(320px, 380px) minmax(460px, 1fr) minmax(320px, 360px);
+  gap: 16px;
+}
+
+.left-column {
+  display: contents;
+}
+
+.form-panel {
+  grid-column: 1;
+  grid-row: 1;
+}
+
+.center-column {
+  grid-column: 2;
+  grid-row: 1 / span 5;
+}
+
+.gopay-panel {
+  grid-column: 3;
+  grid-row: 2;
+}
+
+.luckmail-panel {
+  grid-column: 3;
+  grid-row: 1;
+}
+
+.tools-column {
+  grid-column: 3;
+  grid-row: 3;
+}
+
+.center-column .result-panel {
+  order: -30;
+}
+
+.center-column .incognito-diagnostics-panel {
+  order: -20;
+}
+
+.center-column .monitor-panel {
+  order: -10;
+}
+
+.center-column .luckmail-mails-panel {
+  order: 10;
+}
+
+.panel {
+  background: var(--panel);
+}
+
+.form-panel,
+.result-panel,
+.gopay-panel,
+.luckmail-panel,
+.browser-use-panel,
+.monitor-panel,
+.incognito-diagnostics-panel,
+.luckmail-mails-panel {
+  padding: 16px;
+}
+
+.monitor-panel,
+.incognito-diagnostics-panel,
+.luckmail-mails-panel {
+  background: var(--panel);
+  border-color: var(--line);
+  box-shadow: var(--panel-shadow-soft);
+}
+
+input,
+select,
+textarea {
+  border-color: var(--line);
+  background: var(--control-bg);
+  color: var(--ink);
+}
+
+input::placeholder,
+textarea::placeholder {
+  color: #94a3b8;
+}
+
+input:focus,
+select:focus,
+textarea:focus {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 4px rgba(15, 118, 110, 0.14);
+}
+
+.section-box,
+.summary > div,
+.final-status > div,
+.next-actions,
+.raw-output,
+.gopay-result-grid > div,
+.browser-use-result-grid > div,
+.incognito-diag-grid > div,
+.luckmail-mails-summary,
+.luckmail-mode-row,
+.voice-prompt-row {
+  border-color: var(--line);
+  background: var(--control-muted);
+}
+
+.final-status > div {
+  border-color: rgba(15, 118, 110, 0.18);
+  background: #ecfdf5;
+}
+
+button {
+  background: var(--accent);
+  color: #ffffff;
+  box-shadow: 0 10px 18px rgba(15, 118, 110, 0.16);
+}
+
+button:hover {
+  background: var(--accent-dark);
+  box-shadow: 0 12px 22px rgba(15, 118, 110, 0.18);
+}
+
+button:active {
+  transform: translateY(1px);
+}
+
+.paypal-button {
+  background: #2563eb;
+}
+
+.paypal-button:hover {
+  background: #1d4ed8;
+}
+
+.secondary-button,
+.ghost-button,
+.incognito-link-button,
+.copy-button,
+.browser-use-toolbar button:last-child {
+  color: var(--ink);
+  box-shadow: none;
+}
+
+.danger-button {
+  border-color: rgba(220, 38, 38, 0.28);
+  color: #991b1b;
+}
+
+.danger-button:hover {
+  border-color: rgba(220, 38, 38, 0.36);
+  background: #fef2f2;
+  color: #991b1b;
+}
+
+.device-login-guide-button {
+  background: #15803d;
+  color: #ffffff;
+}
+
+.device-login-guide-button:hover {
+  background: #166534;
+}
+
+.step-flow-item {
+  border-color: var(--line);
+  background: #ffffff;
+}
+
+.step-dot {
+  border-color: #cbd5e1;
+  background: #ffffff;
+}
+
+.step-flow-item.active {
+  border-color: rgba(37, 99, 235, 0.32);
+  background: #eff6ff;
+}
+
+.step-flow-item.active .step-dot {
+  border-color: var(--info);
+  background: var(--info);
+}
+
+.step-flow-item.done {
+  border-color: rgba(22, 101, 52, 0.24);
+  background: #f0fdf4;
+}
+
+.step-flow-item.done .step-dot {
+  border-color: var(--success);
+  background: var(--success);
+}
+
+.step-flow-item.error {
+  border-color: rgba(220, 38, 38, 0.24);
+  background: #fef2f2;
+}
+
+.step-flow-item.warning {
+  border-color: rgba(180, 83, 9, 0.26);
+  background: #fffbeb;
+}
+
+.alert-box,
+.alert-box.token {
+  border-color: rgba(220, 38, 38, 0.24);
+  background: #fef2f2;
+}
+
+.alert-box.cookie {
+  border-color: rgba(180, 83, 9, 0.26);
+  background: #fffbeb;
+}
+
+.alert-hint,
+.incognito-diag-message {
+  color: var(--muted);
+}
+
+pre,
+.monitor-log {
+  border-color: var(--mono-line);
+  background: var(--mono-bg);
+  color: var(--mono-ink);
+}
+
+.monitor-summary {
+  border-color: var(--line);
+  background: #f8fafc;
+  color: var(--muted);
+}
+
+.monitor-summary strong {
+  color: var(--ink);
+}
+
+.monitor-row {
+  border-bottom-color: rgba(148, 163, 184, 0.14);
+}
+
+.monitor-row:hover {
+  background: rgba(37, 99, 235, 0.12);
+}
+
+.monitor-icon {
+  display: inline-flex;
+  min-width: 28px;
+  justify-content: center;
+  border-radius: 4px;
+  background: rgba(219, 234, 254, 0.12);
+  padding: 0 4px;
+  font-size: 10px;
+  font-weight: 900;
+}
+
+.monitor-text {
+  color: var(--mono-ink);
+}
+
+.wechat-group-card {
+  position: static;
+  right: auto;
+  left: auto;
+  bottom: auto;
+  width: min(280px, calc(100% - 32px));
+  margin: 16px auto 24px;
+}
+
+.wechat-group-card.is-collapsed {
+  width: min(280px, calc(100% - 32px));
+}
+
+.wechat-group-card__close,
+.wechat-group-modal__close {
+  background: #f1f5f9;
+  color: var(--muted);
+}
+
+.wechat-group-card__close:hover {
+  background: #fef2f2;
+  color: var(--error);
+}
+
+.wechat-group-card__title {
+  color: var(--muted);
+  letter-spacing: 0;
+}
+
+.wechat-group-modal__backdrop {
+  background: rgba(15, 23, 42, 0.52);
+}
+
+code {
+  color: #334155;
+}
+
 button:focus-visible,
 a:focus-visible,
 summary:focus-visible,
 .wechat-group-card__toggle:focus-visible,
 .wechat-group-card__preview:focus-visible {
-  outline: 3px solid rgba(37, 99, 235, 0.28);
+  outline: 3px solid var(--focus);
   outline-offset: 2px;
 }
 
@@ -1703,12 +2302,32 @@ summary:focus-visible,
 
   .workspace {
     grid-template-columns: minmax(300px, 340px) minmax(0, 1fr);
-    grid-template-areas:
-      "form result"
-      "tools tools";
+    grid-template-areas: none;
+  }
+
+  .form-panel {
+    grid-column: 1;
+    grid-row: 1;
+  }
+
+  .center-column {
+    grid-column: 2;
+    grid-row: 1 / span 3;
+  }
+
+  .gopay-panel {
+    grid-column: 1;
+    grid-row: 3;
+  }
+
+  .luckmail-panel {
+    grid-column: 1 / -1;
+    grid-row: 2;
   }
 
   .tools-column {
+    grid-column: 1 / -1;
+    grid-row: 4;
     grid-template-columns: 1fr;
   }
 
@@ -1746,13 +2365,27 @@ summary:focus-visible,
     justify-content: start;
   }
 
+  .workbench-token-field {
+    width: min(100%, 420px);
+    min-width: 240px;
+  }
+
   .flow-nav {
-    display: none;
+    display: flex;
+    overflow-x: auto;
+    scrollbar-width: thin;
+  }
+
+  .flow-nav ol {
+    flex-wrap: nowrap;
+  }
+
+  .flow-nav li {
+    flex: 0 0 auto;
   }
 
   .mobile-anchor-nav {
-    display: grid;
-    grid-template-columns: repeat(5, minmax(0, 1fr));
+    display: none;
   }
 
   .mobile-anchor-nav a:last-child {
@@ -1766,14 +2399,52 @@ summary:focus-visible,
 
   .workspace {
     grid-template-columns: 1fr;
-    grid-template-areas:
-      "form"
-      "result"
-      "tools";
+    grid-template-areas: none;
+  }
+
+  .form-panel {
+    grid-column: 1;
+    grid-row: 1;
+  }
+
+  .center-column {
+    display: contents;
+  }
+
+  .result-panel {
+    grid-column: 1;
+    grid-row: 2;
+  }
+
+  .gopay-panel {
+    grid-column: 1;
+    grid-row: 4;
+  }
+
+  .luckmail-panel {
+    grid-column: 1;
+    grid-row: 3;
   }
 
   .tools-column {
+    grid-column: 1;
+    grid-row: 5;
     grid-template-columns: 1fr;
+  }
+
+  .incognito-diagnostics-panel {
+    grid-column: 1;
+    grid-row: 6;
+  }
+
+  .monitor-panel {
+    grid-column: 1;
+    grid-row: 7;
+  }
+
+  .luckmail-mails-panel {
+    grid-column: 1;
+    grid-row: 8;
   }
 
   .step-flow,
@@ -1829,6 +2500,7 @@ summary:focus-visible,
   .browser-use-two-col,
   .browser-use-result-grid,
   .gopay-two-col,
+  .gopay-three-col,
   .gopay-result-grid,
   .next-actions-grid {
     grid-template-columns: 1fr;
@@ -1838,8 +2510,14 @@ summary:focus-visible,
     display: grid;
   }
 
+  .workbench-token-field,
+  .workbench-status .workbench-voice-prompt {
+    width: 100%;
+    min-width: 0;
+  }
+
   .mobile-anchor-nav {
-    grid-template-columns: repeat(2, minmax(0, 1fr));
+    grid-template-columns: repeat(3, minmax(0, 1fr));
   }
 
   .mobile-anchor-nav a:last-child {
@@ -1869,6 +2547,11 @@ summary:focus-visible,
     grid-template-columns: 1fr;
   }
 
+  .result-panel .step-flow,
+  #gopayStepFlow {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
   .panel-head,
   .head-actions {
     align-items: stretch;
@@ -1886,8 +2569,2238 @@ summary:focus-visible,
   .form-panel,
   .result-panel,
   .gopay-panel,
+  .luckmail-panel,
+  .monitor-panel,
+  .incognito-diagnostics-panel,
   .browser-use-panel {
     padding: 14px;
+  }
+}
+
+/* ===== Full-screen fit pass ===== */
+
+html,
+body {
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+}
+
+body {
+  min-height: 100svh;
+}
+
+.shell {
+  display: grid;
+  grid-template-rows: auto auto minmax(0, 1fr);
+  gap: 8px;
+  width: min(100% - 16px, 1500px);
+  height: 100svh;
+  overflow: hidden;
+  padding: 8px 0;
+}
+
+.workbench-header,
+.flow-nav,
+.mobile-anchor-nav {
+  margin: 0;
+}
+
+.workbench-header {
+  min-height: 72px;
+  padding: 10px 14px;
+}
+
+.workbench-kicker {
+  margin-bottom: 3px;
+  font-size: 11px;
+}
+
+.workbench-title h1 {
+  font-size: clamp(22px, 2.1vw, 28px);
+}
+
+.workbench-title p:last-child {
+  margin-top: 4px;
+  font-size: 13px;
+  line-height: 1.35;
+}
+
+.status-chip {
+  min-height: 30px;
+  padding: 3px 7px 3px 10px;
+}
+
+.flow-nav {
+  min-height: 34px;
+  padding: 7px 10px;
+}
+
+.flow-nav ol {
+  gap: 6px;
+}
+
+.workspace {
+  display: grid;
+  grid-template-columns:
+    minmax(280px, 0.95fr)
+    minmax(360px, 1.28fr)
+    minmax(290px, 1fr)
+    minmax(290px, 1fr);
+  grid-template-rows: minmax(0, 1.08fr) minmax(0, 0.92fr);
+  grid-template-areas: none;
+  gap: 8px;
+  min-height: 0;
+  height: 100%;
+  overflow: hidden;
+  align-items: stretch;
+}
+
+.left-column,
+.center-column,
+.tools-column {
+  display: contents;
+}
+
+.panel {
+  min-height: 0;
+  overflow: hidden;
+  box-shadow: 0 8px 22px rgba(15, 23, 42, 0.07);
+}
+
+.form-panel,
+.result-panel,
+.gopay-panel,
+.luckmail-panel,
+.browser-use-panel,
+.monitor-panel,
+.incognito-diagnostics-panel,
+.luckmail-mails-panel {
+  display: flex;
+  flex-direction: column;
+  padding: 10px;
+}
+
+.form-panel {
+  grid-column: 1;
+  grid-row: 1 / span 2;
+}
+
+.result-panel {
+  grid-column: 2;
+  grid-row: 1;
+}
+
+.incognito-diagnostics-panel {
+  grid-column: 2;
+  grid-row: 2;
+}
+
+.gopay-panel {
+  grid-column: 3;
+  grid-row: 2;
+}
+
+.luckmail-panel {
+  grid-column: 3;
+  grid-row: 1;
+}
+
+.browser-use-panel {
+  grid-column: 4;
+  grid-row: 1;
+}
+
+.monitor-panel {
+  grid-column: 4;
+  grid-row: 2;
+}
+
+.luckmail-mails-panel {
+  grid-column: 2;
+  grid-row: 2;
+}
+
+.tool-tabs,
+.wechat-group-card {
+  display: none;
+}
+
+.panel-head,
+.monitor-head {
+  flex: 0 0 auto;
+  margin-bottom: 8px;
+}
+
+.panel-head h2,
+.monitor-head h3 {
+  font-size: 17px;
+}
+
+.panel-subtitle {
+  margin-top: 2px;
+  font-size: 12px;
+  line-height: 1.3;
+}
+
+form,
+.gopay-form,
+.luckmail-form,
+.browser-use-form,
+.gopay-monitor,
+.incognito-diagnostics-panel {
+  min-height: 0;
+}
+
+#checkoutForm {
+  grid-template-rows: minmax(0, 1fr) auto auto auto;
+  flex: 1 1 auto;
+  gap: 8px;
+}
+
+.field-block {
+  min-height: 0;
+}
+
+#token {
+  height: 100%;
+  min-height: 150px;
+}
+
+input,
+select {
+  height: 34px;
+  padding: 0 9px;
+}
+
+textarea {
+  min-height: 66px;
+  padding: 8px;
+}
+
+button {
+  height: 36px;
+  min-width: 0;
+  padding: 0 9px;
+  font-size: 13px;
+}
+
+.section-box,
+.summary > div,
+.final-status > div,
+.next-actions,
+.raw-output,
+.gopay-result-grid > div,
+.browser-use-result-grid > div,
+.incognito-diag-grid > div,
+.luckmail-mails-summary {
+  padding: 7px;
+}
+
+.section-box,
+form,
+.gopay-form,
+.luckmail-form,
+.browser-use-form,
+.gopay-field-row,
+.browser-use-row {
+  gap: 7px;
+}
+
+details.section-box > *:not(summary),
+.compact-options > .gopay-field-row,
+.compact-options > .browser-use-row,
+.compact-options > .browser-use-field,
+.compact-options > .gopay-field-row:first-of-type,
+.compact-options > .browser-use-row:first-of-type,
+.compact-options > .browser-use-field:first-of-type {
+  margin-top: 7px;
+}
+
+.field-hint,
+.browser-use-help,
+.luckmail-mode-row,
+.voice-prompt-row {
+  display: none;
+}
+
+.summary,
+.final-status,
+.gopay-result-grid,
+.browser-use-result-grid {
+  gap: 6px;
+  margin-bottom: 6px;
+}
+
+.summary > div,
+.final-status > div {
+  min-height: 48px;
+}
+
+.metric-label {
+  margin-bottom: 3px;
+  font-size: 11px;
+}
+
+.summary strong,
+.final-status strong,
+.checkout-link {
+  font-size: 13px;
+}
+
+.result-panel .step-flow {
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+}
+
+#gopayStepFlow {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+.step-flow {
+  gap: 5px;
+  margin-bottom: 6px;
+}
+
+.step-flow-item {
+  grid-template-columns: 10px minmax(0, 1fr);
+  gap: 5px;
+  padding: 6px;
+}
+
+.step-flow-item strong {
+  font-size: 11px;
+}
+
+.step-flow-item p {
+  font-size: 10px;
+}
+
+.step-dot {
+  width: 8px;
+  height: 8px;
+  margin-top: 3px;
+}
+
+.next-actions {
+  margin-bottom: 6px;
+}
+
+.raw-output pre,
+.incognito-diag-raw pre,
+pre {
+  min-height: 96px;
+  max-height: 150px;
+  padding: 8px;
+  font-size: 11px;
+  line-height: 1.45;
+}
+
+.result-panel .raw-output {
+  margin-top: auto;
+}
+
+.incognito-diagnostics-panel {
+  gap: 8px;
+}
+
+.incognito-diag-grid {
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 6px;
+}
+
+.incognito-diag-message {
+  font-size: 12px;
+  line-height: 1.35;
+}
+
+.monitor-panel .gopay-monitor {
+  display: flex;
+  flex: 1 1 auto;
+  flex-direction: column;
+  min-height: 0;
+}
+
+.monitor-log {
+  flex: 1 1 auto;
+  min-height: 0;
+  max-height: none;
+}
+
+.monitor-summary {
+  margin-bottom: 6px;
+  padding: 6px 8px;
+}
+
+.monitor-row {
+  padding: 4px 8px;
+}
+
+.gopay-form,
+.luckmail-form,
+.browser-use-form {
+  flex: 1 1 auto;
+}
+
+.gopay-two-col,
+.browser-use-two-col {
+  gap: 7px;
+}
+
+.gopay-toolbar,
+.browser-use-toolbar,
+.incognito-toolbar,
+.incognito-diag-toolbar,
+.payment-method-toolbar,
+.next-actions-grid {
+  gap: 6px;
+}
+
+.gopay-check {
+  font-size: 12px;
+  line-height: 1.3;
+}
+
+.luckmail-panel .panel-subtitle,
+.browser-use-panel .panel-subtitle,
+.monitor-panel #monitorOutput,
+.luckmail-token-box > .gopay-field-row.gopay-two-col,
+#luckmailShareCodeLinkBtn {
+  display: none;
+}
+
+details.luckmail-api-config,
+.luckmail-panel > .luckmail-form > details.section-box:not(.luckmail-api-config) {
+  display: none !important;
+}
+
+.luckmail-token-box {
+  display: grid;
+  flex: 1 1 auto;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  min-height: 0;
+}
+
+.luckmail-token-box > .section-title,
+.luckmail-token-box > .gopay-toolbar {
+  grid-column: 1 / -1;
+}
+
+.luckmail-token-box > .gopay-field-row {
+  min-width: 0;
+}
+
+.luckmail-token-box .gopay-toolbar {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+.luckmail-token-box .gopay-toolbar button {
+  height: 32px;
+  font-size: 12px;
+}
+
+.device-login-guide-button,
+#luckmailShareCodeLinkBtn {
+  grid-column: auto;
+}
+
+.luckmail-result,
+.gopay-result {
+  min-height: 0;
+}
+
+.browser-use-field textarea {
+  min-height: 76px;
+}
+
+.browser-use-advanced {
+  flex: 0 0 auto;
+}
+
+@media (max-height: 820px) {
+  .workbench-title p:last-child,
+  .panel-subtitle,
+  .field-hint,
+  .section-title small,
+  .flow-nav > span {
+    display: none;
+  }
+
+  .workbench-header {
+    min-height: 56px;
+  }
+
+  .workbench-title h1 {
+    font-size: 22px;
+  }
+
+  .flow-nav {
+    min-height: 30px;
+    padding: 5px 8px;
+  }
+
+  .panel-head {
+    margin-bottom: 6px;
+  }
+
+  button {
+    height: 32px;
+  }
+
+  input,
+  select {
+    height: 32px;
+  }
+
+  textarea {
+    min-height: 58px;
+  }
+
+  #token {
+    min-height: 112px;
+  }
+}
+
+@media (max-width: 1180px) {
+  .workspace {
+    grid-template-columns: minmax(260px, 0.95fr) minmax(330px, 1.18fr) minmax(260px, 0.95fr);
+    grid-template-rows: minmax(0, 1fr) minmax(0, 0.9fr);
+  }
+
+  .form-panel {
+    grid-column: 1;
+    grid-row: 1;
+  }
+
+  .result-panel {
+    grid-column: 2;
+    grid-row: 1;
+  }
+
+  .incognito-diagnostics-panel {
+    grid-column: 3;
+    grid-row: 2;
+  }
+
+  .gopay-panel {
+    grid-column: 1;
+    grid-row: 2;
+  }
+
+  .luckmail-panel {
+    grid-column: 3;
+    grid-row: 1;
+  }
+
+  .browser-use-panel {
+    grid-column: 2;
+    grid-row: 2;
+  }
+
+  .monitor-panel {
+    grid-column: 3;
+    grid-row: 2;
+  }
+
+  .monitor-panel {
+    display: none;
+  }
+}
+
+@media (max-width: 900px) {
+  .shell {
+    width: min(100% - 12px, 900px);
+    padding: 6px 0;
+    gap: 6px;
+  }
+
+  .workbench-header {
+    min-height: 54px;
+    padding: 8px 10px;
+  }
+
+  .workbench-kicker,
+  .workbench-title p:last-child {
+    display: none;
+  }
+
+  .flow-nav {
+    display: flex;
+    overflow-x: auto;
+    scrollbar-width: thin;
+  }
+
+  .flow-nav ol {
+    flex-wrap: nowrap;
+  }
+
+  .flow-nav li {
+    flex: 0 0 auto;
+  }
+
+  .mobile-anchor-nav {
+    display: none;
+  }
+
+  .mobile-anchor-nav a {
+    min-height: 28px;
+    padding: 4px 6px;
+    border-radius: 7px;
+    font-size: 11px;
+  }
+
+  .workspace {
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+    grid-template-rows: minmax(0, 1.2fr) minmax(0, 1fr) minmax(0, 0.92fr);
+    gap: 6px;
+  }
+
+  .form-panel {
+    grid-column: 1;
+    grid-row: 1 / span 2;
+  }
+
+  .result-panel {
+    grid-column: 2;
+    grid-row: 1;
+  }
+
+  .gopay-panel {
+    grid-column: 1;
+    grid-row: 3;
+  }
+
+  .luckmail-panel {
+    grid-column: 2;
+    grid-row: 2;
+  }
+
+  .browser-use-panel {
+    grid-column: 2;
+    grid-row: 3;
+    visibility: visible;
+    pointer-events: auto;
+  }
+
+  .incognito-diagnostics-panel,
+  .monitor-panel,
+  .luckmail-mails-panel {
+    display: none;
+  }
+
+  .summary,
+  .final-status,
+  .gopay-result-grid,
+  .browser-use-result-grid {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+
+  .result-panel .step-flow,
+  #gopayStepFlow {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+
+  .raw-output {
+    display: none;
+  }
+}
+
+@media (max-width: 560px) {
+  .shell {
+    width: calc(100% - 8px);
+    grid-template-rows: auto auto minmax(0, 1fr);
+  }
+
+  .workbench-header {
+    align-items: center;
+    grid-template-columns: minmax(0, 1fr);
+    min-height: 48px;
+    padding: 7px 8px;
+  }
+
+  .workbench-title h1 {
+    font-size: 18px;
+  }
+
+  .workbench-status {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 5px;
+  }
+
+  .status-chip {
+    min-height: 26px;
+    padding: 2px 6px;
+    font-size: 11px;
+  }
+
+  .badge {
+    height: 22px;
+    min-width: auto;
+    font-size: 10px;
+  }
+
+  .mobile-anchor-nav {
+    grid-template-columns: repeat(5, minmax(0, 1fr));
+  }
+
+  .mobile-anchor-nav a {
+    font-size: 10px;
+  }
+
+  .workspace {
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+    grid-template-rows: minmax(0, 1.14fr) minmax(0, 1.18fr) minmax(0, 0.95fr);
+  }
+
+  .form-panel,
+  .result-panel,
+  .gopay-panel,
+  .luckmail-panel,
+  .browser-use-panel {
+    padding: 7px;
+  }
+
+  .panel-head,
+  .head-actions {
+    flex-direction: row;
+    align-items: center;
+    gap: 5px;
+    margin-bottom: 5px;
+  }
+
+  .panel-head h2 {
+    font-size: 14px;
+  }
+
+  .panel-subtitle,
+  .section-title small,
+  .next-actions,
+  .browser-use-advanced,
+  .luckmail-api-config,
+  .luckmail-panel details.section-box:not(.luckmail-api-config),
+  .incognito-toolbar,
+  .result-panel .summary {
+    display: none;
+  }
+
+  #checkoutForm {
+    grid-template-rows: minmax(0, 1fr) auto;
+  }
+
+  #checkoutForm > .section-box {
+    display: none;
+  }
+
+  #token {
+    min-height: 96px;
+  }
+
+  .payment-method-toolbar,
+  .gopay-toolbar,
+  .browser-use-toolbar,
+  .luckmail-token-box .gopay-toolbar {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  button {
+    height: 30px;
+    padding: 0 5px;
+    font-size: 11px;
+  }
+
+  input,
+  select {
+    height: 30px;
+    padding: 0 7px;
+    font-size: 12px;
+  }
+
+  textarea {
+    min-height: 54px;
+    font-size: 12px;
+  }
+
+  label,
+  .gopay-field,
+  .browser-use-field {
+    gap: 4px;
+    font-size: 11px;
+  }
+
+  .section-box,
+  .summary > div,
+  .final-status > div,
+  .gopay-result-grid > div,
+  .browser-use-result-grid > div {
+    padding: 5px;
+  }
+
+  .metric-label {
+    font-size: 10px;
+  }
+
+  .summary strong,
+  .final-status strong,
+  .checkout-link {
+    font-size: 11px;
+  }
+
+  .final-status {
+    grid-template-columns: 1fr;
+  }
+
+  .final-status > div {
+    min-height: 34px;
+  }
+
+  .result-panel .step-flow,
+  #gopayStepFlow {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .step-flow-item {
+    padding: 4px;
+  }
+
+  .step-flow-item p {
+    display: none;
+  }
+
+  .gopay-panel .section-box {
+    display: none;
+  }
+
+  .luckmail-token-box {
+    display: grid;
+    gap: 5px;
+  }
+
+  .luckmail-token-box .static-title,
+  .luckmail-token-box > .gopay-field-row:nth-of-type(2) {
+    display: none;
+  }
+
+  .luckmail-token-box .gopay-toolbar button:nth-child(n + 5) {
+    display: none;
+  }
+
+  .browser-use-field textarea {
+    min-height: 52px;
+  }
+}
+
+/* ===== Digital banking visual skin ===== */
+
+:root {
+  color-scheme: dark;
+  --bg: #071211;
+  --bg-grid: rgba(127, 255, 212, 0.055);
+  --panel: rgba(8, 24, 22, 0.76);
+  --panel-strong: rgba(10, 34, 31, 0.9);
+  --ink: #ecfff8;
+  --muted: #92b6ad;
+  --line: rgba(132, 255, 212, 0.18);
+  --soft: rgba(15, 47, 42, 0.7);
+  --accent: #00d084;
+  --accent-dark: #5df6c0;
+  --success: #34d399;
+  --asset: #f8c351;
+  --info: #38bdf8;
+  --warning: #f8c351;
+  --error: #fb7185;
+  --focus: rgba(45, 212, 191, 0.28);
+  --control-bg: rgba(7, 20, 20, 0.74);
+  --control-muted: rgba(13, 39, 35, 0.68);
+  --mono-bg: #050b12;
+  --mono-line: rgba(91, 174, 213, 0.24);
+  --mono-ink: #d8f3ff;
+  --panel-shadow: 0 20px 52px rgba(0, 0, 0, 0.34), 0 0 38px rgba(0, 208, 132, 0.07);
+  --panel-shadow-soft: 0 12px 30px rgba(0, 0, 0, 0.26), 0 0 22px rgba(56, 189, 248, 0.045);
+}
+
+body {
+  background:
+    linear-gradient(rgba(127, 255, 212, 0.05) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(127, 255, 212, 0.045) 1px, transparent 1px),
+    linear-gradient(115deg, rgba(0, 208, 132, 0.18) 0%, rgba(0, 208, 132, 0.02) 31%, transparent 49%),
+    linear-gradient(245deg, rgba(56, 189, 248, 0.12) 0%, rgba(56, 189, 248, 0.02) 35%, transparent 58%),
+    linear-gradient(180deg, #050c0b 0%, #071614 46%, #0a1420 100%);
+  background-attachment: fixed;
+  background-size: 52px 52px, 52px 52px, auto, auto, auto;
+  color: var(--ink);
+  font-family: "DM Sans", ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  letter-spacing: 0;
+  text-rendering: geometricPrecision;
+}
+
+::selection {
+  background: rgba(0, 208, 132, 0.28);
+  color: #f7fffb;
+}
+
+* {
+  scrollbar-color: rgba(93, 246, 192, 0.52) rgba(5, 17, 16, 0.72);
+}
+
+.shell {
+  isolation: isolate;
+}
+
+.skip-link {
+  border-color: rgba(93, 246, 192, 0.62);
+  background: rgba(4, 15, 14, 0.94);
+  color: var(--accent-dark);
+  box-shadow: 0 16px 36px rgba(0, 0, 0, 0.34);
+}
+
+.workbench-header,
+.flow-nav,
+.mobile-anchor-nav,
+.panel,
+.monitor-panel,
+.incognito-diagnostics-panel,
+.luckmail-mails-panel {
+  border: 1px solid var(--line);
+  background:
+    linear-gradient(180deg, rgba(18, 48, 43, 0.78) 0%, rgba(7, 20, 20, 0.74) 100%);
+  box-shadow: var(--panel-shadow-soft);
+  backdrop-filter: blur(18px) saturate(1.18);
+}
+
+.workbench-header {
+  box-shadow: var(--panel-shadow);
+}
+
+.workbench-kicker,
+.flow-nav > span {
+  color: var(--accent-dark);
+  font-weight: 900;
+  letter-spacing: 0;
+  text-transform: none;
+}
+
+.workbench-title h1,
+.panel-head h2,
+.monitor-head h3,
+.section-title span,
+.static-title,
+.modal-card h2 {
+  color: var(--ink);
+  font-family: "Space Grotesk", "DM Sans", ui-sans-serif, system-ui, sans-serif;
+  font-weight: 700;
+  letter-spacing: 0;
+}
+
+.workbench-title h1 {
+  background: linear-gradient(90deg, #f2fff9 0%, #7dffd3 54%, #8bd8ff 100%);
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+}
+
+.workbench-title p:last-child,
+.panel-subtitle,
+.field-hint,
+.browser-use-help,
+.section-title small,
+.metric-label,
+.step-flow-item p,
+.luckmail-api-status,
+.luckmail-mail-meta,
+.luckmail-mails-empty,
+.luckmail-mail-card__from,
+.luckmail-mail-card__id,
+.luckmail-mail-card__time,
+.voice-prompt-text,
+.monitor-empty,
+.modal-card p,
+.incognito-diag-message {
+  color: var(--muted);
+}
+
+a,
+.flow-nav a,
+.mobile-anchor-nav a,
+.tool-tab,
+.next-action-link,
+.checkout-link,
+.help-link {
+  color: var(--accent-dark);
+}
+
+code {
+  color: #a7f3d0;
+}
+
+.status-chip,
+.mobile-anchor-nav a,
+.tool-tab,
+.next-action-link,
+.help-link,
+.secondary-button,
+.ghost-button,
+.incognito-link-button,
+.copy-button {
+  border-color: var(--line);
+  background: rgba(9, 30, 28, 0.72);
+  color: #d8fff1;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.04);
+}
+
+.status-chip.muted {
+  border-color: rgba(132, 255, 212, 0.13);
+  background: rgba(8, 22, 24, 0.58);
+  color: var(--muted);
+}
+
+.status-chip > strong:not(.badge),
+.summary strong,
+.final-status strong,
+.monitor-summary strong,
+.luckmail-mails-summary strong {
+  color: #f3fff9;
+}
+
+.badge {
+  border-color: rgba(52, 211, 153, 0.32);
+  background: rgba(52, 211, 153, 0.13);
+  color: #86efac;
+}
+
+.badge.neutral {
+  border-color: rgba(148, 163, 184, 0.22);
+  background: rgba(15, 23, 42, 0.46);
+  color: #cbd5e1;
+}
+
+.badge.error,
+.alert-badge {
+  border-color: rgba(251, 113, 133, 0.35);
+  background: rgba(251, 113, 133, 0.14);
+  color: #fecdd3;
+}
+
+input,
+select,
+textarea {
+  border-color: var(--line);
+  background: var(--control-bg);
+  color: var(--ink);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.035);
+}
+
+input::placeholder,
+textarea::placeholder {
+  color: rgba(146, 182, 173, 0.68);
+}
+
+input:focus,
+select:focus,
+textarea:focus {
+  border-color: rgba(93, 246, 192, 0.78);
+  box-shadow: 0 0 0 3px var(--focus), inset 0 1px 0 rgba(255, 255, 255, 0.05);
+}
+
+select option {
+  background: #081716;
+  color: var(--ink);
+}
+
+.section-box,
+.summary > div,
+.final-status > div,
+.next-actions,
+.raw-output,
+.gopay-result-grid > div,
+.browser-use-result-grid > div,
+.incognito-diag-grid > div,
+.luckmail-mails-summary,
+.luckmail-mode-row,
+.voice-prompt-row,
+.luckmail-mail-card {
+  border-color: var(--line);
+  background: var(--control-muted);
+}
+
+.final-status > div {
+  border-color: rgba(0, 208, 132, 0.24);
+  background: linear-gradient(180deg, rgba(0, 208, 132, 0.15), rgba(7, 20, 20, 0.7));
+}
+
+summary.section-title {
+  color: var(--ink);
+}
+
+summary.section-title::after {
+  color: var(--accent-dark);
+}
+
+button {
+  border: 1px solid rgba(93, 246, 192, 0.42);
+  background: linear-gradient(135deg, #00d084 0%, #5df6c0 58%, #8bd8ff 100%);
+  color: #031311;
+  box-shadow: 0 12px 26px rgba(0, 208, 132, 0.2), inset 0 1px 0 rgba(255, 255, 255, 0.34);
+  font-weight: 800;
+}
+
+button:hover {
+  border-color: rgba(166, 255, 225, 0.76);
+  background: linear-gradient(135deg, #15e39a 0%, #8fffe0 58%, #9fe5ff 100%);
+  box-shadow: 0 16px 34px rgba(0, 208, 132, 0.28), 0 0 20px rgba(56, 189, 248, 0.12);
+}
+
+button:disabled {
+  border-color: rgba(148, 163, 184, 0.16);
+  background: rgba(30, 41, 59, 0.54);
+  color: rgba(203, 213, 225, 0.66);
+  box-shadow: none;
+}
+
+.paypal-button {
+  border-color: rgba(56, 189, 248, 0.44);
+  background: linear-gradient(135deg, #2563eb, #38bdf8);
+  color: #eff6ff;
+}
+
+.paypal-button:hover {
+  background: linear-gradient(135deg, #1d4ed8, #67e8f9);
+}
+
+.device-login-guide-button {
+  border-color: rgba(52, 211, 153, 0.42);
+  background: linear-gradient(135deg, #059669, #34d399);
+  color: #ecfff8;
+}
+
+.device-login-guide-button:hover {
+  background: linear-gradient(135deg, #047857, #6ee7b7);
+}
+
+.secondary-button,
+.ghost-button,
+.incognito-link-button,
+.copy-button,
+.browser-use-toolbar button:last-child {
+  background: rgba(10, 31, 31, 0.72);
+  color: #d8fff1;
+  box-shadow: none;
+}
+
+.secondary-button:hover,
+.ghost-button:hover,
+.incognito-link-button:hover,
+.copy-button:hover,
+.browser-use-toolbar button:last-child:hover,
+.mobile-anchor-nav a:hover,
+.tool-tab:hover,
+.next-action-link:hover,
+.help-link:hover {
+  border-color: rgba(93, 246, 192, 0.58);
+  background: rgba(13, 148, 136, 0.18);
+  color: #f2fff9;
+  box-shadow: 0 0 18px rgba(20, 184, 166, 0.12);
+  text-decoration: none;
+}
+
+.danger-button,
+.flow-nav .danger-flow-action {
+  border-color: rgba(251, 113, 133, 0.28);
+  color: #fecdd3;
+}
+
+.danger-button:hover,
+.flow-nav .danger-flow-action:hover {
+  border-color: rgba(251, 113, 133, 0.5);
+  background: rgba(251, 113, 133, 0.14);
+  color: #ffe4e6;
+}
+
+.flow-nav .flow-action-button {
+  border: 1px solid rgba(93, 246, 192, 0.16);
+  background: rgba(5, 18, 17, 0.35);
+  color: #d8fff1;
+  box-shadow: none;
+  padding: 0 6px;
+}
+
+.flow-nav .flow-action-button:hover {
+  border-color: rgba(93, 246, 192, 0.52);
+  background: rgba(0, 208, 132, 0.16);
+  color: #f2fff9;
+  box-shadow: none;
+}
+
+.flow-nav .flow-action-button:disabled {
+  border-color: rgba(148, 163, 184, 0.13);
+  background: rgba(15, 23, 42, 0.32);
+  color: rgba(148, 163, 184, 0.72);
+  opacity: 1;
+}
+
+.flow-nav li:not(:last-child)::after {
+  color: rgba(146, 182, 173, 0.72);
+}
+
+.step-flow-item {
+  border-color: rgba(132, 255, 212, 0.16);
+  background: rgba(6, 22, 21, 0.64);
+}
+
+.step-flow-item strong {
+  color: #f2fff9;
+}
+
+.step-dot {
+  border-color: rgba(146, 182, 173, 0.54);
+  background: rgba(7, 20, 20, 0.92);
+}
+
+.step-flow-item.active {
+  border-color: rgba(56, 189, 248, 0.46);
+  background: rgba(14, 116, 144, 0.18);
+}
+
+.step-flow-item.active .step-dot {
+  border-color: var(--info);
+  background: var(--info);
+  box-shadow: 0 0 12px rgba(56, 189, 248, 0.48);
+}
+
+.step-flow-item.done {
+  border-color: rgba(52, 211, 153, 0.36);
+  background: rgba(5, 150, 105, 0.14);
+}
+
+.step-flow-item.done .step-dot {
+  border-color: var(--success);
+  background: var(--success);
+  box-shadow: 0 0 12px rgba(52, 211, 153, 0.45);
+}
+
+.step-flow-item.error {
+  border-color: rgba(251, 113, 133, 0.38);
+  background: rgba(251, 113, 133, 0.13);
+}
+
+.step-flow-item.error .step-dot {
+  border-color: var(--error);
+  background: var(--error);
+}
+
+.step-flow-item.warning {
+  border-color: rgba(248, 195, 81, 0.38);
+  background: rgba(248, 195, 81, 0.13);
+}
+
+.step-flow-item.warning .step-dot {
+  border-color: var(--asset);
+  background: var(--asset);
+}
+
+.alert-box,
+.alert-box.token {
+  border-color: rgba(251, 113, 133, 0.36);
+  background: linear-gradient(180deg, rgba(251, 113, 133, 0.15), rgba(7, 20, 20, 0.76));
+}
+
+.alert-box.cookie {
+  border-color: rgba(248, 195, 81, 0.36);
+  background: linear-gradient(180deg, rgba(248, 195, 81, 0.15), rgba(7, 20, 20, 0.76));
+}
+
+.alert-message,
+.alert-steps li,
+.alert-steps-title {
+  color: #fff7ed;
+}
+
+pre,
+.monitor-log,
+.raw-output pre,
+.incognito-diag-raw pre {
+  border-color: var(--mono-line);
+  background:
+    linear-gradient(180deg, rgba(11, 22, 34, 0.94), rgba(5, 11, 18, 0.96));
+  color: var(--mono-ink);
+}
+
+.monitor-summary {
+  border-color: var(--line);
+  background: rgba(7, 20, 20, 0.62);
+  color: var(--muted);
+}
+
+.monitor-row {
+  border-bottom-color: rgba(132, 255, 212, 0.09);
+}
+
+.monitor-row:hover {
+  background: rgba(56, 189, 248, 0.11);
+}
+
+.monitor-icon {
+  background: rgba(56, 189, 248, 0.13);
+  color: #bae6fd;
+}
+
+.monitor-text {
+  color: var(--mono-ink);
+}
+
+.checkout-link {
+  color: #8bd8ff;
+}
+
+.modal-card,
+.wechat-group-card {
+  border-color: var(--line);
+  background: rgba(8, 24, 22, 0.92);
+  box-shadow: var(--panel-shadow);
+}
+
+.wechat-group-card__close,
+.wechat-group-modal__close {
+  background: rgba(15, 23, 42, 0.76);
+  color: var(--muted);
+}
+
+.wechat-group-card__close:hover,
+.wechat-group-modal__close:hover {
+  background: rgba(251, 113, 133, 0.14);
+  color: #fecdd3;
+}
+
+button:focus-visible,
+a:focus-visible,
+summary:focus-visible,
+input:focus-visible,
+select:focus-visible,
+textarea:focus-visible,
+.wechat-group-card__toggle:focus-visible,
+.wechat-group-card__preview:focus-visible {
+  outline: 3px solid var(--focus);
+  outline-offset: 2px;
+}
+
+/* ===== Reference banking blue correction ===== */
+
+:root {
+  --bg: #0b1424;
+  --bg-grid: rgba(96, 129, 190, 0.065);
+  --panel: rgba(36, 45, 62, 0.82);
+  --panel-strong: rgba(40, 49, 67, 0.92);
+  --ink: #f8fafc;
+  --muted: #a9b5c7;
+  --line: rgba(148, 163, 184, 0.22);
+  --soft: rgba(51, 65, 85, 0.62);
+  --accent: #3164e5;
+  --accent-dark: #86a6ff;
+  --success: #6cc58f;
+  --info: #60a5fa;
+  --focus: rgba(49, 100, 229, 0.34);
+  --control-bg: rgba(12, 21, 36, 0.74);
+  --control-muted: rgba(48, 58, 76, 0.7);
+  --mono-bg: #08111f;
+  --mono-line: rgba(96, 165, 250, 0.24);
+  --mono-ink: #dbeafe;
+  --panel-shadow: 0 24px 62px rgba(0, 0, 0, 0.38), 0 0 44px rgba(49, 100, 229, 0.08);
+  --panel-shadow-soft: 0 14px 34px rgba(0, 0, 0, 0.3), 0 0 22px rgba(96, 165, 250, 0.055);
+}
+
+body {
+  background:
+    linear-gradient(rgba(96, 129, 190, 0.055) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(96, 129, 190, 0.052) 1px, transparent 1px),
+    linear-gradient(126deg, rgba(49, 100, 229, 0.22) 0%, rgba(49, 100, 229, 0.045) 36%, transparent 58%),
+    linear-gradient(238deg, rgba(88, 80, 210, 0.16) 0%, rgba(88, 80, 210, 0.035) 38%, transparent 60%),
+    linear-gradient(180deg, #0c1628 0%, #0b1424 48%, #08111f 100%);
+  background-attachment: fixed;
+  background-size: 52px 52px, 52px 52px, auto, auto, auto;
+}
+
+::selection {
+  background: rgba(49, 100, 229, 0.38);
+  color: #ffffff;
+}
+
+* {
+  scrollbar-color: rgba(134, 166, 255, 0.58) rgba(9, 17, 31, 0.78);
+}
+
+.skip-link {
+  border-color: rgba(134, 166, 255, 0.7);
+  background: rgba(12, 21, 36, 0.96);
+  color: #dbeafe;
+}
+
+.workbench-header,
+.flow-nav,
+.mobile-anchor-nav,
+.panel,
+.monitor-panel,
+.incognito-diagnostics-panel,
+.luckmail-mails-panel {
+  border-color: rgba(148, 163, 184, 0.24);
+  background:
+    linear-gradient(180deg, rgba(45, 55, 75, 0.88) 0%, rgba(31, 41, 58, 0.84) 100%);
+  box-shadow: var(--panel-shadow-soft);
+}
+
+.workbench-header {
+  box-shadow: var(--panel-shadow);
+}
+
+.workbench-kicker,
+.flow-nav > span,
+summary.section-title::after {
+  color: var(--accent-dark);
+}
+
+.workbench-title h1 {
+  background: linear-gradient(90deg, #ffffff 0%, #dbeafe 42%, #3164e5 78%, #6d63d7 100%);
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+}
+
+.status-chip,
+.mobile-anchor-nav a,
+.tool-tab,
+.next-action-link,
+.help-link,
+.secondary-button,
+.ghost-button,
+.incognito-link-button,
+.copy-button {
+  border-color: rgba(148, 163, 184, 0.24);
+  background: rgba(34, 43, 60, 0.78);
+  color: #dbeafe;
+}
+
+.status-chip.muted {
+  border-color: rgba(148, 163, 184, 0.18);
+  background: rgba(23, 31, 46, 0.72);
+  color: var(--muted);
+}
+
+.badge {
+  border-color: rgba(108, 197, 143, 0.34);
+  background: rgba(108, 197, 143, 0.14);
+  color: #b7f7ce;
+}
+
+.badge.neutral {
+  border-color: rgba(148, 163, 184, 0.26);
+  background: rgba(17, 24, 39, 0.48);
+  color: #cbd5e1;
+}
+
+input,
+select,
+textarea {
+  border-color: rgba(148, 163, 184, 0.24);
+  background: rgba(9, 17, 31, 0.74);
+  color: var(--ink);
+}
+
+input::placeholder,
+textarea::placeholder {
+  color: rgba(169, 181, 199, 0.7);
+}
+
+input:focus,
+select:focus,
+textarea:focus {
+  border-color: rgba(134, 166, 255, 0.78);
+  box-shadow: 0 0 0 3px var(--focus), inset 0 1px 0 rgba(255, 255, 255, 0.05);
+}
+
+select option {
+  background: #111827;
+}
+
+.section-box,
+.summary > div,
+.final-status > div,
+.next-actions,
+.raw-output,
+.gopay-result-grid > div,
+.browser-use-result-grid > div,
+.incognito-diag-grid > div,
+.luckmail-mails-summary,
+.luckmail-mode-row,
+.voice-prompt-row,
+.luckmail-mail-card {
+  border-color: rgba(148, 163, 184, 0.22);
+  background: rgba(45, 55, 72, 0.64);
+}
+
+.final-status > div {
+  border-color: rgba(96, 165, 250, 0.28);
+  background: linear-gradient(180deg, rgba(49, 100, 229, 0.2), rgba(31, 41, 58, 0.72));
+}
+
+button {
+  border-color: rgba(134, 166, 255, 0.56);
+  background: linear-gradient(135deg, #3164e5 0%, #4f6fdc 58%, #6d63d7 100%);
+  color: #ffffff;
+  box-shadow: 0 14px 28px rgba(49, 100, 229, 0.28), inset 0 1px 0 rgba(255, 255, 255, 0.22);
+}
+
+button:hover {
+  border-color: rgba(191, 219, 254, 0.78);
+  background: linear-gradient(135deg, #3f73f0 0%, #5f7eed 58%, #7a70e8 100%);
+  box-shadow: 0 18px 36px rgba(49, 100, 229, 0.36), 0 0 22px rgba(96, 165, 250, 0.16);
+}
+
+.device-login-guide-button {
+  border-color: rgba(134, 166, 255, 0.5);
+  background: linear-gradient(135deg, #3164e5, #5b6ee1);
+  color: #ffffff;
+}
+
+.device-login-guide-button:hover {
+  background: linear-gradient(135deg, #3f73f0, #7369de);
+}
+
+.secondary-button,
+.ghost-button,
+.incognito-link-button,
+.copy-button,
+.browser-use-toolbar button:last-child {
+  background: rgba(34, 43, 60, 0.78);
+  color: #dbeafe;
+}
+
+.secondary-button:hover,
+.ghost-button:hover,
+.incognito-link-button:hover,
+.copy-button:hover,
+.browser-use-toolbar button:last-child:hover,
+.mobile-anchor-nav a:hover,
+.tool-tab:hover,
+.next-action-link:hover,
+.help-link:hover {
+  border-color: rgba(134, 166, 255, 0.58);
+  background: rgba(49, 100, 229, 0.18);
+  color: #ffffff;
+  box-shadow: 0 0 18px rgba(96, 165, 250, 0.14);
+}
+
+.flow-nav .flow-action-button {
+  border-color: rgba(148, 163, 184, 0.2);
+  background: rgba(31, 41, 58, 0.58);
+  color: #e5edff;
+}
+
+.flow-nav .flow-action-button:hover {
+  border-color: rgba(134, 166, 255, 0.58);
+  background: rgba(49, 100, 229, 0.2);
+  color: #ffffff;
+}
+
+.flow-nav .flow-action-button:disabled {
+  border-color: rgba(148, 163, 184, 0.14);
+  background: rgba(15, 23, 42, 0.48);
+  color: rgba(169, 181, 199, 0.72);
+}
+
+.flow-nav li:not(:last-child)::after {
+  color: rgba(169, 181, 199, 0.7);
+}
+
+.step-flow-item {
+  border-color: rgba(148, 163, 184, 0.22);
+  background: rgba(36, 45, 62, 0.62);
+}
+
+.step-flow-item strong {
+  color: #f8fafc;
+}
+
+.step-dot {
+  border-color: rgba(169, 181, 199, 0.54);
+  background: rgba(15, 23, 42, 0.9);
+}
+
+.step-flow-item.active {
+  border-color: rgba(96, 165, 250, 0.46);
+  background: rgba(49, 100, 229, 0.16);
+}
+
+.step-flow-item.done {
+  border-color: rgba(108, 197, 143, 0.34);
+  background: rgba(108, 197, 143, 0.12);
+}
+
+.monitor-summary {
+  border-color: rgba(148, 163, 184, 0.22);
+  background: rgba(31, 41, 58, 0.62);
+}
+
+.monitor-row {
+  border-bottom-color: rgba(148, 163, 184, 0.1);
+}
+
+.monitor-row:hover {
+  background: rgba(49, 100, 229, 0.13);
+}
+
+.modal-card,
+.wechat-group-card {
+  border-color: rgba(148, 163, 184, 0.24);
+  background: rgba(31, 41, 58, 0.94);
+}
+
+/* ===== Reference typography, buttons, and progress polish ===== */
+
+:root {
+  --bank-bg: #0b1424;
+  --bank-card: rgba(45, 55, 72, 0.82);
+  --bank-card-strong: rgba(53, 63, 81, 0.88);
+  --bank-control: rgba(55, 65, 83, 0.78);
+  --bank-control-dark: rgba(13, 22, 38, 0.86);
+  --bank-border: rgba(148, 163, 184, 0.24);
+  --bank-border-strong: rgba(148, 163, 184, 0.34);
+  --bank-blue: #3164e5;
+  --bank-blue-soft: #4d63d8;
+  --bank-blue-light: #86a6ff;
+  --bank-text: #f8fafc;
+  --bank-muted: #adb8c9;
+}
+
+body {
+  color: var(--bank-text);
+}
+
+.workbench-title h1,
+.panel-head h2,
+.monitor-head h3,
+.section-title span,
+.static-title {
+  color: var(--bank-text);
+  text-shadow: 0 1px 0 rgba(0, 0, 0, 0.18);
+}
+
+.workbench-title h1 {
+  background: none;
+  -webkit-background-clip: initial;
+  background-clip: initial;
+  color: var(--bank-text);
+}
+
+.workbench-title h1 span {
+  color: var(--bank-blue-soft);
+}
+
+.workbench-kicker,
+.flow-nav > span,
+.checkout-link,
+.help-link,
+.next-action-link,
+summary.section-title::after {
+  color: var(--bank-blue-light);
+}
+
+.workbench-title p:last-child,
+.panel-subtitle,
+.field-hint,
+.browser-use-help,
+.metric-label,
+.section-title small,
+.step-flow-item p,
+.monitor-empty,
+.incognito-diag-message,
+label,
+.gopay-field,
+.browser-use-field {
+  color: var(--bank-muted);
+}
+
+.panel,
+.workbench-header,
+.flow-nav,
+.mobile-anchor-nav,
+.monitor-panel,
+.incognito-diagnostics-panel,
+.luckmail-mails-panel {
+  border-color: var(--bank-border);
+  background:
+    linear-gradient(180deg, rgba(48, 58, 77, 0.92) 0%, rgba(34, 44, 62, 0.9) 100%);
+}
+
+.section-box,
+.summary > div,
+.final-status > div,
+.next-actions,
+.raw-output,
+.gopay-result-grid > div,
+.browser-use-result-grid > div,
+.incognito-diag-grid > div,
+.luckmail-mails-summary,
+.luckmail-mode-row,
+.voice-prompt-row,
+.luckmail-mail-card {
+  border-color: var(--bank-border);
+  background:
+    linear-gradient(180deg, rgba(57, 67, 86, 0.78) 0%, rgba(41, 51, 69, 0.76) 100%);
+}
+
+input,
+select,
+textarea,
+pre,
+.monitor-log,
+.raw-output pre,
+.incognito-diag-raw pre {
+  border-color: rgba(77, 91, 116, 0.72);
+  background: var(--bank-control-dark);
+}
+
+input::placeholder,
+textarea::placeholder {
+  color: rgba(173, 184, 201, 0.72);
+}
+
+.status-chip,
+.badge.neutral {
+  border-color: var(--bank-border);
+  background: rgba(18, 28, 45, 0.62);
+  color: #d8e1f1;
+}
+
+.badge {
+  border-color: rgba(108, 197, 143, 0.34);
+  background: rgba(108, 197, 143, 0.15);
+  color: #8ed8aa;
+}
+
+.badge::before {
+  content: "";
+  display: inline-block;
+  flex: 0 0 auto;
+  width: 8px;
+  height: 8px;
+  margin-right: 6px;
+  border-radius: 999px;
+  background: currentColor;
+  box-shadow: 0 0 0 3px color-mix(in srgb, currentColor 14%, transparent), 0 0 12px currentColor;
+  animation: statusLampPulse 1.8s ease-in-out infinite;
+}
+
+.badge.neutral::before {
+  background: #8ea0ba;
+  box-shadow: 0 0 0 3px rgba(142, 160, 186, 0.12), 0 0 9px rgba(142, 160, 186, 0.62);
+  animation: none;
+}
+
+.badge.error::before,
+.alert-badge::before {
+  background: #fb7185;
+  box-shadow: 0 0 0 3px rgba(251, 113, 133, 0.14), 0 0 12px rgba(251, 113, 133, 0.82);
+}
+
+@keyframes statusLampPulse {
+  0%,
+  100% {
+    opacity: 0.72;
+    transform: scale(0.92);
+  }
+
+  50% {
+    opacity: 1;
+    transform: scale(1.08);
+  }
+}
+
+button {
+  border: 1px solid var(--bank-border-strong);
+  background:
+    linear-gradient(180deg, rgba(70, 81, 102, 0.86) 0%, rgba(53, 63, 81, 0.84) 100%);
+  color: var(--bank-text);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.08), 0 10px 22px rgba(0, 0, 0, 0.18);
+}
+
+button:hover {
+  border-color: rgba(49, 100, 229, 0.74);
+  background:
+    linear-gradient(180deg, rgba(72, 87, 119, 0.9) 0%, rgba(54, 67, 96, 0.88) 100%);
+  color: #ffffff;
+  box-shadow: 0 0 0 1px rgba(49, 100, 229, 0.18), 0 14px 30px rgba(0, 0, 0, 0.22);
+}
+
+button:active {
+  transform: translateY(1px);
+}
+
+button:disabled {
+  border-color: rgba(148, 163, 184, 0.14);
+  background: rgba(24, 32, 47, 0.68);
+  color: rgba(173, 184, 201, 0.52);
+}
+
+.flow-nav .flow-action-button,
+.mobile-anchor-nav a {
+  border: 1px solid rgba(49, 100, 229, 0.62);
+  border-radius: 999px;
+  background: rgba(45, 55, 72, 0.46);
+  color: var(--bank-blue-light);
+  box-shadow: none;
+}
+
+.flow-nav li:not(:last-child)::after {
+  color: rgba(134, 166, 255, 0.72);
+}
+
+.flow-nav li:has(.flow-action-button:not(:disabled))::after {
+  color: rgba(134, 166, 255, 0.86);
+}
+
+.flow-nav .flow-action-button:hover,
+.mobile-anchor-nav a:hover {
+  border-color: rgba(86, 126, 255, 0.9);
+  background: rgba(49, 100, 229, 0.16);
+  color: #dbeafe;
+  box-shadow: 0 0 18px rgba(49, 100, 229, 0.15);
+}
+
+.flow-nav .flow-action-button:disabled {
+  border-color: rgba(77, 91, 116, 0.42);
+  background: rgba(31, 41, 58, 0.5);
+  color: rgba(173, 184, 201, 0.52);
+}
+
+.secondary-button,
+.ghost-button,
+.incognito-link-button,
+.copy-button,
+.browser-use-toolbar button:last-child {
+  border-color: var(--bank-border);
+  background: rgba(55, 65, 83, 0.72);
+  color: #eef3fb;
+}
+
+.danger-button,
+.flow-nav .danger-flow-action {
+  border-color: rgba(251, 113, 133, 0.36);
+  color: #fecdd3;
+}
+
+.paypal-button,
+.device-login-guide-button {
+  border-color: rgba(49, 100, 229, 0.72);
+  background: linear-gradient(135deg, #3164e5 0%, #4d63d8 100%);
+  color: #ffffff;
+}
+
+.step-flow {
+  position: relative;
+}
+
+.step-flow-item {
+  position: relative;
+  overflow: hidden;
+  border-color: var(--bank-border);
+  background:
+    linear-gradient(180deg, rgba(55, 65, 83, 0.76) 0%, rgba(37, 47, 65, 0.76) 100%);
+}
+
+.step-flow-item::before {
+  content: "";
+  position: absolute;
+  top: 0;
+  right: 0;
+  left: 0;
+  height: 4px;
+  background: rgba(77, 91, 116, 0.74);
+}
+
+.step-flow-item.active {
+  border-color: rgba(49, 100, 229, 0.6);
+  background:
+    linear-gradient(180deg, rgba(49, 100, 229, 0.24) 0%, rgba(41, 51, 69, 0.82) 100%);
+}
+
+.step-flow-item.active::before {
+  background: linear-gradient(90deg, #3164e5, #7c8cff);
+}
+
+.step-flow-item.done {
+  border-color: rgba(108, 197, 143, 0.4);
+  background:
+    linear-gradient(180deg, rgba(108, 197, 143, 0.14) 0%, rgba(41, 51, 69, 0.78) 100%);
+}
+
+.step-flow-item.done::before {
+  background: linear-gradient(90deg, #6cc58f, #9fe3b8);
+}
+
+.step-flow-item.warning::before {
+  background: linear-gradient(90deg, #f8c351, #f8dc8a);
+}
+
+.step-flow-item.error::before {
+  background: linear-gradient(90deg, #fb7185, #fecdd3);
+}
+
+.step-dot {
+  border-color: rgba(148, 163, 184, 0.48);
+  background: rgba(17, 24, 39, 0.9);
+}
+
+.step-flow-item.active .step-dot {
+  border-color: var(--bank-blue);
+  background: var(--bank-blue);
+  box-shadow: 0 0 14px rgba(49, 100, 229, 0.58);
+}
+
+.step-flow-item.done .step-dot {
+  border-color: var(--success);
+  background: var(--success);
+}
+
+/* ===== Workflow lamps and visible LuckMail API config ===== */
+
+.flow-nav .flow-action-button {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.flow-nav .flow-action-button::before {
+  content: "";
+  flex: 0 0 auto;
+  width: 8px;
+  height: 8px;
+  border-radius: 999px;
+  background: #8ea0ba;
+  box-shadow: 0 0 0 3px rgba(142, 160, 186, 0.12), 0 0 9px rgba(142, 160, 186, 0.58);
+}
+
+.flow-nav .flow-action-button[data-flow-state="running"]::before {
+  animation: workflowRedGreenLamp 0.82s steps(1, end) infinite;
+}
+
+.flow-nav .flow-action-button[data-flow-state="done"]::before {
+  background: #6cc58f;
+  box-shadow: 0 0 0 3px rgba(108, 197, 143, 0.16), 0 0 12px rgba(108, 197, 143, 0.88);
+}
+
+.flow-nav .flow-action-button[data-flow-state="error"]::before {
+  background: #fb7185;
+  box-shadow: 0 0 0 3px rgba(251, 113, 133, 0.16), 0 0 12px rgba(251, 113, 133, 0.86);
+}
+
+@keyframes workflowRedGreenLamp {
+  0%,
+  49% {
+    background: #fb7185;
+    box-shadow: 0 0 0 3px rgba(251, 113, 133, 0.16), 0 0 12px rgba(251, 113, 133, 0.9);
+  }
+
+  50%,
+  100% {
+    background: #6cc58f;
+    box-shadow: 0 0 0 3px rgba(108, 197, 143, 0.16), 0 0 12px rgba(108, 197, 143, 0.9);
+  }
+}
+
+.luckmail-panel .luckmail-form {
+  display: flex;
+  min-height: 0;
+  flex: 1 1 auto;
+  flex-direction: column;
+  gap: 6px;
+  overflow: hidden;
+}
+
+.luckmail-panel details.luckmail-api-config {
+  display: block !important;
+  flex: 0 0 auto;
+  max-height: min(218px, 42vh);
+  margin: 0 0 6px;
+  overflow: auto;
+  border-color: rgba(49, 100, 229, 0.38);
+  background:
+    linear-gradient(180deg, rgba(49, 100, 229, 0.18) 0%, rgba(41, 51, 69, 0.84) 100%);
+}
+
+.luckmail-panel details.luckmail-api-config:not([open]) {
+  max-height: 42px;
+  overflow: hidden;
+}
+
+.luckmail-panel details.luckmail-api-config summary.section-title small {
+  display: inline;
+  color: #c7d2fe;
+}
+
+.luckmail-panel details.luckmail-api-config summary.section-title span {
+  color: #ffffff;
+}
+
+.luckmail-api-key-field {
+  position: relative;
+  border-radius: 7px;
+  outline: 1px solid rgba(108, 197, 143, 0.36);
+  outline-offset: 4px;
+}
+
+.luckmail-api-key-field > span {
+  color: #b9f6ca;
+  font-weight: 800;
+}
+
+.luckmail-api-config input,
+.luckmail-api-config select {
+  height: 28px;
+  padding: 0 7px;
+  font-size: 11px;
+}
+
+.luckmail-api-config .gopay-field-row,
+.luckmail-api-config details.section-box > *:not(summary) {
+  gap: 5px;
+  margin-top: 5px;
+}
+
+.luckmail-api-toolbar {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.luckmail-api-toolbar button {
+  height: 28px;
+  font-size: 11px;
+}
+
+.luckmail-api-status {
+  color: #dbeafe;
+  font-size: 11px;
+  line-height: 1.35;
+}
+
+.badge.neutral {
+  border-color: rgba(108, 197, 143, 0.34);
+  background: rgba(108, 197, 143, 0.14);
+  color: #8ed8aa;
+}
+
+.badge.neutral::before {
+  background: #6cc58f;
+  box-shadow: 0 0 0 3px rgba(108, 197, 143, 0.16), 0 0 12px rgba(108, 197, 143, 0.82);
+}
+
+/* ===== Reference bright blue and green correction ===== */
+
+:root {
+  --success: #66d875;
+  --bank-blue: #4b82f3;
+  --bank-blue-soft: #4f86f7;
+  --bank-blue-light: #8eb4ff;
+}
+
+.badge,
+.badge.neutral {
+  border-color: rgba(102, 216, 117, 0.42);
+  background: rgba(102, 216, 117, 0.16);
+  color: #a9ffbd;
+}
+
+.badge::before,
+.badge.neutral::before,
+.flow-nav .flow-action-button[data-flow-state="done"]::before {
+  background: #66d875;
+  box-shadow: 0 0 0 3px rgba(102, 216, 117, 0.18), 0 0 14px rgba(102, 216, 117, 0.92);
+}
+
+button,
+.paypal-button,
+.device-login-guide-button {
+  border-color: rgba(142, 180, 255, 0.64);
+  background: linear-gradient(135deg, #3f73ea 0%, #4b82f3 52%, #5a90ff 100%);
+  color: #ffffff;
+  box-shadow: 0 16px 32px rgba(75, 130, 243, 0.3), inset 0 1px 0 rgba(255, 255, 255, 0.24);
+}
+
+button:hover,
+.paypal-button:hover,
+.device-login-guide-button:hover {
+  border-color: rgba(219, 234, 254, 0.86);
+  background: linear-gradient(135deg, #4c83fb 0%, #5a90ff 56%, #70a1ff 100%);
+  box-shadow: 0 20px 40px rgba(75, 130, 243, 0.4), 0 0 24px rgba(90, 144, 255, 0.2);
+}
+
+button:disabled,
+.flow-nav .flow-action-button:disabled {
+  border-color: rgba(118, 139, 174, 0.26);
+  background: rgba(30, 41, 59, 0.62);
+  color: rgba(203, 213, 225, 0.58);
+  box-shadow: none;
+}
+
+.secondary-button,
+.ghost-button,
+.incognito-link-button,
+.copy-button,
+.browser-use-toolbar button:last-child {
+  border-color: rgba(142, 180, 255, 0.34);
+  background: rgba(47, 59, 80, 0.82);
+  color: #dbeafe;
+  box-shadow: none;
+}
+
+.secondary-button:hover,
+.ghost-button:hover,
+.incognito-link-button:hover,
+.copy-button:hover,
+.browser-use-toolbar button:last-child:hover {
+  border-color: rgba(142, 180, 255, 0.62);
+  background: rgba(75, 130, 243, 0.18);
+  box-shadow: 0 0 18px rgba(75, 130, 243, 0.16);
+}
+
+.flow-nav .flow-action-button {
+  border-color: rgba(75, 130, 243, 0.7);
+  background: linear-gradient(135deg, rgba(63, 115, 234, 0.94) 0%, rgba(75, 130, 243, 0.94) 52%, rgba(90, 144, 255, 0.94) 100%);
+  color: #dbeafe;
+  box-shadow: 0 12px 26px rgba(75, 130, 243, 0.22), inset 0 1px 0 rgba(255, 255, 255, 0.18);
+}
+
+.flow-nav .flow-action-button:hover {
+  border-color: rgba(142, 180, 255, 0.86);
+  background: linear-gradient(135deg, rgba(76, 131, 251, 0.98) 0%, rgba(90, 144, 255, 0.98) 56%, rgba(112, 161, 255, 0.98) 100%);
+  color: #ffffff;
+}
+
+.flow-nav .danger-flow-action {
+  border-color: rgba(251, 113, 133, 0.48);
+  background: rgba(74, 32, 45, 0.74);
+  color: #fecdd3;
+  box-shadow: none;
+}
+
+.step-flow-item.active::before {
+  background: linear-gradient(90deg, #3f73ea, #5a90ff);
+}
+
+.step-flow-item.active .step-dot {
+  border-color: #4b82f3;
+  background: #4b82f3;
+  box-shadow: 0 0 15px rgba(75, 130, 243, 0.72);
+}
+
+.step-flow-item.done::before {
+  background: linear-gradient(90deg, #66d875, #a9ffbd);
+}
+
+.step-flow-item.done .step-dot {
+  border-color: #66d875;
+  background: #66d875;
+  box-shadow: 0 0 15px rgba(102, 216, 117, 0.72);
+}
+
+.luckmail-api-key-field {
+  outline-color: rgba(102, 216, 117, 0.48);
+}
+
+.luckmail-api-key-field > span {
+  color: #a9ffbd;
+}
+
+.luckmail-panel .voice-prompt-row {
+  display: flex !important;
+  grid-column: 1 / -1;
+  align-items: center;
+  justify-content: space-between;
+  min-height: 32px;
+  margin-top: 5px;
+  padding: 6px 8px;
+  border-color: rgba(75, 130, 243, 0.36);
+  border-radius: 8px;
+  background: rgba(75, 130, 243, 0.12);
+}
+
+.luckmail-panel .voice-prompt-toggle {
+  min-width: 0;
+  color: #dbeafe;
+  font-size: 12px;
+}
+
+.luckmail-panel .voice-prompt-toggle input {
+  width: 16px;
+  height: 16px;
+  accent-color: #66d875;
+  cursor: pointer;
+}
+
+.luckmail-panel .voice-prompt-text {
+  color: #a9ffbd;
+  font-size: 11px;
+}
+
+.workbench-status .workbench-voice-prompt {
+  display: flex !important;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  min-height: 30px;
+  margin: 0;
+  padding: 5px 8px;
+  border: 1px solid rgba(75, 130, 243, 0.44);
+  border-radius: 999px;
+  background: rgba(75, 130, 243, 0.14);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.08), 0 0 18px rgba(75, 130, 243, 0.12);
+}
+
+.workbench-status .workbench-voice-prompt .voice-prompt-toggle {
+  min-width: 0;
+  color: #dbeafe;
+  font-size: 12px;
+  line-height: 1;
+  white-space: nowrap;
+}
+
+.workbench-status .workbench-voice-prompt .voice-prompt-toggle input {
+  width: 16px;
+  height: 16px;
+  accent-color: #66d875;
+  cursor: pointer;
+}
+
+.workbench-status .workbench-voice-prompt .voice-prompt-text {
+  max-width: 88px;
+  color: #a9ffbd;
+  font-size: 11px;
+}
+
+.luckmail-head-actions {
+  align-self: flex-start;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
+.luckmail-head-actions .voice-prompt-row {
+  flex: 0 0 auto;
+  grid-column: auto;
+  min-height: 28px;
+  margin-top: 0;
+  padding: 5px 7px;
+}
+
+.luckmail-head-actions .voice-prompt-text {
+  max-width: 72px;
+}
+
+@keyframes workflowRedGreenLamp {
+  0%,
+  49% {
+    background: #fb7185;
+    box-shadow: 0 0 0 3px rgba(251, 113, 133, 0.16), 0 0 12px rgba(251, 113, 133, 0.9);
+  }
+
+  50%,
+  100% {
+    background: #66d875;
+    box-shadow: 0 0 0 3px rgba(102, 216, 117, 0.18), 0 0 14px rgba(102, 216, 117, 0.94);
   }
 }
 

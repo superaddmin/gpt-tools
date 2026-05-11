@@ -478,14 +478,90 @@ func TestBuildAuditLogRecordIncludesCDPPINFlowFields(t *testing.T) {
 func TestGopayCDPFlowScriptKeepsOTPManualAndDefinesPINStages(t *testing.T) {
 	script := gopayCDPFlowScript("123456")
 
-	for _, want := range []string{"otp_manual_required", "pin_entry_binding", "pin_entry_payment", "pin_page_signature", "hashText(currentURL", "payment_completed", "gopay_complete"} {
+	for _, want := range []string{"otp_manual_required", "pin_entry_binding", "pin_entry_payment", "pin_page_signature", "hashText(pinPageSignatureSource)", "payment_completed", "gopay_complete", "gopay_session_expired", "waktunya habis", "ulangi prosesnya dari awal", "failed to complete payment", "gopay_payment_failed", "payment_failure_reason"} {
 		if !strings.Contains(script, want) {
 			t.Fatalf("script missing %q", want)
 		}
 	}
+	for _, want := range []string{"pin_signal_wins_over_otp_text", "bindingPinPath", "pin_detection_reason", "pin_input_candidate_count", "frame_candidates", "preferSplitPinInputs", "pin_auto_block_reason", "pin_attempt_count", "result.pin_attempt_count < 1", "already_submitted", "pinPageSignatureSource"} {
+		if !strings.Contains(script, want) {
+			t.Fatalf("script missing PIN retry/OTP guard %q", want)
+		}
+	}
+	for _, want := range []string{"pin_keyboard_input_requested", "pin_keyboard_focus_rect", "pin_keyboard_input_reason", "pin_surface_without_visible_inputs", "unsupported_pin_widget", "cdp_keyboard_events", "pinKeyboardFocusRect", "pin_signal_without_inputs", "result.page_stage = result.pin_stage === 'payment' ? 'pin_entry_payment' : 'pin_entry_binding'"} {
+		if !strings.Contains(script, want) {
+			t.Fatalf("script missing PIN keyboard fallback marker %q", want)
+		}
+	}
+	for _, want := range []string{"pin_input_event_source", "pin_input_event_is_trusted", "pin_input_observed_value", "pin_input_expected_value", "pin_input_value_capture_enabled", "pin_input_events", "event.isTrusted", "user_trusted_event", "automation_synthetic", "__gopay_pin_input_audit_v1"} {
+		if !strings.Contains(script, want) {
+			t.Fatalf("script missing PIN input audit marker %q", want)
+		}
+	}
+	pinWins := strings.Index(script, "if (pinPageBySignal && pinInputs.length > 0)")
+	otpFallback := strings.Index(script, "} else if (otpPage) {")
+	if pinWins < 0 || otpFallback < 0 || pinWins > otpFallback {
+		t.Fatalf("PIN page detection must win over noisy OTP text: pinWins=%d otpFallback=%d", pinWins, otpFallback)
+	}
+	if strings.Contains(script, "result.pin_attempt_count < 4") || strings.Contains(script, "result.pin_attempt_count >= 4") {
+		t.Fatalf("script should submit each PIN page/PIN combination at most once")
+	}
 	for _, forbidden := range []string{"setNativeValue(otpInput", "submitBtn.click()"} {
 		if strings.Contains(script, forbidden) {
 			t.Fatalf("script should not auto-fill or submit OTP; found %q", forbidden)
+		}
+	}
+	if !strings.Contains(script, "&& !result.already_handled") {
+		t.Fatalf("script should skip the same PIN page/PIN combination after one automatic submit")
+	}
+}
+
+func TestGopayCDPTerminalProbeDetectsExpiredAndFailedPages(t *testing.T) {
+	script := gopayCDPTerminalProbeScript()
+
+	for _, want := range []string{
+		"waktunya habis",
+		"ulangi prosesnya dari awal",
+		"gopay_session_expired",
+		"failed to complete payment",
+		"please place your order again",
+		"select another payment method",
+		"gopay_payment_failed",
+		"payment_failure_reason",
+		"auto_action_paused",
+	} {
+		if !strings.Contains(script, want) {
+			t.Fatalf("terminal probe missing %q", want)
+		}
+	}
+	if strings.Index(script, "payment_expired: !!expiredMatch") > strings.Index(script, "payment_failed: !!failureMatch") {
+		t.Fatalf("terminal probe should report expired state before failed state")
+	}
+}
+
+func TestGopayCDPKeyboardPINFallbackIsWiredToBackend(t *testing.T) {
+	source, err := os.ReadFile("main.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	script := string(source)
+	for _, want := range []string{
+		"func dispatchCDPKeyboardPIN(",
+		"Input.dispatchKeyEvent",
+		"rawKeyDown",
+		"char",
+		"keyUp",
+		"dispatchCDPMouseClickFromRectBestEffort",
+		`boolMapValue(result, "pin_keyboard_input_requested")`,
+		`result["pin_keyboard_input_dispatched"] = true`,
+		`result["pin_auto_filled"] = true`,
+		`result["pin_auto_submitted"] = true`,
+		`result["pin_input_strategy"] = "cdp_keyboard_events"`,
+		`"pin_keyboard_input_dispatched"`,
+		`"pin_keyboard_input_error"`,
+	} {
+		if !strings.Contains(script, want) {
+			t.Fatalf("backend missing CDP keyboard PIN fallback marker %q", want)
 		}
 	}
 }
@@ -497,19 +573,53 @@ func TestGopayCDPFlowScriptDefinesConsentAndBalanceGuards(t *testing.T) {
 		"Hubungkan",
 		"gopay_consent_hubungkan",
 		"balance_wait_rp0",
-		"pay_now_rp1",
+		"gopay_insufficient_balance",
+		"pay_now_ready",
+		"balance_ready_observed",
 		"Pay now",
+		"Bayar sekarang",
 		"auto_action_paused",
 		"auto_action_stage",
 		"pay_now_auto_clicked",
+		"pay_now_button_detected",
+		"pay_now_trusted_click_requested",
+		"pay_now_trusted_click_count",
+		"pay_now_post_click_elapsed_ms",
+		"pay_now_attempt_limit_reached",
+		"pay_now_button_rect",
+		"pay_now_block_reason",
+		"insufficient_balance",
+		"order_amount",
+		"balance_shortfall",
+		"insufficient_balance_reason",
+		"balance_less_than_order_amount",
+		"findOrderAmount",
 		"hubungkan_auto_clicked",
 		"!result.auto_action_paused",
 		"const actionScope = urlHost + urlPath;",
-		"findStableActionByExactText",
+		"findStableActionByFlexibleText",
 		"gopay_cdp_hubungkan_cooldown_",
+		"gopay_cdp_pay_now_trusted_",
+		"gopay_cdp_pay_now_trusted_at_",
+		"maxPayNowTrustedAttempts = 1",
+		"pay_now_post_click_wait",
+		"trusted_click_already_sent",
+		"trusted_click_no_transition",
+		"!payNowTrustedLimitReached",
 	} {
 		if !strings.Contains(script, want) {
 			t.Fatalf("script missing %q", want)
+		}
+	}
+	for _, forbidden := range []string{
+		"clickElement(payNowButton)",
+		"maxPayNowSyntheticAttempts",
+		"payNowSyntheticLimitReached",
+		"gopay_cdp_pay_now_ready_",
+		"gopay_cdp_pay_now_cooldown_",
+	} {
+		if strings.Contains(script, forbidden) {
+			t.Fatalf("script should not use Pay now synthetic click path; found %q", forbidden)
 		}
 	}
 	pauseCheck := strings.Index(script, "result.balance_state === 'rp0'")
@@ -521,6 +631,18 @@ func TestGopayCDPFlowScriptDefinesConsentAndBalanceGuards(t *testing.T) {
 	clickHubungkan := strings.Index(script, "clickElement(hubungkanButton)")
 	if markHubungkan < 0 || clickHubungkan < 0 || markHubungkan > clickHubungkan {
 		t.Fatalf("script should mark Hubungkan handled before click: mark=%d click=%d", markHubungkan, clickHubungkan)
+	}
+	payNowCheck := strings.Index(script, "findStableActionByFlexibleText(['Pay now'")
+	insufficientCheck := strings.Index(script, "result.balance_state = 'insufficient'")
+	rp1OnlyGate := strings.Index(script, "else if (result.balance_state === 'rp1') {\n\t\t\t\tconst payNowButton")
+	if payNowCheck < 0 {
+		t.Fatalf("script should define flexible Pay now detection")
+	}
+	if insufficientCheck < 0 || insufficientCheck > payNowCheck {
+		t.Fatalf("script should detect insufficient balance before Pay now handling: insufficient=%d payNow=%d", insufficientCheck, payNowCheck)
+	}
+	if rp1OnlyGate >= 0 && rp1OnlyGate < payNowCheck {
+		t.Fatalf("script should not gate Pay now solely on Rp1 balance")
 	}
 }
 
@@ -544,7 +666,8 @@ func TestLoginClickRecognizesChineseLoginRegisterModalAndUsesTrustedClick(t *tes
 		"使用 apple",
 		"使用电话号码",
 		"login_trusted_click_required",
-		"login_direct_navigation_suggested",
+		"login_popup_not_opened",
+		"manual_login_click_required",
 		"拒绝非必需",
 		"全部接受",
 		"item.score >= 80",
@@ -554,6 +677,7 @@ func TestLoginClickRecognizesChineseLoginRegisterModalAndUsesTrustedClick(t *tes
 		"about_blank",
 		"root_cause",
 		"decision_strategy",
+		"stay_on_current_page_after_login_click",
 		"wait_extended_ms",
 		"network_delay_or_hydration_pending",
 		"continue_wait_for_network_and_hydration",
@@ -574,8 +698,6 @@ func TestLoginClickRecognizesChineseLoginRegisterModalAndUsesTrustedClick(t *tes
 		"retry_login_click_on_fresh_context",
 		"https://chatgpt.com/",
 		"Page.navigate",
-		"https://chatgpt.com/auth/login",
-		"https://auth.openai.com/log-in",
 		`"type":        "mouseMoved"`,
 		`"buttons":     0`,
 		`"pointerType": "mouse"`,
@@ -590,6 +712,11 @@ func TestLoginClickRecognizesChineseLoginRegisterModalAndUsesTrustedClick(t *tes
 		}
 	}
 	for _, forbidden := range []string{
+		"login_direct_navigation_suggested",
+		"direct_login_navigation",
+		"runLoginDirectNavigationStep",
+		"https://chatgpt.com/auth/login",
+		"https://auth.openai.com/log-in",
 		"login_reload_triggered",
 		`[class*="dialog"]`,
 		"body.includes('sign up')",
@@ -613,6 +740,11 @@ func TestLoginEmailFillWaitsLongerAfterLoginSurfaceAppears(t *testing.T) {
 		"hardTimeout < 180*time.Second",
 		"sawLoginSurface",
 		"WaitExtendedMS",
+		"waited_for_email_input_after_surface",
+		"login_surface_email_wait_ms",
+		"for (let i = 0; i < 120; i += 1)",
+		"queryAllDeep",
+		"InputEvent('beforeinput'",
 	} {
 		if !strings.Contains(script, want) {
 			t.Fatalf("login email fill flow missing %q", want)
@@ -621,6 +753,27 @@ func TestLoginEmailFillWaitsLongerAfterLoginSurfaceAppears(t *testing.T) {
 }
 
 func TestGopayCDPTargetSelectionPrefersPaymentPinTargets(t *testing.T) {
+	scope := normalizeGopayCDPTargetScope(gopayCDPTargetScope{
+		TargetID:  "midtrans-target",
+		TargetURL: "https://app.midtrans.com/snap/v4/redirection/account-123",
+		AccountID: "account-123",
+	})
+	parentTarget := cdpTarget{
+		ID:   "midtrans-target",
+		Type: "page",
+		URL:  "https://app.midtrans.com/snap/v4/redirection/account-123",
+	}
+	pinTarget := cdpTarget{
+		ID:   "pin-target",
+		Type: "iframe",
+		URL:  "https://pin-web-client.gopayapi.com/payment/validate-pin?reference=abc",
+	}
+	parentScore := gopayCDPTargetScore(parentTarget) + gopayCDPTargetScopeScore(parentTarget, scope)
+	pinScore := gopayCDPTargetScore(pinTarget) + gopayCDPTargetScopeScore(pinTarget, scope)
+	if pinScore <= parentScore {
+		t.Fatalf("payment PIN target score = %d, want greater than scoped Midtrans parent score %d", pinScore, parentScore)
+	}
+
 	source, err := os.ReadFile("main.go")
 	if err != nil {
 		t.Fatalf("read main.go: %v", err)
@@ -629,6 +782,7 @@ func TestGopayCDPTargetSelectionPrefersPaymentPinTargets(t *testing.T) {
 	for _, want := range []string{
 		"findBestGopayCDPTarget",
 		"gopayCDPTargetScore",
+		"isGopayCDPInputTargetURL",
 		"/payment/validate-pin",
 		"/auth/pin/verify",
 		"selected_target_score",
@@ -636,6 +790,55 @@ func TestGopayCDPTargetSelectionPrefersPaymentPinTargets(t *testing.T) {
 	} {
 		if !strings.Contains(script, want) {
 			t.Fatalf("gopay cdp target selection missing %q", want)
+		}
+	}
+}
+
+func TestGopayCDPExecutionContextSelectionPrefersSecondPaymentPINFrame(t *testing.T) {
+	parentContext := gopayCDPExecutionContext{
+		ID:        1,
+		Origin:    "https://app.midtrans.com",
+		FrameURL:  "https://app.midtrans.com/snap/v4/redirection/account-123",
+		Type:      "default",
+		IsDefault: true,
+	}
+	paymentPINContext := gopayCDPExecutionContext{
+		ID:        7,
+		Origin:    "https://pin-web-client.gopayapi.com",
+		FrameURL:  "https://pin-web-client.gopayapi.com/payment/validate-pin?reference=abc",
+		Type:      "default",
+		IsDefault: true,
+	}
+	parentScore := gopayCDPExecutionContextScore(parentContext)
+	pinScore := gopayCDPExecutionContextScore(paymentPINContext)
+	if pinScore <= parentScore {
+		t.Fatalf("payment PIN execution context score = %d, want greater than parent Midtrans context score %d", pinScore, parentScore)
+	}
+	if !isGopayCDPPINExecutionContextCandidate(paymentPINContext) {
+		t.Fatalf("payment PIN context should be a PIN execution candidate")
+	}
+	if isGopayCDPPINExecutionContextCandidate(parentContext) {
+		t.Fatalf("plain Midtrans parent context should not be treated as a PIN execution candidate")
+	}
+
+	source, err := os.ReadFile("main.go")
+	if err != nil {
+		t.Fatalf("read main.go: %v", err)
+	}
+	script := string(source)
+	for _, want := range []string{
+		"Runtime.executionContextCreated",
+		"Page.getFrameTree",
+		"executeCDPScriptInContext",
+		"executeGopayCDPFlowScript",
+		"pin_context_selected",
+		"execution_context_id",
+		"execution_context_frame_url",
+		"contextId",
+		"/payment/validate-pin",
+	} {
+		if !strings.Contains(script, want) {
+			t.Fatalf("second PIN context execution support missing %q", want)
 		}
 	}
 }
@@ -651,14 +854,51 @@ func TestRandomJapaneseProfileUsesUniqueNamesAndAllowedAgeRange(t *testing.T) {
 		usedJapaneseProfileNames.mu.Unlock()
 	}()
 
+	hasKana := func(value string) bool {
+		for _, r := range value {
+			if (r >= '\u3040' && r <= '\u309f') || (r >= '\u30a0' && r <= '\u30ff') {
+				return true
+			}
+		}
+		return false
+	}
+	isJapaneseKanjiName := func(value string) bool {
+		if value == "" {
+			return false
+		}
+		for _, r := range value {
+			if r == '\u3005' {
+				continue
+			}
+			if (r >= '\u4e00' && r <= '\u9fff') || (r >= '\u3400' && r <= '\u4dbf') {
+				continue
+			}
+			return false
+		}
+		return true
+	}
+	for _, component := range append(append([]string{}, japaneseProfileSurnames...), japaneseProfileGivenNames...) {
+		if !isJapaneseKanjiName(component) {
+			t.Fatalf("configured Japanese profile component = %q, want Japanese kanji name characters", component)
+		}
+		if hasKana(component) {
+			t.Fatalf("configured Japanese profile component = %q, should not use kana reading for full-name field", component)
+		}
+	}
 	seen := map[string]struct{}{}
 	for i := 0; i < 200; i++ {
 		profile := nextRandomJapaneseProfile()
 		if profile.Name == "" {
 			t.Fatal("profile name is empty")
 		}
-		if profile.Age < 18 || profile.Age > 48 {
-			t.Fatalf("profile age = %d, want 18..48", profile.Age)
+		if !isJapaneseKanjiName(profile.Name) {
+			t.Fatalf("profile name = %q, want Japanese kanji full name without spaces or digits", profile.Name)
+		}
+		if hasKana(profile.Name) {
+			t.Fatalf("profile name = %q, should use Japanese kanji instead of kana reading", profile.Name)
+		}
+		if profile.Age <= 20 || profile.Age > 48 {
+			t.Fatalf("profile age = %d, want 21..48", profile.Age)
 		}
 		if _, exists := seen[profile.Name]; exists {
 			t.Fatalf("duplicate profile name generated: %s", profile.Name)
@@ -667,7 +907,266 @@ func TestRandomJapaneseProfileUsesUniqueNamesAndAllowedAgeRange(t *testing.T) {
 	}
 }
 
-func TestLoginCodeFillAutoCompletesChineseProfilePage(t *testing.T) {
+func TestManagedIncognitoCloseCandidatesUseWorkflowScope(t *testing.T) {
+	targets := []cdpTarget{
+		{ID: "local", Type: "page", URL: "http://127.0.0.1:18473/"},
+		{ID: "tracked", Type: "page", URL: "https://example.test/manual"},
+		{ID: "chatgpt", Type: "page", URL: "https://chatgpt.com/"},
+		{ID: "pay", Type: "page", URL: "https://pay.openai.com/c/pay/cs_test_123"},
+		{ID: "midtrans", Type: "page", URL: "https://app.midtrans.com/snap/v4/redirection/acct-123"},
+		{ID: "worker", Type: "service_worker", URL: "https://chatgpt.com/sw.js"},
+		{ID: "devtools", Type: "page", URL: "devtools://devtools/bundled/inspector.html"},
+	}
+	got := managedIncognitoCloseCandidates(targets, "https://chatgpt.com/", map[string]time.Time{"tracked": time.Now()})
+	ids := make([]string, 0, len(got))
+	for _, target := range got {
+		ids = append(ids, target.ID)
+	}
+	want := []string{"tracked", "chatgpt", "pay", "midtrans"}
+	if strings.Join(ids, ",") != strings.Join(want, ",") {
+		t.Fatalf("close candidate ids = %v, want %v", ids, want)
+	}
+}
+
+func TestRecommendedFlowMatchesRequestedWorkflowOrder(t *testing.T) {
+	body, err := os.ReadFile("web/index.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	html := string(body)
+	start := strings.Index(html, `<nav class="flow-nav"`)
+	if start < 0 {
+		t.Fatal("recommended flow nav not found")
+	}
+	end := strings.Index(html[start:], `</nav>`)
+	if end < 0 {
+		t.Fatal("recommended flow nav end not found")
+	}
+	flowNav := html[start : start+end]
+	last := -1
+	for _, step := range []string{
+		"打开无痕窗口",
+		"设备登录引导",
+		"获取 Session JSON",
+		"自动填地址",
+		"打开支付页",
+		"GoPay 绑定",
+		"LuckMail 接码",
+		"Browser Use 分析",
+		"导出 sub2api 凭证",
+		"关闭窗口",
+	} {
+		idx := strings.Index(flowNav, step)
+		if idx < 0 {
+			t.Fatalf("recommended flow missing %q", step)
+		}
+		if idx <= last {
+			t.Fatalf("recommended flow step %q is out of order", step)
+		}
+		last = idx
+	}
+	for _, want := range []string{
+		`id="openIncognitoBtn"`,
+		`id="luckmailDeviceLoginGuideBtn"`,
+		`id="fetchSessionBtn"`,
+		`id="autoFillCheckoutBtn"`,
+		`id="openPaymentShortcutBtn"`,
+		`id="gopayLinkBtn"`,
+		`id="luckmailTokenCodeBtn"`,
+		`id="browserUseRunBtn"`,
+		`id="exportSub2APIBtn"`,
+		`id="closeIncognitoBtn"`,
+		`class="flow-action-button`,
+	} {
+		if !strings.Contains(flowNav, want) {
+			t.Fatalf("recommended flow missing functional button marker %s", want)
+		}
+	}
+	for _, id := range []string{"openIncognitoBtn", "luckmailDeviceLoginGuideBtn", "fetchSessionBtn", "autoFillCheckoutBtn", "openPaymentShortcutBtn", "gopayLinkBtn", "luckmailTokenCodeBtn", "browserUseRunBtn", "exportSub2APIBtn", "closeIncognitoBtn"} {
+		if count := strings.Count(html, `id="`+id+`"`); count != 1 {
+			t.Fatalf("workflow button id %s appears %d times, want exactly once", id, count)
+		}
+	}
+}
+
+func TestPaymentMethodButtonsRemainVisibleAndWired(t *testing.T) {
+	htmlBody, err := os.ReadFile("web/index.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	appBody, err := os.ReadFile("web/app.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cssBody, err := os.ReadFile("web/styles.css")
+	if err != nil {
+		t.Fatal(err)
+	}
+	html := string(htmlBody)
+	app := string(appBody)
+	css := string(cssBody)
+	for _, want := range []string{
+		`<div class="toolbar payment-method-toolbar"`,
+		`id="submitButton" type="submit"`,
+		`id="paypalSubmitButton" class="paypal-button" type="button"`,
+		`生成 GoPay 链接`,
+		`生成 PayPal 链接`,
+	} {
+		if !strings.Contains(html, want) {
+			t.Fatalf("payment method toolbar missing HTML marker %q", want)
+		}
+	}
+	for _, want := range []string{
+		`document.querySelector("#paypalSubmitButton")`,
+		`paymentMethod: "paypal"`,
+		`paypalSubmitButton?.addEventListener("click"`,
+	} {
+		if !strings.Contains(app, want) {
+			t.Fatalf("PayPal submit button missing JS wiring %q", want)
+		}
+	}
+	for _, want := range []string{
+		`.payment-method-toolbar`,
+		`grid-template-columns: repeat(2, minmax(0, 1fr))`,
+		`.paypal-button`,
+		`#checkoutForm .payment-method-toolbar button`,
+	} {
+		if !strings.Contains(css, want) {
+			t.Fatalf("payment method toolbar missing CSS marker %q", want)
+		}
+	}
+}
+
+func TestGopayAndLuckMailPanelsSwapVisualPositions(t *testing.T) {
+	htmlBody, err := os.ReadFile("web/index.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cssBody, err := os.ReadFile("web/styles.css")
+	if err != nil {
+		t.Fatal(err)
+	}
+	html := string(htmlBody)
+	css := string(cssBody)
+
+	if strings.Count(html, `id="gopayPanel"`) != 1 || strings.Count(html, `id="luckmailPanel"`) != 1 {
+		t.Fatal("GoPay and LuckMail panels should each appear exactly once")
+	}
+	anchorStart := strings.Index(html, `<nav class="mobile-anchor-nav"`)
+	if anchorStart < 0 {
+		t.Fatal("mobile anchor nav not found")
+	}
+	anchorEnd := strings.Index(html[anchorStart:], `</nav>`)
+	if anchorEnd < 0 {
+		t.Fatal("mobile anchor nav end not found")
+	}
+	anchorNav := html[anchorStart : anchorStart+anchorEnd]
+	luckmailAnchor := strings.Index(anchorNav, `href="#luckmailPanel"`)
+	gopayAnchor := strings.Index(anchorNav, `href="#gopayPanel"`)
+	if luckmailAnchor < 0 || gopayAnchor < 0 || luckmailAnchor > gopayAnchor {
+		t.Fatalf("mobile anchors should follow swapped visual order: luckmail=%d gopay=%d", luckmailAnchor, gopayAnchor)
+	}
+
+	for _, want := range []string{
+		".luckmail-panel {\n  grid-column: 3;\n  grid-row: 1;",
+		".gopay-panel {\n  grid-column: 3;\n  grid-row: 2;",
+		".luckmail-panel {\n    grid-column: 3;\n    grid-row: 1;",
+		".gopay-panel {\n    grid-column: 1;\n    grid-row: 2;",
+		".luckmail-panel {\n    grid-column: 2;\n    grid-row: 2;",
+		".gopay-panel {\n    grid-column: 1;\n    grid-row: 3;",
+	} {
+		if !strings.Contains(css, want) {
+			t.Fatalf("swapped GoPay/LuckMail layout CSS missing %q", want)
+		}
+	}
+}
+
+func TestOpenPaymentShortcutUsesOpenResultForFlowState(t *testing.T) {
+	body, err := os.ReadFile("web/app.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	app := string(body)
+	for _, want := range []string{
+		"var opened = await openInSameIncognito(latestCheckoutURL);",
+		"await autoSelectOpenedCheckoutPaymentMethod(latestOpenedCheckoutURL || latestCheckoutURL);",
+		`/api/checkout/payment-method-select`,
+		"latestOpenedCheckoutTargetID",
+		"resolveOpenedCheckoutTarget",
+		"target_id: latestOpenedCheckoutTargetID",
+		"trace_id: ensureAutomationTraceID(\"checkout\")",
+		"GoPay",
+		"PayPal",
+		`setWorkflowButtonState(openPaymentShortcutBtn, opened ? "done" : "error")`,
+	} {
+		if !strings.Contains(app, want) {
+			t.Fatalf("open payment shortcut flow state missing %q", want)
+		}
+	}
+}
+
+func TestWorkflowButtonsAnnounceEveryStepState(t *testing.T) {
+	body, err := os.ReadFile("web/app.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	app := string(body)
+	for _, want := range []string{
+		"const workflowVoiceSteps = {",
+		"const workflowVoiceStateMessages = {",
+		"const workflowVoiceStepMessages = {",
+		"function announceWorkflowButtonState(button, state)",
+		"推荐流程第 ",
+		"第一步，正在打开无痕窗口。",
+		"第六步，正在执行 GoPay 绑定和支付辅助。",
+		"第七步，正在通过 LuckMail 接收验证码。",
+		"开始执行",
+		"已完成",
+		"执行失败",
+		"announceLuckMailScene(\"workflow_\" + button.id + \"_\" + state",
+		"delete button.dataset.voiceState",
+	} {
+		if !strings.Contains(app, want) {
+			t.Fatalf("workflow voice announcement missing %q", want)
+		}
+	}
+	for _, id := range []string{"openIncognitoBtn", "luckmailDeviceLoginGuideBtn", "fetchSessionBtn", "autoFillCheckoutBtn", "openPaymentShortcutBtn", "gopayLinkBtn", "luckmailTokenCodeBtn", "browserUseRunBtn", "exportSub2APIBtn", "closeIncognitoBtn"} {
+		if !strings.Contains(app, id+":") {
+			t.Fatalf("workflow voice step map missing %s", id)
+		}
+	}
+}
+
+func TestLuckMailCodePollingLocksInterruptiveActions(t *testing.T) {
+	body, err := os.ReadFile("web/app.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	app := string(body)
+	for _, want := range []string{
+		"let luckMailCodePollingActive = false;",
+		"function setLuckMailCodePollingActive(active)",
+		"closeIncognitoBtn.disabled = luckMailCodePollingActive",
+		"正在等待验证码，已暂时锁定配置与关闭窗口操作",
+		"if (luckMailCodePollingActive) {",
+		"正在等待验证码，请先不要关闭窗口",
+		"setLuckMailCodePollingActive(true)",
+		"setLuckMailCodePollingActive(false)",
+		"验证码等待被中断",
+		"不要刷新页面、关闭无痕窗口或修改 LuckMail 配置",
+		"function isLuckMailTokenCodeRetryable(data)",
+		"async function fetchLuckMailTokenCodeWithRecovery(options)",
+		"auto_retry_attempt",
+		"LuckMail 验证码等待连接被中断，正在自动恢复轮询",
+		"if (isLuckMailTokenCodeRetryable(data))",
+	} {
+		if !strings.Contains(app, want) {
+			t.Fatalf("LuckMail polling interruption guard missing %q", want)
+		}
+	}
+}
+
+func TestLoginCodeFillAutoCompletesLocalizedProfilePage(t *testing.T) {
 	source, err := os.ReadFile("main.go")
 	if err != nil {
 		t.Fatalf("read main.go: %v", err)
@@ -767,6 +1266,46 @@ func TestWebShellAvoidsRemoteFontBlockingAndDelaysBrowserUseProbe(t *testing.T) 
 	}
 	if !strings.Contains(string(html), "setTimeout(checkBrowserUseHealth") {
 		t.Fatal("browser-use health probe should be delayed until after first paint")
+	}
+}
+
+func TestStatusBadgesExposeLampStyles(t *testing.T) {
+	css, err := os.ReadFile(filepath.Join("web", "styles.css"))
+	if err != nil {
+		t.Fatalf("read styles.css: %v", err)
+	}
+	styles := string(css)
+	for _, want := range []string{
+		".badge::before",
+		"statusLampPulse",
+		".badge.neutral::before",
+		"Reference bright blue and green correction",
+		"background: #66d875",
+		"--bank-blue: #4b82f3",
+		".badge.error::before",
+		"workflowRedGreenLamp",
+		"workflowRedGreenLamp 0.82s",
+		`[data-flow-state="running"]`,
+		`[data-flow-state="done"]`,
+	} {
+		if !strings.Contains(styles, want) {
+			t.Fatalf("status lamp styles missing %q", want)
+		}
+	}
+
+	html, err := os.ReadFile(filepath.Join("web", "index.html"))
+	if err != nil {
+		t.Fatalf("read index.html: %v", err)
+	}
+	for _, want := range []string{
+		`id="healthBadge" class="badge" aria-live="polite"`,
+		`id="luckmailBadge" class="badge neutral" aria-live="polite"`,
+		`id="latency" class="badge neutral" aria-live="polite"`,
+		`class="flow-action-button"`,
+	} {
+		if !strings.Contains(string(html), want) {
+			t.Fatalf("status badge live marker missing %q", want)
+		}
 	}
 }
 
@@ -1039,6 +1578,30 @@ func TestMidtransLinkingFillOutcomeRejectsTechnicalErrorAfterClick(t *testing.T)
 	}
 }
 
+func TestMidtransLinkingFillOutcomeRejectsPhoneBindingError(t *testing.T) {
+	ok, stage := midtransLinkingFillOutcome(map[string]any{
+		"clicked":          false,
+		"country_code":     "62",
+		"country_verified": true,
+		"found": map[string]any{
+			"country": true,
+			"phone":   true,
+			"button":  true,
+		},
+		"page_text_snippet": "Phone number: +62 85124742169 Please use another phone number Link and pay",
+	})
+
+	if ok {
+		t.Fatal("ok = true, want false when Midtrans asks for another phone number")
+	}
+	if stage != "midtrans_phone_binding_required" {
+		t.Fatalf("stage = %q, want midtrans_phone_binding_required", stage)
+	}
+	if !midtransPhoneBindingErrorInText("Please use another phone number") {
+		t.Fatal("midtransPhoneBindingErrorInText should detect another phone number prompt")
+	}
+}
+
 func TestMidtransLinkingRetryConfigDefault(t *testing.T) {
 	cfg := midtransLinkingRetryConfig(false)
 
@@ -1158,6 +1721,134 @@ func TestCheckoutSubmitWatcherRespectsMidtransLinkingCooldown(t *testing.T) {
 	}
 }
 
+func TestGopayFrontendTreatsPayNowAttemptLimitAsManualAction(t *testing.T) {
+	source, err := os.ReadFile("web/app.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	script := string(source)
+
+	for _, want := range []string{
+		"payNowAttemptLimitReached",
+		"/attempt_limit/i.test(payNowBlockReason)",
+		"gopay-pay-now-limit",
+		"停止重复点击",
+		"Pay now 已达到自动点击上限",
+		"pay_now_post_click_wait",
+		"trusted_click_no_transition",
+		"gopay-pay-now-stalled",
+		"Pay now 已真实点击一次",
+		"payNowStalledNoticeShown",
+		"继续被动监听 PIN 页面",
+		"监听 PIN",
+		"gopay_insufficient_balance",
+		"insufficientBalanceNoticeShown",
+		"GoPay 余额不足",
+		"gopay-insufficient-balance",
+		`payNowBlockReason === "insufficient_balance"`,
+	} {
+		if !strings.Contains(script, want) {
+			t.Fatalf("gopay frontend missing Pay now attempt limit guard %q", want)
+		}
+	}
+	insufficientBranch := strings.Index(script, `pageStage === "gopay_insufficient_balance"`)
+	stalledBranch := strings.Index(script, `pageStage === "pay_now_post_click_wait" && payNowBlockReason === "trusted_click_no_transition"`)
+	limitBranch := strings.Index(script, `payNowButtonDetected && payNowAttemptLimitReached`)
+	clickBranch := strings.Index(script, `pageStage === "pay_now_trusted_click"`)
+	if insufficientBranch < 0 || stalledBranch < 0 || limitBranch < 0 || clickBranch < 0 || insufficientBranch > stalledBranch || stalledBranch > limitBranch || limitBranch > clickBranch {
+		t.Fatalf("insufficient/stall/limit should be handled before trusted click logging: insufficient=%d stalled=%d limit=%d click=%d", insufficientBranch, stalledBranch, limitBranch, clickBranch)
+	}
+	stalledBlockEnd := strings.Index(script[stalledBranch:], `} else if (pageStage === "pay_now_post_click_wait")`)
+	if stalledBlockEnd < 0 {
+		t.Fatal("Pay now stalled branch end not found")
+	}
+	stalledBlock := script[stalledBranch : stalledBranch+stalledBlockEnd]
+	for _, forbidden := range []string{"stop = true", "stopGopayOTPAutoCapture = null", "releaseGopayAutomationAfterTerminal()"} {
+		if strings.Contains(stalledBlock, forbidden) {
+			t.Fatalf("Pay now stalled branch must keep passive PIN watcher alive; found %q", forbidden)
+		}
+	}
+}
+
+func TestGopayFrontendUsesAdaptivePollingWithoutExtraPayNowClicks(t *testing.T) {
+	source, err := os.ReadFile("web/app.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	script := string(source)
+
+	for _, want := range []string{
+		"function nextGopayPollDelayMs",
+		"unchangedPolls",
+		"pollDelayMs = nextGopayPollDelayMs",
+		`pageStage === "pin_entry_payment"`,
+		`pageStage === "pay_now_post_click_wait"`,
+		`pay_now_trusted_click`,
+		`poll_delay_ms: pollDelayMs`,
+		`trace_id: ensureAutomationTraceID("gopay")`,
+	} {
+		if !strings.Contains(script, want) {
+			t.Fatalf("gopay frontend missing adaptive polling marker %q", want)
+		}
+	}
+}
+
+func TestGopayFrontendNormalizesPINBeforeSending(t *testing.T) {
+	source, err := os.ReadFile("web/app.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	script := string(source)
+
+	for _, want := range []string{
+		"normalizeGopayPINValue",
+		"replace(/\\D/g, \"\")",
+		"slice(0, 6)",
+		"currentGopayPINValue()",
+		"pin: currentGopayPINValue()",
+		"var pinCode = currentGopayPINValue();",
+		"f.key === \"pin_code\"",
+	} {
+		if !strings.Contains(script, want) {
+			t.Fatalf("gopay frontend missing PIN normalization guard %q", want)
+		}
+	}
+}
+
+func TestGopayFrontendStopsOnTerminalPaymentPages(t *testing.T) {
+	source, err := os.ReadFile("web/app.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	script := string(source)
+
+	for _, want := range []string{
+		"releaseGopayAutomationAfterTerminal",
+		"gopayAutoTriggerRunning = false",
+		"gopayPaymentFlowRunning = false",
+		"gopayCheckoutWatcherActive = false",
+		"GoPay 支付页已过期",
+		"gopay-session-expired",
+		"gopay-payment-failed",
+		"Failed to complete payment",
+		"重新生成 OpenAI 结账链接",
+		"stopGopayOTPAutoCapture = null",
+	} {
+		if !strings.Contains(script, want) {
+			t.Fatalf("gopay frontend missing terminal payment guard %q", want)
+		}
+	}
+	expiredBranch := strings.Index(script, `pageStage === "gopay_session_expired"`)
+	failedBranch := strings.Index(script, `pageStage === "gopay_payment_failed"`)
+	limitBranch := strings.Index(script, `payNowButtonDetected && payNowAttemptLimitReached`)
+	if expiredBranch < 0 || failedBranch < 0 || limitBranch < 0 {
+		t.Fatalf("missing terminal or Pay now branches: expired=%d failed=%d limit=%d", expiredBranch, failedBranch, limitBranch)
+	}
+	if expiredBranch > limitBranch || failedBranch > limitBranch {
+		t.Fatalf("terminal payment pages should stop before Pay now handling: expired=%d failed=%d limit=%d", expiredBranch, failedBranch, limitBranch)
+	}
+}
+
 func TestMidtransLinkingFillScriptDoesNotLoopForeverForLoadingShell(t *testing.T) {
 	source, err := os.ReadFile("main.go")
 	if err != nil {
@@ -1207,6 +1898,26 @@ func TestCheckoutWatcherUsesMidtransCandidateWhenResolveTargetFails(t *testing.T
 	}
 }
 
+func TestCheckoutWatcherAnnouncesMidtransPhoneBindingRequired(t *testing.T) {
+	source, err := os.ReadFile("web/app.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	script := string(source)
+
+	for _, want := range []string{
+		"midtransPhoneBindingRequired",
+		"midtrans-phone-binding-required",
+		"请解除手机绑定",
+		"手机号已绑定或不可用，请先解除手机绑定",
+		"finishWatcher();",
+	} {
+		if !strings.Contains(script, want) {
+			t.Fatalf("checkout watcher missing phone binding prompt %q", want)
+		}
+	}
+}
+
 func TestLuckMailTokenModeForcesTokenEmailResolutionAndClearsResolvedEmail(t *testing.T) {
 	source, err := os.ReadFile("web/app.js")
 	if err != nil {
@@ -1226,6 +1937,372 @@ func TestLuckMailTokenModeForcesTokenEmailResolutionAndClearsResolvedEmail(t *te
 		if !strings.Contains(script, want) {
 			t.Fatalf("luckmail token flow missing %q", want)
 		}
+	}
+}
+
+func TestLuckMailInvalidTokenFallsBackToAPIKeyPurchaseList(t *testing.T) {
+	source, err := os.ReadFile("web/app.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	script := string(source)
+
+	for _, want := range []string{
+		"function isLikelyLuckMailMailboxToken(value)",
+		"return /^tok_[a-z0-9_-]{6,}$/i.test",
+		"function invalidLuckMailTokenInputMessage()",
+		"resolveLuckMailEmailByPurchaseList({ reason: invalidLuckMailTokenInputMessage() })",
+		"await resolveLuckMailEmailByPurchaseList(reason ? { reason: reason } : {})",
+		"Object.assign({ page: 1, page_size: 20 }, luckMailAPIContextPayload())",
+		"LuckMail Token 输入框中的值不是已购邮箱 Token",
+	} {
+		if !strings.Contains(script, want) {
+			t.Fatalf("luckmail invalid token fallback missing %q", want)
+		}
+	}
+	if strings.Contains(script, "if (!tokenValue) {\n      switchLuckMailManualMode(\"未填写 LuckMail Token") {
+		t.Fatal("LuckMail purchase loading should not switch to manual before API Key purchase list fallback")
+	}
+}
+
+func TestLuckMailTokenHandlersRejectInvalidTokenFormatBeforeSDK(t *testing.T) {
+	source, err := os.ReadFile("main.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	script := string(source)
+	for _, want := range []string{
+		"func isLikelyLuckMailMailboxToken(token string) bool",
+		`strings.HasPrefix(token, "tok_")`,
+		`Stage:     "luckmail_token_invalid_format"`,
+		"API Key 请保存到 LuckMail API 配置区域",
+	} {
+		if !strings.Contains(script, want) {
+			t.Fatalf("luckmail token handler guard missing %q", want)
+		}
+	}
+}
+
+func TestLuckMailTokenCodeContextCanceledIsRetryableInterruption(t *testing.T) {
+	if !isRetryableLuckMailPollingError(context.Canceled) {
+		t.Fatal("context.Canceled should be treated as a retryable LuckMail polling interruption")
+	}
+	if !isRetryableLuckMailPollingError(errors.New("context canceled")) {
+		t.Fatal("context canceled text should be treated as retryable")
+	}
+	if isRetryableLuckMailPollingError(errors.New("invalid token")) {
+		t.Fatal("invalid token should not be treated as retryable")
+	}
+
+	source, err := os.ReadFile("main.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	script := string(source)
+	for _, want := range []string{
+		"func isRetryableLuckMailPollingError",
+		`Stage:       stage`,
+		`Retryable:   retryable`,
+		`Interrupted: retryable`,
+		`stage = "luckmail_token_code_interrupted"`,
+	} {
+		if !strings.Contains(script, want) {
+			t.Fatalf("LuckMail token-code retryable interruption handling missing %q", want)
+		}
+	}
+}
+
+func TestLuckMailAPIConfigSaveSummarizesSecretAndRuntimeUsesActiveProfile(t *testing.T) {
+	storePath := filepath.Join(t.TempDir(), "luckmail-profiles.json")
+	t.Setenv("LUCKMAIL_PROFILE_STORE_PATH", storePath)
+	t.Setenv("LUCKMAIL_API_KEY", "legacy-api-key-value")
+	t.Setenv("LUCKMAIL_BASE_URL", "https://legacy.example.test")
+
+	body := `{"name":"主力 API","api_key":"luck-secret-main-value","base_url":"https://mails.example.test","project_code":"openai","email_type":"ms_graph","timeout_s":123,"interval_s":4,"set_active":true}`
+	req := httptest.NewRequest(http.MethodPost, "/api/luckmail/config", strings.NewReader(body))
+	req.RemoteAddr = "127.0.0.1:12345"
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Origin", "http://127.0.0.1:18473")
+	rec := httptest.NewRecorder()
+
+	handleLuckMailAPIConfig(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	if strings.Contains(rec.Body.String(), "luck-secret-main-value") {
+		t.Fatalf("config response leaked raw api key: %s", rec.Body.String())
+	}
+	var response luckMailAPIConfigResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	if !response.OK || response.SavedID == "" {
+		t.Fatalf("response = %#v, want saved profile", response)
+	}
+	if len(response.Profiles) != 1 || !response.Profiles[0].APIKey.Present {
+		t.Fatalf("profiles = %#v, want api key summary", response.Profiles)
+	}
+
+	cfg, err := resolveLuckMailRuntimeConfig("", "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.APIKey != "luck-secret-main-value" {
+		t.Fatalf("runtime api key = %q, want saved profile key", cfg.APIKey)
+	}
+	if cfg.BaseURL != "https://mails.example.test" || cfg.ProjectCode != "openai" || cfg.TimeoutS != 123 || cfg.IntervalS != 4 {
+		t.Fatalf("runtime config = %#v", cfg)
+	}
+
+	legacy, err := resolveLuckMailRuntimeConfig(luckMailLegacyConfigProfileID, "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if legacy.APIKey != "legacy-api-key-value" || legacy.BaseURL != "https://legacy.example.test" {
+		t.Fatalf("legacy config = %#v", legacy)
+	}
+}
+
+func TestLuckMailAPIProfileStoreMigratesLegacyTmpStore(t *testing.T) {
+	tempDir := t.TempDir()
+	t.Setenv("LUCKMAIL_PROFILE_STORE_PATH", "")
+	t.Setenv("APPDATA", filepath.Join(tempDir, "appdata"))
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(tempDir, "xdg-config"))
+	t.Setenv("HOME", filepath.Join(tempDir, "home"))
+	previousWD, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chdir(tempDir); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = os.Chdir(previousWD)
+	})
+	legacyPath := filepath.Join(tempDir, ".tmp", "luckmail-profiles.json")
+	if err := os.MkdirAll(filepath.Dir(legacyPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	legacyBody := `{"version":1,"active_id":"legacy-main","profiles":[{"id":"legacy-main","name":"Legacy Main","api_key":"legacy-secret","base_url":"https://mails.example.test"}]}`
+	if err := os.WriteFile(legacyPath, []byte(legacyBody), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	luckMailAPIProfileStoreMu.Lock()
+	store, err := loadLuckMailAPIProfileStoreLocked()
+	luckMailAPIProfileStoreMu.Unlock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if store.ActiveID != "legacy-main" || len(store.Profiles) != 1 || store.Profiles[0].APIKey != "legacy-secret" {
+		t.Fatalf("store = %#v, want migrated legacy profile", store)
+	}
+	if _, err := os.Stat(luckMailAPIProfileStorePath()); err != nil {
+		t.Fatalf("migrated store missing at %s: %v", luckMailAPIProfileStorePath(), err)
+	}
+	if strings.Contains(luckMailAPIProfileStorePath(), ".tmp") {
+		t.Fatalf("default profile store path should not be .tmp: %s", luckMailAPIProfileStorePath())
+	}
+}
+
+func TestLuckMailAPIConfigRejectsNonLocalSettingsAccess(t *testing.T) {
+	t.Setenv("LUCKMAIL_PROFILE_STORE_PATH", filepath.Join(t.TempDir(), "profiles.json"))
+	req := httptest.NewRequest(http.MethodGet, "/api/luckmail/config", nil)
+	req.RemoteAddr = "203.0.113.10:12345"
+	rec := httptest.NewRecorder()
+
+	handleLuckMailAPIConfig(rec, req)
+
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403", rec.Code)
+	}
+}
+
+func TestLuckMailAPIConfigPanelWiresProfileSelection(t *testing.T) {
+	appSource, err := os.ReadFile("web/app.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	htmlSource, err := os.ReadFile("web/index.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cssSource, err := os.ReadFile("web/styles.css")
+	if err != nil {
+		t.Fatal(err)
+	}
+	app := string(appSource)
+	html := string(htmlSource)
+	css := string(cssSource)
+	for _, want := range []string{
+		`id="luckmailApiProfileSelect"`,
+		`id="luckmailApiKey"`,
+		`class="workbench-token-field"`,
+		`id="luckmailToken"`,
+		`id="luckmailVoicePromptToggle"`,
+		`语音播报`,
+		`workbench-voice-prompt`,
+		`id="luckmailApiSaveBtn"`,
+		`id="luckmailApiTestBtn"`,
+		`id="luckmailApiDeleteBtn"`,
+		`class="section-box compact-options luckmail-api-config" open`,
+		`LuckMail API Key 填写区`,
+		`在这里填写 API Key`,
+		`API Key（填写这里）`,
+		`Token 输入框已移到顶部语音播报左侧`,
+	} {
+		if !strings.Contains(html, want) {
+			t.Fatalf("LuckMail config panel missing %q", want)
+		}
+	}
+	for _, want := range []string{
+		`/api/luckmail/config`,
+		`/api/luckmail/config/test`,
+		`fetchJSONWithTimeout`,
+		`var payload = luckMailAPIConfigFormPayload(true)`,
+		`配置已保存并设为当前使用`,
+		`luckmailApiFormDirty`,
+		`luckmail_api_key_profile_id`,
+		`function luckMailAPIContextPayload()`,
+		`Object.assign({ page: 1, page_size: 20 }, luckMailAPIContextPayload())`,
+	} {
+		if !strings.Contains(app, want) {
+			t.Fatalf("LuckMail config frontend missing %q", want)
+		}
+	}
+	if strings.Contains(app, `localStorage.setItem("luckmail_api_key`) || strings.Contains(app, `localStorage.setItem('luckmail_api_key`) {
+		t.Fatal("LuckMail API key should not be persisted in browser localStorage")
+	}
+	for _, want := range []string{
+		".luckmail-panel details.luckmail-api-config",
+		".luckmail-api-key-field",
+		".workbench-token-field",
+		".workbench-token-field input",
+		".workbench-status .workbench-voice-prompt",
+		"display: flex !important",
+		"display: block !important",
+		"Workflow lamps and visible LuckMail API config",
+	} {
+		if !strings.Contains(css, want) {
+			t.Fatalf("LuckMail config visibility CSS missing %q", want)
+		}
+	}
+	if count := strings.Count(html, `id="luckmailVoicePromptToggle"`); count != 1 {
+		t.Fatalf("LuckMail voice prompt toggle appears %d times, want exactly once", count)
+	}
+	if count := strings.Count(html, `id="luckmailToken"`); count != 1 {
+		t.Fatalf("LuckMail token input appears %d times, want exactly once", count)
+	}
+	tokenIdx := strings.Index(html, `id="luckmailToken"`)
+	voiceIdx := strings.Index(html, `id="luckmailVoicePromptToggle"`)
+	healthIdx := strings.Index(html, `本地服务 <strong id="healthBadge"`)
+	if voiceIdx < 0 || healthIdx < 0 || voiceIdx > healthIdx {
+		t.Fatalf("LuckMail voice prompt toggle should appear before local service status: voice=%d health=%d", voiceIdx, healthIdx)
+	}
+	if tokenIdx < 0 || voiceIdx < 0 || tokenIdx > voiceIdx {
+		t.Fatalf("LuckMail token input should appear to the left of voice prompt: token=%d voice=%d", tokenIdx, voiceIdx)
+	}
+}
+
+func TestLuckMailVoicePromptKeepsUtteranceAliveAndReportsErrors(t *testing.T) {
+	body, err := os.ReadFile("web/app.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	app := string(body)
+	for _, want := range []string{
+		"activeLuckMailVoiceUtterance",
+		"cachedLuckMailVoices",
+		"voicePromptPlaybackQueue",
+		"voicePromptRecentKeys",
+		"function shouldAnnounceVoicePrompt(key, force, windowMS)",
+		"function speechPromptSupported()",
+		"function refreshLuckMailVoices()",
+		"function selectLuckMailVoice()",
+		"function luckMailVoiceErrorMessage(reason)",
+		"async function speakLuckMailPromptLocally(message)",
+		`/api/voice/speak`,
+		"中文语音排队中...",
+		"本机语音播报中...",
+		"本机语音失败",
+		"function speakLuckMailPrompt(key, message, force)",
+		"SpeechSynthesisUtterance",
+		"window.speechSynthesis.resume()",
+		"utterance.onerror",
+		"语音播放失败",
+		"语音启动失败，请检查系统音量或浏览器语音包",
+		"正在试播...",
+		"voiceschanged",
+	} {
+		if !strings.Contains(app, want) {
+			t.Fatalf("LuckMail voice prompt robustness missing %q", want)
+		}
+	}
+	if strings.Contains(app, `function voicePromptEnabled() {
+  return !!(luckmailVoicePromptToggle && luckmailVoicePromptToggle.checked && "speechSynthesis" in window);
+}`) {
+		t.Fatal("voice prompt should verify SpeechSynthesisUtterance support, not only speechSynthesis")
+	}
+}
+
+func TestWorkflowVoiceCoversGopayAndLuckMailRuntimeStages(t *testing.T) {
+	body, err := os.ReadFile("web/app.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	app := string(body)
+	for _, want := range []string{
+		"const gopayVoiceStepLabels = {",
+		"function announceGopayStep(step, state, text)",
+		"announceGopayStep(step, state, text || \"\")",
+		"GoPay 余额不足，已暂停自动点击 Pay now。请充值后点击 Refresh。",
+		"已检测到支付确认 PIN 页面，正在尝试自动输入 PIN。",
+		"const checkoutWatcherVoiceEventMessages = {",
+		"function announceCheckoutWatcherVoice(method, summary)",
+		"announceCheckoutWatcherVoice(method, summary)",
+		"const luckMailStageVoiceMessages = {",
+		"function announceLuckMailDataStage(data)",
+		"announceLuckMailDataStage(data)",
+		"luckmail_token_code_received",
+		"device_login_guide_started",
+	} {
+		if !strings.Contains(app, want) {
+			t.Fatalf("runtime voice coverage missing %q", want)
+		}
+	}
+}
+
+func TestVoiceSpeakEndpointProvidesWindowsSystemFallback(t *testing.T) {
+	source, err := os.ReadFile("main.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	mainSource := string(source)
+	for _, want := range []string{
+		`mux.HandleFunc("/api/voice/speak", handleVoiceSpeak)`,
+		"type voiceSpeakRequest struct",
+		"func handleVoiceSpeak(",
+		"func speakLocalVoice(",
+		"func windowsSpeechPowerShellScript() string",
+		"powershell.exe",
+		"System.Speech.Synthesis.SpeechSynthesizer",
+		"CHECKOUT_WORKBENCH_TTS_TEXT",
+		"localVoiceSpeakMu",
+		`"/api/voice/speak":`,
+		`"本机语音播报"`,
+		`"local_voice_speak"`,
+	} {
+		if !strings.Contains(mainSource, want) {
+			t.Fatalf("voice speak endpoint missing %q", want)
+		}
+	}
+	if got := normalizeVoiceSpeakMessage("  hello\n world\t "); got != "hello world" {
+		t.Fatalf("normalizeVoiceSpeakMessage whitespace = %q", got)
+	}
+	long := strings.Repeat("语", 200)
+	if got := []rune(normalizeVoiceSpeakMessage(long)); len(got) != 160 {
+		t.Fatalf("normalizeVoiceSpeakMessage length = %d, want 160", len(got))
 	}
 }
 
@@ -1345,7 +2422,11 @@ func TestWriteMidtransNetworkDebugArtifactUsesSanitizedPayload(t *testing.T) {
 
 func TestAuditOperationFlowIncludesNetworkDiagnostics(t *testing.T) {
 	flow := auditOperationFlow(map[string]any{
-		"ok": true,
+		"ok":               true,
+		"trace_id":         "checkout-test",
+		"target_id":        "target-1",
+		"target_id_reused": true,
+		"poll_delay_ms":    float64(650),
 		"network_diagnostics": map[string]any{
 			"entries": []any{
 				map[string]any{"url": "https://app.midtrans.com/snap/v4/token", "status": float64(500)},
@@ -1355,6 +2436,23 @@ func TestAuditOperationFlowIncludesNetworkDiagnostics(t *testing.T) {
 
 	if _, ok := flow["network_diagnostics"]; !ok {
 		t.Fatal("network_diagnostics missing from audit operation flow")
+	}
+	for _, key := range []string{"trace_id", "target_id", "target_id_reused", "poll_delay_ms"} {
+		if _, ok := flow[key]; !ok {
+			t.Fatalf("%s missing from audit operation flow", key)
+		}
+	}
+}
+
+func TestAuditCorrelationIdentifiersIncludeTraceAndTargetIDs(t *testing.T) {
+	identifiers := auditCorrelationIdentifiers(
+		map[string]any{"trace_id": "checkout-test", "target_id": "target-1"},
+		map[string]any{"selected_target_id": "target-2", "cdp_target_id": "target-3"},
+	)
+	for _, key := range []string{"trace_id", "target_id", "selected_target_id", "cdp_target_id"} {
+		if identifiers[key] == nil {
+			t.Fatalf("%s missing from audit correlation identifiers", key)
+		}
 	}
 }
 
@@ -1791,6 +2889,33 @@ func TestResolveCheckoutPageTargetReturnsCanonicalCurrentURL(t *testing.T) {
 	}
 }
 
+func TestResolveCheckoutPageTargetWithHintReusesMatchingTargetAndRejectsMismatch(t *testing.T) {
+	expected := "https://pay.openai.com/c/pay/cs_live_test_123#fid=test"
+	targets := []cdpTarget{
+		{ID: "old", Type: "page", URL: "https://chatgpt.com/checkout/openai_llc/cs_live_other"},
+		{ID: "hinted", Type: "page", URL: "https://chatgpt.com/checkout/openai_llc/cs_live_test_123"},
+	}
+
+	target, canonicalURL, reused, err := resolveCheckoutPageTargetWithHint(targets, expected, "hinted")
+	if err != nil {
+		t.Fatalf("resolveCheckoutPageTargetWithHint returned error: %v", err)
+	}
+	if target.ID != "hinted" || !reused {
+		t.Fatalf("target.ID/reused = %q/%v, want hinted/true", target.ID, reused)
+	}
+	if canonicalURL != "https://chatgpt.com/checkout/openai_llc/cs_live_test_123" {
+		t.Fatalf("canonicalURL = %q", canonicalURL)
+	}
+
+	target, _, reused, err = resolveCheckoutPageTargetWithHint(targets, expected, "old")
+	if err != nil {
+		t.Fatalf("resolveCheckoutPageTargetWithHint fallback returned error: %v", err)
+	}
+	if target.ID != "hinted" || reused {
+		t.Fatalf("mismatched hint target.ID/reused = %q/%v, want hinted/false", target.ID, reused)
+	}
+}
+
 func TestResolveCheckoutFillTargetPrefersStripeFrameMatchingExpected(t *testing.T) {
 	expected := "https://pay.openai.com/c/pay/cs_live_test_123#fid=test"
 	targets := []cdpTarget{
@@ -1846,6 +2971,137 @@ func TestCheckoutAutoFillActionActivatesGopayBeforeFillingAddress(t *testing.T) 
 	}
 	if got := checkoutAutoFillAction(probe, false); got != "activate_gopay" {
 		t.Fatalf("checkoutAutoFillAction = %q, want activate_gopay", got)
+	}
+}
+
+func TestCheckoutAutoFillActionFallsBackToPayPalWhenGopayMissing(t *testing.T) {
+	probe := map[string]any{
+		"inputCount": float64(9),
+		"text":       "Payment method Bank card PayPal Billing address",
+	}
+	if got := checkoutAutoFillAction(probe, false); got != "activate_paypal" {
+		t.Fatalf("checkoutAutoFillAction = %q, want activate_paypal", got)
+	}
+}
+
+func TestCheckoutPaymentMethodSelectionPrefersGopayAndAvoidsFinalSubmit(t *testing.T) {
+	script := checkoutPaymentMethodSelectScript()
+	for _, want := range []string{
+		"const methods = ['gopay', 'paypal']",
+		"selected_method",
+		"available_methods",
+		"isDangerousSubmit",
+		"subscribe|pay now|confirm|place order|complete payment|buy now",
+	} {
+		if !strings.Contains(script, want) {
+			t.Fatalf("payment method selection script missing %q", want)
+		}
+	}
+
+	source, err := os.ReadFile("main.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	mainSource := string(source)
+	for _, want := range []string{
+		`mux.HandleFunc("/api/checkout/payment-method-select", handleCheckoutPaymentMethodSelect)`,
+		"func handleCheckoutPaymentMethodSelect",
+		"payment_method_selection_order",
+		`[]string{"gopay", "paypal"}`,
+		`"subscription_submit_clicked":`,
+	} {
+		if !strings.Contains(mainSource, want) {
+			t.Fatalf("checkout payment method endpoint missing %q", want)
+		}
+	}
+}
+
+func TestPlusSubscribeProbeTriggersSessionFlowWithoutClickingSubmit(t *testing.T) {
+	script := plusSubscribeSessionTriggerProbeScript()
+	for _, want := range []string{
+		"plus",
+		"puls",
+		"订阅并付款",
+		"subscribe\\s*(and|&)\\s*pay",
+		"safe_trigger_fetch_session",
+		"subscription_submit_clicked: false",
+		"manual_payment_confirmation_required: true",
+	} {
+		if !strings.Contains(script, want) {
+			t.Fatalf("plus subscribe probe script missing %q", want)
+		}
+	}
+	for _, forbidden := range []string{
+		".click(",
+		"dispatchEvent(new MouseEvent",
+		"submit()",
+	} {
+		if strings.Contains(script, forbidden) {
+			t.Fatalf("plus subscribe probe must not click or submit checkout; found %q", forbidden)
+		}
+	}
+
+	source, err := os.ReadFile("main.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	mainSource := string(source)
+	for _, want := range []string{
+		`mux.HandleFunc("/api/pricing/plus-subscribe-probe", handlePlusSubscribeSessionProbe)`,
+		"func handlePlusSubscribeSessionProbe",
+		`"safe_trigger_fetch_session": false`,
+		`"/api/pricing/plus-subscribe-probe":`,
+		"plusSubscribeProbeServerMinInterval",
+		"server_throttled",
+	} {
+		if !strings.Contains(mainSource, want) {
+			t.Fatalf("plus subscribe probe endpoint missing %q", want)
+		}
+	}
+}
+
+func TestFrontendAutoFetchesSessionWhenPlusSubscribeCardDetected(t *testing.T) {
+	body, err := os.ReadFile("web/app.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	app := string(body)
+	for _, want := range []string{
+		"startPlusSubscribeSessionTriggerWatcher",
+		"probePlusSubscribeSessionTrigger",
+		`/api/pricing/plus-subscribe-probe`,
+		"safe_trigger_fetch_session",
+		`autoFetchAndGenerate({ source: "plus_subscribe_card" })`,
+		"plusSubscribeAutoTriggeredSignature",
+		"PLUS_SUBSCRIBE_TRIGGER_COOLDOWN_MS",
+		"PLUS_SUBSCRIBE_WATCH_MAX_INTERVAL_MS",
+		"nextPlusSubscribeProbeDelay",
+		"plusSubscribeProbeConsecutiveMisses",
+		"系统不会自动点击最终订阅付款按钮",
+		"void bootstrapPlusSubscribeSessionTriggerWatcher();",
+	} {
+		if !strings.Contains(app, want) {
+			t.Fatalf("frontend plus subscribe auto session trigger missing %q", want)
+		}
+	}
+}
+
+func TestFrontendSessionFetchRequiresAccessTokenBeforeSuccess(t *testing.T) {
+	body, err := os.ReadFile("web/app.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	app := string(body)
+	for _, want := range []string{
+		"function extractSessionAccessToken",
+		"extractSessionAccessToken(resultJSON)",
+		"diagnostics?.has_access_token",
+		"session-missing-access-token",
+		"Session 响应没有 accessToken",
+	} {
+		if !strings.Contains(app, want) {
+			t.Fatalf("frontend session success guard missing %q", want)
+		}
 	}
 }
 
@@ -2298,38 +3554,22 @@ func TestExtractSnapAccountIDFromBodyWithSourceReturnsSnippet(t *testing.T) {
 }
 
 func TestGopayPaymentPINCandidatesPreferRequestedPIN(t *testing.T) {
-	got := gopayPaymentPINCandidates("654321")
-	if len(got) == 0 {
-		t.Fatal("gopayPaymentPINCandidates returned empty slice")
+	got := gopayPaymentPINCandidates("654 321")
+	if len(got) != 1 || got[0] != "654321" {
+		t.Fatalf("gopayPaymentPINCandidates = %#v, want only requested PIN 654321", got)
 	}
-	if got[0] != "654321" {
-		t.Fatalf("first candidate = %q, want 654321", got[0])
-	}
-	count := 0
-	for _, item := range got {
-		if item == "654321" {
-			count++
+	for _, input := range []string{"", "12345", "abcdef", "1234567"} {
+		if got := gopayPaymentPINCandidates(input); len(got) != 0 {
+			t.Fatalf("gopayPaymentPINCandidates(%q) = %#v, want no fallback candidates", input, got)
 		}
-	}
-	if count != 1 {
-		t.Fatalf("candidate 654321 appears %d times, want 1", count)
 	}
 }
 
 func TestGopayLinkingPINCandidatesPreferRequestedPIN(t *testing.T) {
 	got := gopayLinkingPINCandidates("987654")
-	if len(got) == 0 {
-		t.Fatal("gopayLinkingPINCandidates returned empty slice")
+	if len(got) != 1 || got[0] != "987654" {
+		t.Fatalf("gopayLinkingPINCandidates = %#v, want only requested PIN 987654", got)
 	}
-	if got[0] != "987654" {
-		t.Fatalf("first candidate = %q, want 987654", got[0])
-	}
-	for _, item := range got {
-		if item == "123456" {
-			return
-		}
-	}
-	t.Fatalf("default candidate 123456 missing from %#v", got)
 }
 
 func TestGopayCDPTargetScopeScorePrefersCurrentTargetAndAccount(t *testing.T) {
@@ -2382,8 +3622,11 @@ func TestGopayReuseStagesWithPaymentShowsCompletion(t *testing.T) {
 			successMessage = message
 		}
 	}
-	if !strings.Contains(pinMessage, "123456") {
-		t.Fatalf("pin message = %q, want it to contain used pin", pinMessage)
+	if !strings.Contains(pinMessage, "PIN 已校验") {
+		t.Fatalf("pin message = %q, want sanitized PIN success message", pinMessage)
+	}
+	if strings.Contains(pinMessage, "123456") {
+		t.Fatalf("pin message = %q, should not expose raw PIN", pinMessage)
 	}
 	if !strings.Contains(successMessage, "支付完成") {
 		t.Fatalf("success message = %q, want it to contain 支付完成", successMessage)

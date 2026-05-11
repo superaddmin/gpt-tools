@@ -1,0 +1,109 @@
+{
+  "version": 1,
+  "name": "checkout-workbench-multi-agent-system",
+  "description": "Project-local multi-role agent registry for automation architecture, backend/CDP, frontend workflow/UX, and operations/user review.",
+  "created_at": "2026-05-11",
+  "source_of_truth": {
+    "backend": "main.go",
+    "frontend": "web/app.js",
+    "ui": ["web/index.html", "web/styles.css"],
+    "tests": "main_test.go",
+    "automation_plan": "docs/audit/automation-log-analysis-p0-p4-plan.md",
+    "api_reference": "docs/api/reference.md"
+  },
+  "roles": [
+    {
+      "id": "automation-architect",
+      "display_name": "自动化架构师",
+      "profile": "roles/automation-architect.md",
+      "primary_scope": ["workflow-state-machine", "automation-boundaries", "P0-P4-roadmap", "cross-role-coordination"],
+      "decision_rights": ["state-machine-shape", "workflow-priority", "acceptance-criteria"],
+      "must_consult": ["backend-cdp-engineer", "frontend-workflow-ux", "operations-user-representative"]
+    },
+    {
+      "id": "backend-cdp-engineer",
+      "display_name": "后端/CDP工程师",
+      "profile": "roles/backend-cdp-engineer.md",
+      "primary_scope": ["main.go", "CDP-target-selection", "GoPay-PIN-OTP", "audit-logging", "tests"],
+      "decision_rights": ["backend-api-contract", "CDP-safety-boundary", "log-field-design"],
+      "must_consult": ["automation-architect", "frontend-workflow-ux"]
+    },
+    {
+      "id": "frontend-workflow-ux",
+      "display_name": "前端工作流/UX专家",
+      "profile": "roles/frontend-workflow-ux.md",
+      "primary_scope": ["web/app.js", "web/index.html", "web/styles.css", "operator-feedback", "status-lights"],
+      "decision_rights": ["workflow-visibility", "manual-intervention-UX", "front-end-state-copy"],
+      "must_consult": ["automation-architect", "operations-user-representative"]
+    },
+    {
+      "id": "operations-user-representative",
+      "display_name": "运营/使用者代表",
+      "profile": "roles/operations-user-representative.md",
+      "primary_scope": ["runbook", "manual-handoff", "operator-risk", "repeat-work-reduction"],
+      "decision_rights": ["operator-acceptance", "manual-procedure-fit", "readiness-of-runbook"],
+      "must_consult": ["automation-architect", "frontend-workflow-ux"]
+    }
+  ],
+  "communication": {
+    "protocol": "protocol.md",
+    "message_schema": "schemas/message.schema.json",
+    "message_envelope": {
+      "task_id": "string",
+      "from_role": "role-id",
+      "to_role": "role-id|all",
+      "message_type": "brief|finding|proposal|decision|handoff|blocker|verification",
+      "priority": "P0|P1|P2|P3|P4",
+      "context_refs": ["file path, log query, doc section, API route"],
+      "payload": "object",
+      "requested_action": "string",
+      "deadline_or_gate": "string"
+    },
+    "decision_record": {
+      "decision_id": "string",
+      "owner_role": "role-id",
+      "status": "proposed|accepted|rejected|deferred",
+      "rationale": "string",
+      "risks": ["string"],
+      "validation": ["command or review step"]
+    }
+  },
+  "schemas": {
+    "message": "schemas/message.schema.json",
+    "task": "schemas/task.schema.json"
+  },
+  "permissions": {
+    "policy": "permissions.md",
+    "default_write_policy": "least-privilege-by-file-ownership",
+    "sensitive_data_policy": "local-only; never copy secrets into shared artifacts unless explicitly required and audit_capture_sensitive is intentionally enabled"
+  },
+  "workflows": [
+    {
+      "id": "checkout-automation-review",
+      "title": "Checkout P0-P4 Automation Review",
+      "path": "workflows/checkout-automation-review.md",
+      "default_task": "tasks/p0-p4-review.task.json"
+    }
+  ],
+  "shared_artifacts": {
+    "allowed": [
+      "docs/",
+      ".codex/agents/",
+      "non-sensitive summaries",
+      "test outputs summarized in final reports"
+    ],
+    "restricted": [
+      "log/",
+      "gptpls/",
+      ".codex/runtime/",
+      "tokens",
+      "cookies",
+      "PINs",
+      "session JSON"
+    ]
+  },
+  "validation_commands": [
+    "go test ./...",
+    "node --check web/app.js"
+  ]
+}

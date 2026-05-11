@@ -79,6 +79,13 @@ Go 服务默认使用编译嵌入的 `config.json`。如设置 `APP_CONFIG`，�
 | `checkout_cookie` | `CHECKOUT_COOKIE` | 上游 checkout 请求使用的 Cookie，前端请求中的 `checkout_session.cookie` 优先 |
 | `checkout_user_agent` | `CHECKOUT_USER_AGENT` | 上游 checkout 请求使用的 User-Agent，前端请求中的 `checkout_session.user_agent` 优先 |
 | `audit_capture_sensitive` | `AUDIT_CAPTURE_SENSITIVE` | 是否在审计日志中保留完整请求/响应敏感内容 |
+| `luckmail_api_key` | `LUCKMAIL_API_KEY` | LuckMail API Key，主页面板保存的活动配置优先；此项作为兜底 |
+| `luckmail_base_url` | `LUCKMAIL_BASE_URL` | LuckMail API 基础地址，默认 `https://mails.luckyous.com` |
+| `luckmail_default_project_code` | `LUCKMAIL_DEFAULT_PROJECT_CODE` | LuckMail 默认项目代码，默认 `openai` |
+| `luckmail_default_email_type` | `LUCKMAIL_DEFAULT_EMAIL_TYPE` | LuckMail 默认邮箱类型，默认 `ms_graph` |
+| `luckmail_default_domain` | `LUCKMAIL_DEFAULT_DOMAIN` | LuckMail 默认域名 |
+| `luckmail_timeout_s` | `LUCKMAIL_TIMEOUT_S` | LuckMail 默认等待秒数 |
+| `luckmail_interval_s` | `LUCKMAIL_INTERVAL_S` | LuckMail 默认轮询间隔秒 |
 | `local_mock_base_url` | `LOCAL_MOCK_BASE_URL` | 本地 mock 基础地址，默认 `http://localhost:8282` |
 | `midtrans_mock_base_url` | `MIDTRANS_MOCK_BASE_URL` | Midtrans mock 或目标基础地址 |
 | `gopay_gwa_mock_base_url` | `GOPAY_GWA_MOCK_BASE_URL` | GoPay GWA mock 或目标基础地址 |
@@ -87,6 +94,12 @@ Go 服务默认使用编译嵌入的 `config.json`。如设置 `APP_CONFIG`，�
 | `midtrans_linking_cookie` | `MIDTRANS_LINKING_COOKIE` | Midtrans linking Cookie |
 | `midtrans_charge_cookie` | `MIDTRANS_CHARGE_COOKIE` | Midtrans charge Cookie |
 | `proxy_test_urls` | `PROXY_TEST_URLS` | 代理测试目标 URL 列表 |
+
+运行时密钥档案：
+
+| 环境变量 | 默认值 | 说明 |
+| --- | --- | --- |
+| `LUCKMAIL_PROFILE_STORE_PATH` | 系统用户配置目录下的 `Checkout Workbench/luckmail-profiles.json` | 主页面板保存的 LuckMail API Key 配置档案；不要纳入版本管理。旧版 `.tmp/luckmail-profiles.json` 会在读取时自动兼容迁移 |
 
 browser-use 服务配置：
 

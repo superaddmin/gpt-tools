@@ -1,0 +1,55 @@
+{
+  "$schema": "../schemas/task.schema.json",
+  "task_id": "p0-p4-checkout-automation-review",
+  "workflow": "checkout-automation-review",
+  "priority": "P0-P4",
+  "objective": "Review and coordinate implementation of the P0-P4 automation roadmap for Checkout Workbench.",
+  "context_refs": [
+    "docs/audit/automation-log-analysis-p0-p4-plan.md",
+    "main.go",
+    "web/app.js",
+    "main_test.go",
+    "docs/api/reference.md"
+  ],
+  "roles": [
+    {
+      "id": "automation-architect",
+      "assignment": "Own state-machine shape, P0-P4 sequencing, next_action semantics, and final decision records.",
+      "deliverables": ["state transition proposal", "priority decision", "acceptance criteria"]
+    },
+    {
+      "id": "backend-cdp-engineer",
+      "assignment": "Review backend/CDP feasibility for readiness gates, PIN contexts, GoPay token lifecycle, and audit fields.",
+      "deliverables": ["API contract notes", "CDP safety review", "test plan"]
+    },
+    {
+      "id": "frontend-workflow-ux",
+      "assignment": "Review frontend orchestration, status lights, manual handoff, and user-visible workflow clarity.",
+      "deliverables": ["UI state map", "manual intervention copy", "frontend validation plan"]
+    },
+    {
+      "id": "operations-user-representative",
+      "assignment": "Review operator burden, recovery paths, runbook clarity, and payment safety visibility.",
+      "deliverables": ["operator acceptance notes", "manual fallback checklist", "residual risk assessment"]
+    }
+  ],
+  "acceptance_criteria": [
+    "Plus probe no-progress loops are bounded.",
+    "GoPay CDP polling is gated on target readiness.",
+    "GoPay expired/not_found/rate_limited token states are not retried blindly.",
+    "PIN input source can distinguish automation_synthetic from user_trusted_event.",
+    "Operator UI exposes current state, blocker, and next action.",
+    "Pay now is never clicked repeatedly by automation."
+  ],
+  "validation_commands": [
+    "go test ./...",
+    "node --check web/app.js",
+    "Get-Content .codex/agents/agents.manifest.json -Raw | ConvertFrom-Json | Out-Null"
+  ],
+  "sensitive_data_policy": {
+    "local_only": true,
+    "raw_logs_allowed": false,
+    "summaries_allowed": true,
+    "pin_values_allowed_only_when_audit_capture_sensitive_is_enabled": true
+  }
+}

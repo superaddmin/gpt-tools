@@ -1,6 +1,6 @@
 # API 参考
 
-最后核对日期：2026-05-07
+最后核对日期：2026-05-11
 
 本文档以 [main.go](file:///f:/chatadd/main.go) 的路由注册和 handler 实现、以及 [.codex/runtime/browser-use-service/src/server.js](file:///f:/chatadd/.codex/runtime/browser-use-service/src/server.js) 为事实来源。
 
@@ -36,6 +36,31 @@
 ```
 
 方法不匹配时返回 `405` 和通用错误结构。
+
+### `POST /api/voice/speak`
+
+调用本机系统语音播报流程提示，是浏览器 `speechSynthesis` 无声或失败时的本地兜底。当前实现优先支持 Windows，通过 `System.Speech.Synthesis.SpeechSynthesizer` 发声。
+
+请求体：
+
+```json
+{
+  "message": "语音播报已开启"
+}
+```
+
+成功响应：
+
+```json
+{
+  "ok": true,
+  "stage": "local_voice_spoken",
+  "engine": "windows_system_speech",
+  "message": "语音播报已开启"
+}
+```
+
+业务失败时返回 HTTP 200，`ok: false`，并在 `stage` / `error` 中说明原因。
 
 ### `POST /api/checkout`
 
@@ -147,6 +172,27 @@
 - `400`：JSON 非法、URL 缺失或 URL scheme 非法。
 - `500`：Chrome 启动失败。
 
+### `POST /api/incognito/close`
+
+关闭本工具管理的 Chrome 无痕窗口或相关 CDP 页面，用于完整流程结束后的收尾清理。
+
+请求体：无。
+
+成功响应：
+
+```json
+{
+  "ok": true,
+  "stage": "incognito_close",
+  "closed_count": 1
+}
+```
+
+说明：
+
+- 如果 CDP 端口未运行，返回 `stage: incognito_not_running`，并清理本地窗口状态。
+- 如果未发现可关闭目标，返回 `stage: incognito_close_no_targets`。
+
 ### `POST /api/session/fetch`
 
 通过 Chrome CDP 在 `chatgpt.com` 页面内请求 `/api/auth/session`，提取 Session JSON 并返回诊断信息。
@@ -238,6 +284,33 @@
   "error": "错误信息",
   "opened_url": "https://pay.openai.com/c/pay/cs_...",
   "candidate_urls": ["https://..."]
+}
+```
+
+### `POST /api/checkout/payment-method-select`
+
+在当前 checkout 页面只选择支付方式，不填写地址、不勾选条款、不点击最终订阅按钮。选择顺序固定为：优先 GoPay；页面没有 GoPay 时选择 PayPal。
+
+请求体：
+
+```json
+{
+  "expected_url": "https://pay.openai.com/c/pay/cs_..."
+}
+```
+
+成功响应主要字段：
+
+```json
+{
+  "ok": true,
+  "stage": "checkout_payment_method_selected",
+  "selected_payment_method": "gopay",
+  "gopay_selected": true,
+  "paypal_selected": false,
+  "manual_confirmation_required": true,
+  "subscription_submit_clicked": false,
+  "payment_method_selection_order": ["gopay", "paypal"]
 }
 ```
 
@@ -537,6 +610,25 @@
 }
 ```
 
+### `POST /api/pricing/plus-subscribe-probe`
+
+探测当前 CDP 管理的 ChatGPT 页面是否同时出现 Plus 套餐特征和“订阅并付款 / Subscribe and pay”按钮。该接口只读取页面状态，用于前端触发“获取 Session JSON → 生成并打开支付页”流程，不会点击最终订阅或付款按钮。
+
+成功响应：
+
+```json
+{
+  "ok": true,
+  "stage": "plus_subscribe_probe",
+  "plus_plan_detected": true,
+  "subscribe_payment_detected": true,
+  "safe_trigger_fetch_session": true,
+  "subscription_submit_clicked": false,
+  "manual_payment_confirmation_required": true,
+  "button_text": "订阅并付款"
+}
+```
+
 ### `POST /api/gopay/full-link`
 
 完整 GoPay 链路辅助：使用 access token 生成新 checkout、提取 account id、创建或复用 linking、处理 OTP/PIN、执行 Midtrans 支付确认并返回阶段诊断。
@@ -695,6 +787,108 @@
   "target_url": "..."
 }
 ```
+
+## LuckMail API
+
+### `GET /api/luckmail/config`
+
+读取本机保存的 LuckMail API Key 配置档案。响应只返回密钥摘要，不返回 API Key 明文。
+
+```json
+{
+  "ok": true,
+  "stage": "luckmail_api_config_loaded",
+  "active_id": "main",
+  "active_source": "profile",
+  "profiles": [
+    {
+      "id": "main",
+      "name": "主力 API",
+      "active": true,
+      "api_key": {
+        "present": true,
+        "prefix": "luck_9",
+        "suffix": "abcd",
+        "length": 37
+      },
+      "base_url": "https://mails.luckyous.com",
+      "project_code": "openai",
+      "email_type": "ms_graph",
+      "timeout_s": 300,
+      "interval_s": 3
+    }
+  ],
+  "fallback_config": {
+    "id": "__config__",
+    "name": "配置文件 / 环境变量",
+    "locked": true,
+    "source": "config",
+    "api_key": {
+      "present": true,
+      "length": 37
+    }
+  }
+}
+```
+
+### `POST /api/luckmail/config`
+
+新增或更新本机 LuckMail API 配置。新增配置时 `api_key` 必填；更新已有配置时 `api_key` 为空表示保留原密钥。`set_active: true` 会设为默认配置。
+
+```json
+{
+  "id": "main",
+  "name": "主力 API",
+  "api_key": "luck_xxx",
+  "base_url": "https://mails.luckyous.com",
+  "project_code": "openai",
+  "email_type": "ms_graph",
+  "domain": "",
+  "timeout_s": 300,
+  "interval_s": 3,
+  "set_active": true
+}
+```
+
+成功响应与 `GET /api/luckmail/config` 相同，并额外返回 `saved_id`。管理接口只允许本机访问，并校验本地 `Origin` / `Referer`。
+
+### `DELETE /api/luckmail/config`
+
+删除本机保存的配置档案。
+
+```json
+{
+  "id": "main"
+}
+```
+
+### `POST /api/luckmail/config/test`
+
+使用指定配置或临时 API Key 调用 LuckMail 用户信息接口，验证 `X-API-Key` 是否可用。响应不返回 API Key 明文。
+
+```json
+{
+  "id": "main",
+  "api_key": "",
+  "base_url": "https://mails.luckyous.com"
+}
+```
+
+### `POST /api/luckmail/create-and-wait`
+
+创建临时接码订单并等待验证码。可选传入 `luckmail_api_key_profile_id` 指定主页面板中的配置；为空时使用活动配置，最后兜底到 `LUCKMAIL_API_KEY` / `config.local.json`。
+
+### `POST /api/luckmail/token-code`
+
+通过已购邮箱 Token 等待验证码。支持 `luckmail_api_key_profile_id`、`luckmail_token`、`timeout_s`、`interval_s`、`since_unix_ms`。
+
+### `POST /api/luckmail/token-mails`
+
+通过已购邮箱 Token 查询邮件列表摘要。支持 `luckmail_api_key_profile_id` 与 `luckmail_token`。
+
+### `POST /api/luckmail/purchases`
+
+读取已购邮箱列表。支持 `luckmail_api_key_profile_id`、`page`、`page_size`、`keyword`、`user_disabled`。
 
 ## browser-use 服务 API
 

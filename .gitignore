@@ -11,6 +11,8 @@ elements-session-response.json
 config.local.json
 gptpls/
 log/
+.tmp/
+tmp/
 dist/
 *_sub2api_*.json
 artifacts/network-debug/
