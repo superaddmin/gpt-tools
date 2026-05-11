@@ -754,3 +754,240 @@ P1 Plus 探测熔断
 ```
 
 其中 P0 是最终形态，但为了降低风险，应以“薄状态机 + 现有按钮兼容”的方式逐步收敛，而不是一次性替换全部流程。
+
+## 11. 最新运行日志多角色验证报告
+
+核对时间：2026-05-11 21:23（Asia/Shanghai）
+
+验证参与角色：
+
+- 自动化架构师：验证 P0-P4 状态机覆盖、实施顺序、terminal 收口和跨 watcher 协调。
+- 后端/CDP 工程师：验证 CDP readiness gate、GoPay PIN/OTP、Pay now 安全边界、后端响应字段和审计字段。
+- 前端工作流/UX 专家：验证状态灯、按钮流程、语音播报、轮询退避、Session 校验和用户可见下一动作。
+- 运营/使用者代表：验证人工接管、失败提示、重复劳动和实际操作可理解性。
+
+### 11.1 验证方法
+
+本次验证不再按“每个日志文件只包含一个 JSON”的假设解析，而是按 JSONL/多 JSON 事件逐行解析 `log/*.log`。这是必要修正，因为多个 `.log` 文件实际包含多条审计 JSON；单文件 `ConvertFrom-Json` 会漏掉 `/api/gopay/auto-trigger-check`、`/api/gopay/smart-link`、`/api/voice/speak` 等事件，导致基线偏低。
+
+验证范围：
+
+| 范围 | 数值 |
+| --- | ---: |
+| 全量可解析事件 | 27,781 |
+| 全量起始时间 | 2026-05-07 14:06 |
+| 全量结束时间 | 2026-05-11 21:23 |
+| 增量验证窗口 | 2026-05-11 14:26 至 21:23 |
+| 增量事件数 | 6,430 |
+
+增量窗口主要接口分布：
+
+| 接口 | 调用量 | 验证含义 |
+| --- | ---: | --- |
+| `/api/pricing/plus-subscribe-probe` | 4,605 | P1 的主要验证对象，仍为最大噪声源 |
+| `/api/checkout/resolve-target` | 508 | checkout target 解析仍高频运行 |
+| `/api/voice/speak` | 481 | P4 语音播报可靠性需要纳入验证 |
+| `/api/gopay/auto-trigger-check` | 263 | 真实流程存在 `auto_trigger_waiting/ready` 分支 |
+| `/api/gopay/cdp-otp` | 157 | P3/P4 的 GoPay CDP 自动化验证对象 |
+| `/api/session/fetch` | 21 | Session 获取频次较低，但需要强校验 accessToken |
+| `/api/checkout/start` | 20 | checkout 生成链路样本 |
+
+### 11.2 总体验证结论
+
+P0-P4 方案方向正确，且最新成功支付链路证明 GoPay binding PIN 自动输入、Pay now 一次真实点击边界、支付完成记录等关键能力已经具备工程基础。但方案文档需要补充最新日志反映出的真实行为：当前最大问题已经从“ChatGPT 首页空转”扩展为“checkout 订阅确认页空转”，并且方案要求的 `page_classification`、`next_action`、`poll_after_ms`、`token_state` 等机器可读字段在最新日志中仍未落地。
+
+最终验证结论：**有条件通过**。
+
+通过条件：
+
+1. 先实现 P0.0 运行生命周期与 terminal 统一收口。
+2. P1 不只处理首页空转，还必须处理 checkout 订阅确认页空转。
+3. P3 readiness gate 必须泛化到所有 CDP watcher，而不仅是 `/api/gopay/cdp-otp`。
+4. P4 必须把“失败态”变成“下一动作”，否则用户仍需要读日志。
+5. P2 token 生命周期需要成为后端 API 合同，而不是前端临时冷却变量。
+
+### 11.3 最新成功链路对 P0 的验证
+
+最新完整成功链路显示真实流程并非严格线性。脱敏后的阶段序列为：
+
+```text
+/api/session/fetch
+  -> /api/checkout/start
+  -> /api/checkout/payment-method-select
+  -> /api/checkout/auto-fill
+  -> /api/gopay/auto-trigger-check: auto_trigger_waiting
+  -> /api/gopay/auto-trigger-check: auto_trigger_ready
+  -> /api/gopay/midtrans-linking-fill: midtrans_linking_submitted
+  -> /api/gopay/cdp-otp: page_observed
+  -> /api/gopay/cdp-otp: pin_entry_binding
+  -> /api/gopay/cdp-otp: gopay_complete
+  -> /api/gptpls/record: gptpls_payment_success_recorded
+```
+
+日志证据：
+
+| 观察项 | 最新日志表现 | 对方案的影响 |
+| --- | --- | --- |
+| GoPay binding PIN | `pin_stage=binding`、`pin_auto_filled=true`、`pin_auto_submitted=true`、`pin_input_event_source=automation_synthetic` | 证明第一处 PIN 自动输入已可验证 |
+| payment PIN | 增量窗口 `pin_stage=payment && pin_auto_submitted=true` 为 0 | P3 验收不能假设第二 PIN 必然出现，需作为可选分支 |
+| 支付完成 | `stage=gopay_complete`、`payment_completed=true`、`payment_complete_reason=url_or_text_success` | terminal 状态可由 URL/文本成功信号触发 |
+| 成功记录 | `/api/gptpls/record` 成功 | P0 terminal 后应进入记录/导出或关闭窗口状态 |
+
+文档修订要求：
+
+- P0 状态图应新增 `auto_trigger_waiting`、`auto_trigger_ready`、`midtrans_linking_submitted`、`checkout_payment_method_selected`、`gopay_complete`。
+- `gopay_pin_payment` 不能作为必经线性步骤，应改为 Pay now 后的可选分支：`payment_pin_target_waiting -> gopay_pin_payment -> payment_completed`。
+- `payment_completed` 必须触发 run-level cleanup，停止 Plus probe、checkout watcher、GoPay CDP poll 和语音队列里的过期提示。
+
+### 11.4 P1 Plus 探测验证结论
+
+P1 的问题判断被最新日志强烈验证，但原方案覆盖面不足。
+
+增量窗口 `/api/pricing/plus-subscribe-probe` 统计：
+
+| 指标 | 数值 |
+| --- | ---: |
+| 调用量 | 4,605 |
+| 业务失败 | 4,605 |
+| `server_throttled` | 0 |
+| `page_classification` | 0 |
+| `next_action` | 0 |
+| `poll_after_ms` | 0 |
+| `plus=true, subscribe=false, manual_required=true` | 2,923 |
+| `chatgpt_target_not_found` | 796 |
+| `cdp_not_ready` | 343 |
+
+关键冲突：
+
+- 代码中已存在 `server_throttled` 注入逻辑，但最新日志没有该字段，说明当前运行服务可能未加载最新代码，或后端缓存路径未被命中。该问题不能只依赖源码字符串测试，必须补 handler 级测试和运行时健康标识。
+- 日志主噪声已变成 `chatgpt.com/checkout/...` 上的订阅确认页：页面有 Plus 套餐、月付/年付、订阅、条款等文本，但没有 `subscribe_payment_detected`，因此一直 `safe_trigger_fetch_session=false`。
+- 这类状态不应归类为失败轮询，而应归类为 `checkout_subscription_confirmation_required` 或 `checkout_created_not_submitted`，并转入人工确认状态。
+
+P1 修订建议：
+
+| 新分类 | 判断条件 | 动作 |
+| --- | --- | --- |
+| `checkout_subscription_confirmation_required` | URL 含 `/checkout/`，`plus_plan_detected=true`，`subscribe_payment_detected=false`，页面含订阅/条款/计费选项 | 停止高频探测，提示用户审阅并手动点击订阅 |
+| `checkout_created_not_submitted` | checkout URL 存在但未跳转到 Midtrans/支付页 | 退避到 30-60 秒，显示“等待用户确认订阅或页面跳转” |
+| `terminal_after_payment` | 当前 run 已 `gopay_complete/payment_completed` | 停止所有订阅探测 |
+| `cdp_recovering` | CDP not ready | 不再打业务探测，进入无痕诊断/恢复 |
+
+P1 新验收标准：
+
+- checkout 确认页同一 trace 连续 3 次无进展后停止高频探测。
+- `/api/pricing/plus-subscribe-probe` 返回 `page_classification`、`next_action`、`retryable`、`terminal`、`poll_after_ms`。
+- 最新日志中 `server_throttled` 或 `poll_after_ms` 必须可见，不能只在源码中存在。
+
+### 11.5 P2 GoPay token 生命周期验证结论
+
+P2 尚未落地为 API 合同。
+
+增量窗口 GoPay token/绑定相关接口：
+
+| 指标 | 数值 |
+| --- | ---: |
+| `/api/gopay/auto-link`、`force-link`、`smart-link`、`midtrans-linking-fill` 合计 | 57 |
+| 失败 | 37 |
+| `token_state` 字段 | 0 |
+| `next_action` 字段 | 0 |
+| `retryable` 字段 | 0 |
+
+日志仍能看到同一失效资源重复出现 `token not found`、`token has expired`、`429`。这与 P2 中“同一 token/reference 失败后不重复尝试”的目标冲突。
+
+P2 必须调整为后端优先：
+
+- 404 -> `token_state=not_found`、`terminal=true`、`next_action=regenerate_checkout`
+- 407 -> `token_state=expired`、`terminal=true`、`next_action=regenerate_checkout`
+- 429 -> `token_state=rate_limited`、`retryable=true`、`retry_after_ms`、`next_action=wait_cooldown`
+- 2xx -> `token_state=fresh|used`
+
+前端只负责消费这些字段并禁用同一 `account_id/reference_id/checkout_key` 的重复请求。
+
+### 11.6 P3 CDP readiness gate 与支付安全边界验证结论
+
+P3 部分有效，但范围需要扩大。
+
+GoPay CDP 增量窗口：
+
+| 指标 | 数值 |
+| --- | ---: |
+| `/api/gopay/cdp-otp` 调用量 | 157 |
+| 失败/503 | 12 |
+| binding PIN 自动提交 | 5 |
+| payment PIN 自动提交 | 0 |
+| `gopay_complete/payment_completed` | 4 |
+| `pay_now_block_reason=trusted_click_already_sent` | 58 |
+
+验证通过项：
+
+- Pay now 一次真实点击边界基本成立。日志出现 `trusted_click_already_sent`，未观察到重复点击扩大。
+- binding PIN 自动输入和提交有明确证据。
+- 支付完成可被 `gopay_complete` 和 `payment_completed=true` 识别。
+
+需要修订项：
+
+- readiness gate 不能只包 `/api/gopay/cdp-otp`。Plus probe 同样产生大量 `cdp_not_ready` 和 `chatgpt_target_not_found`，应共用 `cdp_recovering/target_waiting` gate。
+- Pay now 后如果长时间停留 `pay_now_post_click_wait`，应提升 `poll_after_ms`，并输出 `next_action=wait_payment_pin_or_manual_check`。
+- 第二 PIN 未在最新日志中成功出现，验收应改为“若 payment PIN target 出现，则必须能记录 context 并尝试输入”，不能要求每次支付都出现 payment PIN。
+
+### 11.7 P4 可观测性与人工接管验证结论
+
+P4 的字段方向正确，但用户可见闭环不足。
+
+主要问题：
+
+1. 最新失败日志大量缺少 `next_action`。增量窗口中 Plus probe、GoPay token 失败、部分 voice failure 都不能直接告诉用户下一步。
+2. 状态灯目前更像按钮上次动作结果，而不是主流程状态机。`web/app.js` 里主要通过 `setWorkflowButtonState()` 给按钮设置 `data-flow-state`，尚未形成文档中描述的 `automationRun`。
+3. 运行中红绿交替的灯效可能被误读为错误。P4 应要求红色只表示失败或需要立即处理；运行中建议使用蓝色/中性脉冲。
+4. 语音播报有成功记录，但也出现 `local_voice_speak_failed` 和超时。关键人工动作应有浏览器语音兜底，并避免过长排队。
+
+P4 最小合同建议：
+
+```json
+{
+  "stage": "checkout_subscription_confirmation_required",
+  "human_message": "已到订阅确认页，需要你审阅条款并手动点击订阅。",
+  "next_action": "review_and_click_subscribe",
+  "retryable": false,
+  "terminal": false,
+  "poll_after_ms": 60000,
+  "primary_button": "我已点击订阅，继续监听",
+  "secondary_button": "重新打开支付页"
+}
+```
+
+### 11.8 多角色交叉结论
+
+| 角色 | 结论 | 关键证据 | 必须补齐 |
+| --- | --- | --- | --- |
+| 自动化架构师 | 有条件通过 | 最新成功链路包含 P0 未列出的 `auto_trigger_waiting/ready`、`midtrans_linking_submitted`、`gopay_complete`；完成后 Plus probe 仍继续 | P0.0 terminal cleanup、状态图补分支 |
+| 后端/CDP 工程师 | 有条件通过 | Pay now 一次点击和 binding PIN 自动化成立；Plus probe 分类/限流、token_state 未在日志体现 | 后端响应合同、handler 级测试、统一 CDP gate |
+| 前端工作流/UX 专家 | 有条件通过 | 状态灯是按钮状态；获取 Session 实际会继续生成并打开支付页；失败态缺下一动作 | 主流程状态条、按钮命名/顺序修正、消费 `next_action` |
+| 运营/使用者代表 | 有条件通过 | 用户仍需读日志判断订阅确认、token 失效、Pay now 等待、PIN/OTP 手动点 | 手动接管按钮、动作化文案、失败态播报 |
+
+### 11.9 修订后的实施顺序
+
+原建议顺序 `P1 -> P3 -> P4 -> P2 -> P0` 仍适合渐进落地，但最新日志显示需要先补一个更小的 P0.0，否则完成后 watcher 不收口。
+
+修订顺序：
+
+```text
+P0.0 运行生命周期与 terminal cleanup
+  -> P1 Plus/checkout 探测分类、熔断、退避
+  -> P3 通用 CDP readiness gate 与 Pay now 后低频监听
+  -> P4 next_action、human_message、手动接管按钮和语音提示
+  -> P2 GoPay token/reference 生命周期状态化
+  -> P0 完整状态机迁移
+```
+
+### 11.10 最终验证结论
+
+方案总体可行，但当前文档需要根据最新日志补充以下底线：
+
+- **不是所有成功支付都会出现第二次 payment PIN**；payment PIN 应为条件分支。
+- **checkout 订阅确认页是当前最大空转来源**；P1 必须覆盖它，而不只覆盖首页。
+- **terminal 状态必须停止所有 watcher**；支付已完成后继续 Plus probe 是当前最明确的状态机缺陷。
+- **API 响应必须提供下一动作**；没有 `next_action`，前端无法降低人工判断成本。
+- **运行服务版本必须可验证**；源码已有字段但日志没有字段时，应优先检查服务是否重启、页面是否刷新、handler 级测试是否覆盖。
+
+本轮验证给出的最终状态：**方案可继续执行，但须按 P0.0/P1/P3/P4/P2 的顺序补齐验证条件后，才能宣称 P0-P4 已完整落地。**
