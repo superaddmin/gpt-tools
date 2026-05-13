@@ -1,6 +1,6 @@
 # 开发指南
 
-最后核对日期：2026-05-07
+最后核对日期：2026-05-12
 
 ## 环境要求
 
@@ -141,10 +141,12 @@ python -m json.tool .codex\skillsets\playwright-ai.json > $null
   - `operationDisplayNames`。
   - `operationTypes`。
   - `docs/api/reference.md`。
+- LuckMail SDK 位于 `LuckMailSdk-Go/luckmail/`，通过 `go.mod` 的 `replace` 指令本地引用。修改 SDK 后需运行 `go mod tidy` 确保依赖一致。
 - 修改前端 DOM id 前必须检查 [app.js](file:///f:/chatadd/web/app.js) 的选择器绑定。
 - 修改 Session、GoPay、checkout 自动填地址逻辑时，优先补充或更新 [main_test.go](file:///f:/chatadd/main_test.go) 中的针对性测试。
-- 不要把 access token、refresh token、Cookie、Authorization 明文写入仓库。
+- 不要把 access token、refresh token、Cookie、Authorization、LuckMail API Key 明文写入仓库。
 - `log/`、`.playwright-mcp/`、browser-use `node_modules/` 和 browser-use artifacts 已被 `.gitignore` 忽略。
+- `config.json` 中的敏感字段（`luckmail_api_key`、`checkout_cookie` 等）不应提交到版本控制；使用 `config.local.json` 存放本地敏感配置。
 
 ## 文档更新工作流
 

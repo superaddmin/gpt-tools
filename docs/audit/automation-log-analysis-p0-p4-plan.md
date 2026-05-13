@@ -1,6 +1,6 @@
 # 自动化日志全量分析与 P0-P4 改造方案
 
-最后核对日期：2026-05-11
+最后核对日期：2026-05-12
 
 ## 1. 文档目的
 
@@ -13,6 +13,7 @@
 - 前端页面结构：[web/index.html](../../web/index.html)
 - 日志样本：`log/*.log`
 - 既有支付链路文档：[checkout-payment-flow-analysis.md](checkout-payment-flow-analysis.md)
+- 支付授权篡改与凭证重放 sandbox 方案：[payment-authorization-tamper-sandbox-plan.md](payment-authorization-tamper-sandbox-plan.md)
 
 ## 2. 日志样本与标准化框架
 
@@ -991,3 +992,294 @@ P0.0 运行生命周期与 terminal cleanup
 - **运行服务版本必须可验证**；源码已有字段但日志没有字段时，应优先检查服务是否重启、页面是否刷新、handler 级测试是否覆盖。
 
 本轮验证给出的最终状态：**方案可继续执行，但须按 P0.0/P1/P3/P4/P2 的顺序补齐验证条件后，才能宣称 P0-P4 已完整落地。**
+
+## 12. 2026-05-12 最近 5 次主流程全量排查
+
+核对时间：2026-05-12 10:03（Asia/Shanghai）
+
+### 12.1 分析口径
+
+本轮按 JSONL/逐行事件解析 `log/*.log`，并以最近 5 个 `checkout-*` trace 作为主流程锚点。该口径可以避免两类误判：
+
+- 单文件可能包含多条审计事件，不能用“单文件单 JSON”的方式聚合。
+- 登录、LuckMail、语音和 Plus probe 有时不带 `checkout-*` trace，因此只在流程锚点前后作为相邻节点纳入排查，不在表中暴露账号邮箱。
+
+最近 5 个主流程中，最新一次属于 checkout 创建前终止；其余 4 次进入了 checkout/Midtrans/GoPay 自动化链路。
+
+### 12.2 最近 5 次流程总览
+
+| 流程 | Trace | 时间窗口 | 墙钟耗时 | 事件数 | Handler 累计耗时 | 最终状态 | 主问题 |
+| --- | --- | --- | ---: | ---: | ---: | --- | --- |
+| F1 | `checkout-mp1zkbnu-rjmtb2` | 10:02:49 | 0 秒（checkout trace）；关联登录约 65 秒 | 1 | 2.28 秒 | `/api/checkout/start` 400，`User is already paid` | 缺少“已付费账号”前置拦截和 terminal 收口 |
+| F2 | `checkout-mp1nx7z2-6vdo5y` | 04:36:55-04:48:29 | 693.3 秒 | 65 | 29.39 秒 | `chatgpt_target_not_found`，此前出现 `gopay_session_expired` | Pay Now 后出现成功等待信号，但最终被会话过期覆盖；watcher 未收口 |
+| F3 | `checkout-mp1ne5sn-5fmr1u` | 04:22:06-04:24:13 | 127.0 秒 | 23 | 13.58 秒 | `checkout_subscription_confirmation_required` | Midtrans linking 返回 `midtrans_phone_binding_required` 后仍继续 Plus probe |
+| F4 | `checkout-mp1n1xc3-75dj5j` | 04:12:35-04:16:44 | 248.7 秒 | 18 | 13.43 秒 | `plus_subscribe_probe` | 同样止于 `midtrans_phone_binding_required`，后续轮询未进入明确人工态 |
+| F5 | `checkout-mp1mundm-x60ukj` | 04:06:56-04:11:50 | 294.8 秒 | 21 | 13.57 秒 | `chatgpt_target_not_found` | phone binding 阻塞后继续轮询，并出现 CDP/target 抖动 |
+
+如果排除 F1 这种“创建 checkout 前终止”的尝试，前一条 `checkout-mp1mm9yw-dpfaoh` 与 F3-F5 形态一致：checkout 创建成功、自动填充成功、auto-trigger ready 后止于 `midtrans_phone_binding_required`，最终继续落入 Plus probe。
+
+### 12.3 单流程步骤、节点、耗时与问题
+
+#### F1：已付费账号仍尝试创建 checkout
+
+关联流程步骤：
+
+| 节点 | 结果 | 耗时 | 观察 |
+| --- | --- | ---: | --- |
+| 无痕窗口打开 | 成功 | 4 ms | 登录准备正常 |
+| 登录入口点击 | 成功 | 5.40 秒 | 登录窗口 ready |
+| LuckMail 邮件列表 | 成功 | 1.71 秒 | 邮件读取正常 |
+| 邮箱填入 | 成功 | 3.92 秒 | 验证码页面 ready |
+| LuckMail 验证码 | 成功 | 12.53 秒 | 邮件等待为主要耗时 |
+| 验证码填入 | 成功 | 5.75 秒 | 登录完成 |
+| Session fetch | 成功 | 135 ms | 取到会话信息 |
+| Checkout start | 失败 | 2.28 秒 | API 返回 `User is already paid` |
+| Voice speak | 失败多次 | 单次约 220-246 ms | terminal 后仍持续播报队列 |
+
+潜在问题：
+
+- 缺少账号订阅状态 preflight。已付费账号仍走到 checkout 创建，浪费登录和接码步骤。
+- `/api/checkout/start` 对 `User is already paid` 仍以 HTTP 400 暴露，前端无法稳定消费为“终止成功态/无需购买态”。
+- 语音播报失败没有熔断，terminal 后仍继续排队，污染流程观感。
+
+自动化判断：高度可自动化。应在 Session 获取后立即做“已付费/无需购买”分类，直接进入 `account_already_paid_terminal`，停止 checkout、Plus probe、GoPay watcher 和语音队列。
+
+#### F2：GoPay PIN/Pay Now 已自动化，但 terminal 分类不稳定
+
+关键步骤：
+
+| 节点 | 结果 | 耗时 | 观察 |
+| --- | --- | ---: | --- |
+| Checkout start | 成功 | 6.09 秒 | 支付链接创建成功 |
+| Payment method select | 业务软失败 | 4 ms | 阶段为 `checkout_payment_method_selected`，但 `operation_result=failed`，语义不一致 |
+| Plus probe | 失败态分类 | 4-79 ms | 正确识别 `checkout_subscription_confirmation_required`，给出 `next_action=review_and_click_subscribe`、`poll_after_ms=60000` |
+| Checkout auto-fill | 成功 | 2.28 秒 | 地址/结账信息填充完成 |
+| Auto trigger check | 成功 | 0 ms | 从 `auto_trigger_waiting` 到 `auto_trigger_ready` |
+| Midtrans linking fill | 成功 | 12.08 秒 | 进入 `midtrans_linking_submitted` |
+| GoPay CDP page observe | 成功 | 25 次，单次 5-12 ms | 高频观察等待 PIN/Pay Now 页面 |
+| Binding PIN | 成功 | 663 ms | `pin_stage=binding`、`pin_auto_filled=true`、`pin_auto_submitted=true` |
+| Payment PIN | 成功 | 643 ms | `pin_stage=payment`、`pin_auto_submitted=true`；输入来源记录为 `user_trusted_event` |
+| Pay Now trusted click | 成功 | 725 ms | 后续 `pay_now_block_reason=trusted_click_already_sent/no_transition`，单次点击边界有效 |
+| Payment success waiting redirect | 成功观察 | 2-5 ms | 出现 `midtrans_success_waiting_merchant_redirect` |
+| Final | 非预期终止 | 1.09 秒 | 随后分类为 `gopay_session_expired`，最后 Plus probe 继续到 `chatgpt_target_not_found` |
+
+潜在问题：
+
+- 这是最接近成功的流程：PIN 与 Pay Now 自动化可用，但成功等待信号没有稳定转为 `payment_completed`。
+- `gopay_session_expired` 与 `midtrans_payment_success_waiting_redirect` 的优先级可能冲突，需要在成功信号出现后短时间内保护 terminal 判定。
+- 支付链路终止后 Plus probe 仍继续 8 分钟以上，说明 run-level cleanup 仍未覆盖所有 watcher。
+- `pin_input_event_source=user_trusted_event` 与 `pin_auto_submitted=true` 同时出现，需要继续核对事件归因，避免把人工输入误计为自动输入。
+
+自动化判断：中高可行。PIN、Pay Now、自动触发已经具备工程基础；下一步应优先修 terminal 判定、成功重定向等待和 watcher cleanup，而不是继续加强点击脚本。
+
+#### F3：Midtrans phone binding required 后未收口
+
+关键步骤：
+
+| 节点 | 结果 | 耗时 | 观察 |
+| --- | --- | ---: | --- |
+| Checkout start | 成功 | 5.16 秒 | 支付链接创建成功 |
+| Payment method select | 业务软失败 | 4 ms | 阶段仍为 `checkout_payment_method_selected` |
+| Checkout auto-fill | 成功两次 | 2.28 秒 + 2.29 秒 | 重复填充，说明按钮/轮询可能重复触发 |
+| Auto trigger check | 成功 | 3 次 | 第三次进入 `auto_trigger_ready` |
+| Midtrans linking fill | 失败 | 3.82 秒 | `midtrans_phone_binding_required`，`next_action=change_or_unbind_phone_number` |
+| Plus probe | 继续失败态 | 3 次 | 仍提示 checkout subscription confirmation |
+
+潜在问题：
+
+- `midtrans_phone_binding_required` 已经是明确人工/配置阻塞，不应继续把流程表现为订阅确认页等待。
+- `/api/checkout/auto-fill` 重复执行，可能来自按钮重复触发或 watcher 未感知已填充。
+
+自动化判断：部分可自动化。可自动识别和解释 phone binding required，但解绑/换号涉及用户账号和支付绑定，不建议静默自动执行，应进入人工接管。
+
+#### F4：phone binding required 后 4 分钟低价值轮询
+
+关键步骤：
+
+| 节点 | 结果 | 耗时 | 观察 |
+| --- | --- | ---: | --- |
+| Checkout start | 成功 | 6.82 秒 | 外部 checkout API 较慢但成功 |
+| Checkout auto-fill | 成功 | 2.27 秒 | 填充正常 |
+| Auto trigger check | 成功 | 2 次 | 11 秒内从 waiting 到 ready |
+| Midtrans linking fill | 失败 | 4.30 秒 | `midtrans_phone_binding_required` |
+| Plus probe | 持续 | 4 次 | 每 60 秒一次 `checkout_subscription_confirmation_required`，最后转为 `plus_subscribe_probe` |
+
+潜在问题：
+
+- 该流程在 04:13:05 已经知道阻塞原因，但到 04:16:44 仍未明确 terminal。
+- `next_action=change_or_unbind_phone_number` 没有成为主流程状态，用户仍可能看到不相关的 Plus probe 状态。
+
+自动化判断：高可行的是“阻塞识别和停止轮询”，低可行的是“自动换绑”。建议把该分支定义为 `manual_required_phone_binding` terminal。
+
+#### F5：phone binding required 后叠加 CDP/target 抖动
+
+关键步骤：
+
+| 节点 | 结果 | 耗时 | 观察 |
+| --- | --- | ---: | --- |
+| Checkout start | 成功 | 6.26 秒 | 支付链接创建成功 |
+| Checkout auto-fill | 成功 | 2.28 秒 | 填充正常 |
+| Auto trigger check | 成功 | 2 次 | 8 秒内进入 ready |
+| Midtrans linking fill | 失败 | 4.32 秒 | `midtrans_phone_binding_required` |
+| Plus probe | 持续 | 9 次 | 出现 `cdp_not_ready`、`chatgpt_target_not_found`、`plus_subscribe_probe` 交替 |
+
+潜在问题：
+
+- 已知 phone binding 阻塞后，CDP target 抖动不应再影响主流程判断。
+- Plus probe 在终止性阻塞后继续运行，会把真实失败原因覆盖成 CDP/target 问题。
+
+自动化判断：高可行。需要 run-scoped terminal reason 锁存，后续 watcher 只能补充诊断，不能覆盖主流程最终原因。
+
+### 12.4 跨流程系统性结论
+
+| 问题 | 证据 | 影响 | 优先级 |
+| --- | --- | --- | --- |
+| Terminal cleanup 不完整 | F2/F3/F4/F5 在明确终止或人工阻塞后仍有 Plus probe/voice | 最终原因被后续噪声覆盖，用户难以判断下一步 | P0.0 |
+| `User is already paid` 缺少业务分类 | F1 checkout start 400 | 已付费账号仍消耗完整登录/接码流程 | P1/P4 |
+| `midtrans_phone_binding_required` 没有提升为主流程状态 | F3-F5 | 重复 checkout/Plus probe，无法快速进入人工处理 | P2/P4 |
+| 成功等待与会话过期优先级冲突 | F2 | 接近成功的支付可能被误判为过期 | P3 |
+| 操作结果语义不一致 | `checkout_payment_method_selected` 同时记为 failed | 统计失败率失真，按钮状态可能误导 | P4 |
+| 语音失败无熔断 | F1 及相邻流程多次 `/api/voice/speak failed` | 流程结束后仍产生失败噪声 | P4 |
+| 重复 auto-fill/resolve-target | F3-F5 中 resolve-target 高频、F3 auto-fill 两次 | 增加 CDP 负担，放大页面抖动 | P1/P3 |
+
+### 12.5 可自动化环节评估
+
+| 环节 | 可行性 | 技术方案 | 预期效益 | 风险与边界 |
+| --- | --- | --- | --- | --- |
+| 账号状态 preflight | 高 | Session fetch 后读取订阅状态或消费 checkout API 的 `User is already paid`，归一为 `account_already_paid_terminal` | 避免已付费账号继续走 checkout，减少一次完整登录后失败 | 状态来源可能不稳定；需保留“继续尝试”手动按钮 |
+| 登录入口、邮箱、验证码填入 | 中高 | 保持现有 CDP 自动填入，增加取消原因、窗口重绑定、验证码过期重取 | 降低人工输入和超时等待 | 登录页面 selector 和地区跳转易变；不可绕过验证码/风控 |
+| LuckMail token-code 等待 | 高 | 复用 token-mails/token-code，按 code-fill 状态动态取消或延长 | 缩短等待，减少无效长轮询 | 邮件延迟不可控；失败需允许手动填码 |
+| Checkout 地址和支付方式填充 | 高 | 保持 `/api/checkout/auto-fill`，增加 idempotency key 和“已填充”状态锁 | 避免 F3 的重复填充 | 页面结构变化时需降级人工 |
+| 订阅确认页处理 | 中 | 自动识别 `checkout_subscription_confirmation_required`，显示审阅/确认动作；最终付费动作必须保留明确用户授权 | 减少 Plus probe 噪声，用户知道该点需要确认 | 涉及付费提交，不应静默自动越过用户确认 |
+| Midtrans phone binding required | 高（识别），低（自动处理） | 将 `midtrans_phone_binding_required` 提升为 run terminal/manual state，禁用同一号码重试 | 3/5 个流程可立即停止无效轮询 | 换绑/解绑涉及用户支付账号，应人工处理 |
+| GoPay OTP/PIN 输入 | 中高 | 保持 page_stage + pin_stage + context 校验；每个 PIN context 限一次；payment PIN 作为可选分支 | F2 已证明 binding/payment PIN 可自动提交 | PIN 属敏感信息；必须保留本地、最小化日志、严格上下文 |
+| Pay Now 点击 | 中 | 保持 trusted click 单次边界，要求用户已明确授权本轮支付；点击后只等待状态，不重复点击 | 避免重复扣款风险 | 付费动作安全边界最高，不能用循环点击解决失败 |
+| Watcher/轮询调度 | 高 | 前端消费 `poll_after_ms`、`terminal`、`next_action`；后端统一 CDP readiness gate | 降低日志噪声和 CDP 负载，防止最终原因被覆盖 | 需要保证所有 watcher 都能收到 run terminal |
+| 语音播报 | 高 | 连续失败 2-3 次后禁用本地语音，改为 UI toast/browser speech；terminal 时清空队列 | 减少失败日志和过期播报 | 系统 TTS 可用性依赖本机环境 |
+
+### 12.6 自动化改造实施计划
+
+#### 阶段 1：P0.0 run 生命周期与 terminal cleanup（优先，1-2 天）
+
+目标：让每次运行有唯一 run/trace，且任何 terminal/manual 阻塞都能停止所有 watcher。
+
+改造点：
+
+- 前端建立 `automationRun.runId` 的强制传播，覆盖 checkout、plus probe、GoPay、LuckMail、voice、close 等接口。
+- 新增 run-level terminal reason 锁存：`account_already_paid_terminal`、`manual_required_phone_binding`、`gopay_session_expired`、`payment_completed`、`checkout_start_failed`。
+- watcher 在收到 terminal 后统一停止：Plus probe、checkout resolve-target、GoPay CDP poll、auto-trigger、voice queue。
+- 后续诊断事件只能作为 `post_terminal_diagnostic`，不能覆盖主流程最终状态。
+
+验收：
+
+- F3-F5 形态在 `midtrans_phone_binding_required` 后不再继续 Plus probe。
+- F1 形态在 `User is already paid` 后不再播报“下一步自动填地址”。
+
+#### 阶段 2：P1/P4 响应合同归一（1-2 天）
+
+目标：每个失败都变成机器可读的下一动作。
+
+改造点：
+
+- `/api/checkout/start` 将 `User is already paid` 映射为：
+
+```json
+{
+  "ok": false,
+  "stage": "account_already_paid",
+  "terminal": true,
+  "retryable": false,
+  "next_action": "export_subscription_or_switch_account",
+  "human_message": "当前账号已付费，无需创建新的 checkout。"
+}
+```
+
+- `/api/gopay/midtrans-linking-fill` 的 `midtrans_phone_binding_required` 必须带 `terminal=true` 或 `manual_required=true`，并提升为主流程状态。
+- `checkout_payment_method_selected` 这类“业务已达成但 ok=false”的响应要拆成 `operation_result=success` 或 `ok=true, warning=...`，避免失败率失真。
+- `/api/voice/speak` 增加 `retryable` 与本地 TTS 不可用分类，前端连续失败后自动静音。
+
+验收：
+
+- 最近 20 个失败事件中，`next_action` 覆盖率达到 95% 以上。
+- UI 不再要求用户读日志才能知道下一步。
+
+#### 阶段 3：P3 CDP readiness gate 与轮询退避（2-3 天）
+
+目标：减少 CDP 抖动和重复页面探测。
+
+改造点：
+
+- 抽象统一 `cdp_readiness`：Chrome ready、target exists、target URL stable、frame/context ready。
+- Plus probe、resolve-target、auto-fill、GoPay CDP poll 共用 readiness gate。
+- 前端严格消费 `poll_after_ms`：checkout 确认页 60 秒，Pay Now 后 5 秒，CDP not ready 15 秒，terminal 0 秒。
+- `resolve-target` 从固定 2 秒轮询改为“状态变化触发 + 最大心跳”。
+
+验收：
+
+- 单流程 `resolve-target` 调用数减少 50% 以上。
+- `cdp_not_ready/chatgpt_target_not_found` 不再覆盖已知业务阻塞原因。
+
+#### 阶段 4：P2 GoPay/Midtrans 状态化（2-4 天）
+
+目标：把 GoPay 绑定、phone binding、token/reference 生命周期变成后端 API 合同。
+
+改造点：
+
+- `token_state`: `fresh`、`used`、`not_found`、`expired`、`rate_limited`。
+- `phone_binding_state`: `ready`、`binding_required`、`mismatch`、`manual_required`。
+- 同一 `account_id/reference_id/checkout_key` 在 terminal/manual_required 后禁止自动重试，只允许用户显式“换号/重新生成 checkout”。
+- 保留 PIN 自动化，但把 `payment PIN` 作为可选分支；若出现则自动处理，未出现则不算失败。
+
+验收：
+
+- F3-F5 形态自动转为 `manual_required_phone_binding`，不重复提交同一绑定。
+- `token_state` 和 `phone_binding_state` 在审计日志中可见。
+
+#### 阶段 5：P0 完整状态机与回归测试（3-5 天）
+
+目标：从“按钮串联”收口为“状态机驱动”。
+
+状态图需覆盖：
+
+```text
+login_preparing
+  -> login_code_waiting
+  -> session_captured
+  -> checkout_created
+  -> checkout_subscription_confirmation_required
+  -> checkout_autofilled
+  -> auto_trigger_waiting
+  -> auto_trigger_ready
+  -> midtrans_linking_submitted
+  -> gopay_pin_binding
+  -> payment_pin_optional
+  -> pay_now_waiting
+  -> payment_completed | manual_required_phone_binding | account_already_paid | gopay_session_expired
+```
+
+测试计划：
+
+- Handler 级测试：`User is already paid`、`midtrans_phone_binding_required`、`cdp_not_ready`、`checkout_subscription_confirmation_required` 的响应合同。
+- 前端流程测试：terminal 后 watcher 停止，voice queue 清空，按钮状态显示下一动作。
+- 日志回放测试：用最近 5 个流程的阶段序列作为 fixture，验证最终状态不被后续 probe 覆盖。
+
+最终收益预估：
+
+| 指标 | 当前表现 | 改造后目标 |
+| --- | --- | --- |
+| phone binding 阻塞后的无效轮询 | F3-F5 均继续轮询 | 0 次或仅保留低频诊断 |
+| 已付费账号 checkout 尝试 | F1 仍发起 checkout/start | Session 后直接终止 |
+| terminal 后语音失败 | 多次持续失败 | 连续失败熔断，terminal 清队列 |
+| 主流程最终原因准确性 | 容易被 Plus/CDP 覆盖 | run-level reason 锁存 |
+| 用户下一动作判断成本 | 需要读日志 | UI 直接显示主动作按钮 |
+
+### 14.6 支付授权篡改与重放 sandbox
+
+为避免历史支付凭证、客户端 evidence 或跨账号 voucher 被误当作当前 checkout 授权，新增独立 sandbox 方案：
+
+- 方案文档：[payment-authorization-tamper-sandbox-plan.md](payment-authorization-tamper-sandbox-plan.md)
+- 本地路由：`POST /api/sandbox/payment-authorization/assess`
+- 后端合同：`paymentVoucherReplayRiskContract`、`paymentAuthorizationTamperRiskContract`
+- 已覆盖场景：伪造支付授权、旧凭证 replay、篡改 localStorage/window evidence、跨账号 voucher 注入
+
+该方案仅用于本地 mock/sandbox 安全测试，不驱动真实支付页面或真实付款动作。

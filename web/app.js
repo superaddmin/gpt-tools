@@ -33,6 +33,8 @@ const alertTitle = document.querySelector("#alertTitle");
 const alertBadge = document.querySelector("#alertBadge");
 const alertMessage = document.querySelector("#alertMessage");
 const alertHint = document.querySelector("#alertHint");
+const alertActions = document.querySelector("#alertActions");
+const authorizedSubscribeClickBtn = document.querySelector("#authorizedSubscribeClickBtn");
 const alertSteps = document.querySelector("#alertSteps");
 const alertStepsList = document.querySelector("#alertStepsList");
 const stepFlowItems = Array.from(document.querySelectorAll(".step-flow-item"));
@@ -66,6 +68,28 @@ let plusSubscribeAutoTriggerLastAttemptAt = 0;
 let plusSubscribeWatcherReason = "watch";
 let plusSubscribeProbeConsecutiveMisses = 0;
 let plusSubscribeProbeLastSignature = "";
+let plusSubscribeLastActionNoticeKey = "";
+let plusSubscribeNoProgressCount = 0;
+let pendingAuthorizedSubscribeTarget = null;
+let authorizedSubscribeClickRunning = false;
+const authorizedSubscribeClickKeys = new Set();
+let lastVoicePromptKey = "";
+let activeLuckMailVoiceUtterance = null;
+let voicePromptPlaybackQueue = Promise.resolve();
+let voicePromptPendingKeys = new Set();
+let automationRun = {
+  runId: "",
+  state: "idle",
+  previousState: "",
+  enteredAt: 0,
+  attempts: {},
+  locks: {},
+  lastError: null,
+  context: {},
+  terminal: false,
+  terminalReason: "",
+  terminalAt: 0,
+};
 const clientPerfState = {
   longTasks: [],
   slowInteractions: [],
@@ -82,6 +106,128 @@ function ensureAutomationTraceID(prefix) {
     activeAutomationTraceID = createAutomationTraceID(prefix);
   }
   return activeAutomationTraceID;
+}
+
+function currentAutomationRunID() {
+  if (!automationRun.runId) {
+    automationRun.runId = createAutomationTraceID("run");
+  }
+  return automationRun.runId;
+}
+
+function buildAutomationPayload(prefix, payload) {
+  return Object.assign({
+    trace_id: ensureAutomationTraceID(prefix),
+    run_id: currentAutomationRunID(),
+  }, payload || {});
+}
+
+function beginAutomationRun(initialState, details) {
+  details = details || {};
+  activeAutomationTraceID = createAutomationTraceID(details.tracePrefix || "checkout");
+  automationRun = {
+    runId: createAutomationTraceID("run"),
+    state: "idle",
+    previousState: "",
+    enteredAt: Date.now(),
+    attempts: {},
+    locks: {},
+    lastError: null,
+    context: {},
+    terminal: false,
+    terminalReason: "",
+    terminalAt: 0,
+  };
+  return transitionAutomationState(initialState || "starting", details);
+}
+
+function automationRunIsTerminal() {
+  return !!automationRun.terminal;
+}
+
+function transitionAutomationState(nextState, details) {
+  nextState = String(nextState || "idle").trim() || "idle";
+  details = details || {};
+  if (!automationRun.runId || nextState === "idle") {
+    automationRun.runId = createAutomationTraceID("run");
+  }
+  if (automationRun.state !== nextState) {
+    automationRun.previousState = automationRun.state;
+    automationRun.state = nextState;
+    automationRun.enteredAt = Date.now();
+    automationRun.lastError = details.error || null;
+    automationRun.context = Object.assign({}, automationRun.context || {}, details.context || {});
+    if (typeof appendMonitorEvent === "function") {
+      appendMonitorEvent({
+        domain: "Log",
+        method: "automation-state",
+        summary: "状态：" + automationRun.previousState + " -> " + nextState + (details.reason ? "（" + details.reason + "）" : ""),
+        ts: Date.now(),
+      });
+    }
+  }
+  return automationRun;
+}
+
+function clearVoicePromptQueueAfterTerminal() {
+  try {
+    if ("speechSynthesis" in window) window.speechSynthesis.cancel();
+  } catch (_err) {}
+  try {
+    activeLuckMailVoiceUtterance = null;
+    lastVoicePromptKey = "";
+    voicePromptPendingKeys?.clear();
+    voicePromptPlaybackQueue = Promise.resolve();
+  } catch (_err) {}
+}
+
+function stopRunScopedWatchersAfterTerminal(reason) {
+  plusSubscribeWatcherExpiresAt = 0;
+  stopPlusSubscribeSessionTriggerWatcher();
+  checkoutSubmitWatcherId += 1;
+  gopayAutoTriggerRunning = false;
+  gopayPaymentFlowRunning = false;
+  gopayCheckoutWatcherActive = false;
+  if (typeof stopGopayOTPAutoCapture === "function") {
+    try { stopGopayOTPAutoCapture(); } catch (_err) {}
+  }
+  stopGopayOTPAutoCapture = null;
+  clearVoicePromptQueueAfterTerminal();
+  if (gopayLinkBtn) gopayLinkBtn.disabled = false;
+  if (gopayMonitorBtn) gopayMonitorBtn.disabled = false;
+  if (typeof appendMonitorEvent === "function") {
+    appendMonitorEvent({
+      domain: "Log",
+      method: "automation-terminal-cleanup",
+      summary: "已停止本轮 watcher：" + (reason || "terminal"),
+      ts: Date.now(),
+    });
+  }
+}
+
+function finishAutomationRun(finalState, details) {
+  finalState = String(finalState || "manual_required").trim() || "manual_required";
+  details = details || {};
+  var reason = String(details.reason || details.error || finalState || "terminal").trim() || "terminal";
+  if (automationRun.terminal) {
+    stopRunScopedWatchersAfterTerminal(automationRun.terminalReason || reason);
+    if (typeof appendMonitorEvent === "function") {
+      appendMonitorEvent({
+        domain: "Log",
+        method: "post-terminal-diagnostic",
+        summary: "流程已终止，忽略后续状态：" + reason,
+        ts: Date.now(),
+      });
+    }
+    return automationRun;
+  }
+  automationRun.terminal = true;
+  automationRun.terminalReason = reason;
+  automationRun.terminalAt = Date.now();
+  automationRun.context = Object.assign({}, automationRun.context || {}, details.context || {});
+  stopRunScopedWatchersAfterTerminal(reason);
+  transitionAutomationState(finalState, Object.assign({}, details, { reason: reason }));
+  return automationRun;
 }
 
 function safePerfURL(rawURL) {
@@ -241,13 +387,13 @@ function setText(node, value) {
 const workflowVoiceSteps = {
   openIncognitoBtn: { order: 1, label: "打开无痕窗口" },
   luckmailDeviceLoginGuideBtn: { order: 2, label: "设备登录引导" },
-  fetchSessionBtn: { order: 3, label: "获取 Session JSON" },
+  fetchSessionBtn: { order: 3, label: "获取会话信息" },
   autoFillCheckoutBtn: { order: 4, label: "自动填地址" },
   openPaymentShortcutBtn: { order: 5, label: "打开支付页" },
-  gopayLinkBtn: { order: 6, label: "GoPay 绑定" },
-  luckmailTokenCodeBtn: { order: 7, label: "LuckMail 接码" },
-  browserUseRunBtn: { order: 8, label: "Browser Use 分析" },
-  exportSub2APIBtn: { order: 9, label: "导出 sub2api 凭证" },
+  gopayLinkBtn: { order: 6, label: "支付绑定" },
+  luckmailTokenCodeBtn: { order: 7, label: "邮箱接码" },
+  browserUseRunBtn: { order: 8, label: "浏览器分析" },
+  exportSub2APIBtn: { order: 9, label: "导出订阅凭证" },
   closeIncognitoBtn: { order: 10, label: "关闭窗口" },
 };
 
@@ -265,13 +411,13 @@ const workflowVoiceStepMessages = {
   },
   luckmailDeviceLoginGuideBtn: {
     running: "第二步，正在执行设备登录引导，系统会准备邮箱并打开登录页面。",
-    done: "第二步完成，设备登录引导已结束。下一步获取 Session JSON。",
-    error: "第二步失败，设备登录引导没有完成，请查看 LuckMail 状态信息。",
+    done: "第二步完成，设备登录引导已结束。下一步获取会话信息。",
+    error: "第二步失败，设备登录引导没有完成，请查看邮箱接码状态信息。",
   },
   fetchSessionBtn: {
-    running: "第三步，正在获取 Session JSON。",
-    done: "第三步完成，Session JSON 已获取。下一步自动填地址。",
-    error: "第三步失败，Session JSON 获取失败，请确认无痕窗口已登录。",
+    running: "第三步，正在获取会话信息。",
+    done: "第三步完成，会话信息已获取。下一步自动填地址。",
+    error: "第三步失败，会话信息获取失败，请确认无痕窗口已登录。",
   },
   autoFillCheckoutBtn: {
     running: "第四步，正在自动填写地址和结账信息。",
@@ -279,29 +425,29 @@ const workflowVoiceStepMessages = {
     error: "第四步失败，自动填写地址没有完成，请检查页面状态。",
   },
   openPaymentShortcutBtn: {
-    running: "第五步，正在打开支付页并优先选择 GoPay。",
-    done: "第五步完成，支付页已打开。下一步执行 GoPay 绑定。",
+    running: "第五步，正在打开支付页并优先选择支付方式。",
+    done: "第五步完成，支付页已打开。下一步执行支付绑定。",
     error: "第五步失败，支付页没有成功打开，请重新生成支付链接。",
   },
   gopayLinkBtn: {
-    running: "第六步，正在执行 GoPay 绑定和支付辅助。",
-    done: "第六步完成，GoPay 流程已完成。",
-    error: "第六步失败，GoPay 流程出现异常，请查看 GoPay 实时状态。",
+    running: "第六步，正在执行支付绑定和支付辅助。",
+    done: "第六步完成，支付流程已完成。",
+    error: "第六步失败，支付流程出现异常，请查看支付实时状态。",
   },
   luckmailTokenCodeBtn: {
-    running: "第七步，正在通过 LuckMail 接收验证码。",
-    done: "第七步完成，LuckMail 验证码已处理。",
-    error: "第七步失败，LuckMail 未能完成接码，请检查 Token 或邮箱状态。",
+    running: "第七步，正在通过邮箱接码接收验证码。",
+    done: "第七步完成，邮箱验证码已处理。",
+    error: "第七步失败，邮箱接码未能完成，请检查令牌或邮箱状态。",
   },
   browserUseRunBtn: {
-    running: "第八步，正在执行 Browser Use 分析。",
-    done: "第八步完成，Browser Use 分析已结束。",
-    error: "第八步失败，Browser Use 分析没有完成，请查看分析输出。",
+    running: "第八步，正在执行浏览器分析。",
+    done: "第八步完成，浏览器分析已结束。",
+    error: "第八步失败，浏览器分析没有完成，请查看分析输出。",
   },
   exportSub2APIBtn: {
-    running: "第九步，正在导出 sub2api 凭证。",
-    done: "第九步完成，sub2api 凭证已导出。",
-    error: "第九步失败，sub2api 凭证导出失败，请检查登录状态。",
+    running: "第九步，正在导出订阅凭证。",
+    done: "第九步完成，订阅凭证已导出。",
+    error: "第九步失败，订阅凭证导出失败，请检查登录状态。",
   },
   closeIncognitoBtn: {
     running: "第十步，正在关闭无痕窗口。",
@@ -618,6 +764,7 @@ function buildStartPayload(options) {
     },
     customer_email: fields.customerEmail.value.trim(),
     trace_id: ensureAutomationTraceID("checkout"),
+    run_id: currentAutomationRunID(),
   };
 }
 
@@ -626,6 +773,9 @@ function buildRequestHeaders(extraHeaders) {
   var email = (fields.customerEmail?.value || "").trim();
   if (email) {
     headers["X-Account-Email"] = email;
+  }
+  if (automationRun.runId) {
+    headers["X-Automation-Run-Id"] = automationRun.runId;
   }
   if (extraHeaders && typeof extraHeaders === "object") {
     Object.assign(headers, extraHeaders);
@@ -849,12 +999,40 @@ async function runLoginClickAfterIncognitoOpen(options) {
       headers: buildRequestHeaders(),
       body: JSON.stringify({ timeout_s: 45 }),
     });
-    const data = await response.json();
+    let data = await response.json();
     renderLuckMailOutput(data);
     var alreadyLoggedIn = data.stage === "already_logged_in";
     loginClickReady = !!(response.ok && data.ok && (data.email_input_ready || data.email_mode_switched || data.login_surface_ready || alreadyLoggedIn));
     var targetSwitching = data.stage && String(data.stage).includes("target_switching");
     var popupNotOpened = data.stage === "login_popup_not_opened" || !!data.login_popup_not_opened;
+    if (!loginClickReady && popupNotOpened) {
+      appendMonitorEvent({ domain: "Log", method: "login-click-retry", summary: "登录弹窗未出现，执行一次短间隔兜底点击检查", ts: Date.now() });
+      await new Promise(function (r) { setTimeout(r, 1400); });
+      try {
+        const retryResponse = await fetch("/api/login/click", {
+          method: "POST",
+          headers: buildRequestHeaders(),
+          body: JSON.stringify({ timeout_s: 25 }),
+        });
+        const retryData = await retryResponse.json();
+        retryData.previous_login_click_stage = data.stage || "";
+        retryData.previous_login_click_root_cause = data.root_cause || "";
+        if (retryResponse.ok && (retryData.ok || retryData.email_input_ready || retryData.email_mode_switched || retryData.login_surface_ready || retryData.stage === "already_logged_in")) {
+          data = retryData;
+          renderLuckMailOutput(data);
+          alreadyLoggedIn = data.stage === "already_logged_in";
+          loginClickReady = !!(data.ok && (data.email_input_ready || data.email_mode_switched || data.login_surface_ready || alreadyLoggedIn));
+          targetSwitching = data.stage && String(data.stage).includes("target_switching");
+          popupNotOpened = data.stage === "login_popup_not_opened" || !!data.login_popup_not_opened;
+        } else {
+          data.login_click_retry = retryData;
+          renderLuckMailOutput(data);
+        }
+      } catch (retryError) {
+        data.login_click_retry_error = retryError.message || "登录点击兜底重试失败";
+        renderLuckMailOutput(data);
+      }
+    }
     var emailWatchFallback = targetSwitching || popupNotOpened || !!data.clicked_login;
     if (luckmailBadge) {
       setText(luckmailBadge, alreadyLoggedIn ? "已登录" : (loginClickReady ? "登录窗已开" : (emailWatchFallback ? "继续监控" : "点击失败")));
@@ -1088,6 +1266,7 @@ function renderSessionConclusion(conclusion) {
       alertHint.hidden = false;
       setText(alertHint, conclusion.status || "-");
     }
+    hideAlertActions();
     renderAlertSteps(Array.isArray(conclusion.next_steps) ? conclusion.next_steps : []);
   }
 }
@@ -1105,6 +1284,7 @@ function showAutoFillNotice(title, badge, message, hint, kind) {
     alertHint.hidden = !hint;
     setText(alertHint, hint || "-");
   }
+  hideAlertActions();
   if (alertSteps) alertSteps.hidden = true;
   if (alertStepsList) alertStepsList.innerHTML = "";
   if (kind === "error") {
@@ -1112,12 +1292,107 @@ function showAutoFillNotice(title, badge, message, hint, kind) {
   }
 }
 
+function hideAlertActions() {
+  if (alertActions) alertActions.hidden = true;
+  if (authorizedSubscribeClickBtn) {
+    authorizedSubscribeClickBtn.hidden = true;
+    authorizedSubscribeClickBtn.disabled = false;
+    setText(authorizedSubscribeClickBtn, "已确认，执行一次订阅点击");
+  }
+  pendingAuthorizedSubscribeTarget = null;
+}
+
+function showAuthorizedSubscribeAction(data) {
+  if (!alertActions || !authorizedSubscribeClickBtn) return;
+  var targetURL = String(data?.url || data?.current_url || data?.expected_url || latestOpenedCheckoutURL || latestCheckoutURL || "").trim();
+  var targetID = String(data?.target?.id || data?.target_id || latestOpenedCheckoutTargetID || "").trim();
+  var clickKey = checkoutAutoTriggerKey(targetURL) || targetURL.split("#")[0];
+  if (!targetURL || authorizedSubscribeClickKeys.has(clickKey)) {
+    hideAlertActions();
+    return;
+  }
+  pendingAuthorizedSubscribeTarget = {
+    expected_url: targetURL,
+    target_id: targetID,
+    checkout_key: clickKey,
+  };
+  alertActions.hidden = false;
+  authorizedSubscribeClickBtn.hidden = false;
+  authorizedSubscribeClickBtn.disabled = authorizedSubscribeClickRunning;
+  setText(authorizedSubscribeClickBtn, authorizedSubscribeClickRunning ? "执行中..." : "已确认，执行一次订阅点击");
+}
+
+async function runAuthorizedSubscribeClick() {
+  if (!pendingAuthorizedSubscribeTarget || authorizedSubscribeClickRunning) return null;
+  var target = Object.assign({}, pendingAuthorizedSubscribeTarget);
+  if (!target.expected_url) return null;
+  authorizedSubscribeClickRunning = true;
+  authorizedSubscribeClickBtn.disabled = true;
+  setText(authorizedSubscribeClickBtn, "执行中...");
+  appendCheckoutWatcherEvent("subscription-authorize-click", "已收到本地授权，准备执行一次订阅确认真实鼠标点击");
+  try {
+    var response = await fetch("/api/checkout/authorized-subscribe-click", {
+      method: "POST",
+      headers: buildRequestHeaders(),
+      body: JSON.stringify(buildAutomationPayload("checkout", {
+        expected_url: target.expected_url,
+        target_id: target.target_id || latestOpenedCheckoutTargetID || "",
+        authorized: true,
+      })),
+    });
+    var data = await response.json();
+    if (!response.ok || !data.ok) {
+      throw new Error(data.error || data.human_message || "订阅点击未完成");
+    }
+    var clickKey = target.checkout_key || checkoutAutoTriggerKey(target.expected_url) || target.expected_url.split("#")[0];
+    authorizedSubscribeClickKeys.add(clickKey);
+    hideAlertActions();
+    appendCheckoutWatcherEvent("subscription-authorized-clicked", "已执行一次订阅确认点击，等待支付页原生跳转");
+    showAutoFillNotice(
+      "订阅点击已执行",
+      "已授权",
+      "已通过 CDP 真实鼠标执行一次订阅确认点击。",
+      "接下来只监听页面原生跳转和 GoPay/PIN 状态，不会重复点击订阅按钮。",
+      "success"
+    );
+    var watcherURL = data.current_url || data.after_url || data.expected_url || target.expected_url;
+    if (data.target_id) latestOpenedCheckoutTargetID = data.target_id;
+    if (watcherURL) latestOpenedCheckoutURL = watcherURL;
+    if (checkoutAutoTriggerKey(watcherURL)) {
+      startCheckoutSubmitWatcher({ current_url: watcherURL, expected_url: watcherURL });
+    } else {
+      startPlusSubscribeSessionTriggerWatcher("authorized_subscribe_click");
+    }
+    return data;
+  } catch (error) {
+    appendCheckoutWatcherEvent("subscription-authorized-click-error", error.message || "订阅点击失败");
+    showAutoFillNotice(
+      "订阅点击失败",
+      "需检查",
+      error.message || "未能执行订阅点击。",
+      "请确认当前无痕窗口停留在订阅确认页，且按钮没有被条款复选框或页面加载状态禁用。",
+      "error"
+    );
+    showAuthorizedSubscribeAction(target);
+    return null;
+  } finally {
+    authorizedSubscribeClickRunning = false;
+    if (authorizedSubscribeClickBtn && !authorizedSubscribeClickBtn.hidden) {
+      authorizedSubscribeClickBtn.disabled = false;
+      setText(authorizedSubscribeClickBtn, "已确认，执行一次订阅点击");
+    }
+  }
+}
+
+authorizedSubscribeClickBtn?.addEventListener("click", function () {
+  void runAuthorizedSubscribeClick();
+});
+
 async function resolveOpenedCheckoutTarget(openedURL, options) {
   options = options || {};
   var deadline = Date.now() + (options.timeoutMS || 5000);
   var delayMS = options.initialDelayMS || 0;
   var lastData = null;
-  var traceID = ensureAutomationTraceID("checkout");
   var openedCheckoutKey = typeof checkoutAutoTriggerKey === "function" ? checkoutAutoTriggerKey(openedURL) : "";
 
   while (Date.now() <= deadline) {
@@ -1128,11 +1403,10 @@ async function resolveOpenedCheckoutTarget(openedURL, options) {
       const resp = await fetch("/api/checkout/resolve-target", {
         method: "POST",
         headers: buildRequestHeaders(),
-        body: JSON.stringify({
+        body: JSON.stringify(buildAutomationPayload("checkout", {
           opened_url: openedURL,
           target_id: latestOpenedCheckoutTargetID,
-          trace_id: traceID,
-        }),
+        })),
       });
       const data = await resp.json();
       lastData = data;
@@ -1190,11 +1464,10 @@ async function autoSelectOpenedCheckoutPaymentMethod(expectedURL) {
     const resp = await fetch("/api/checkout/payment-method-select", {
       method: "POST",
       headers: buildRequestHeaders(),
-      body: JSON.stringify({
+      body: JSON.stringify(buildAutomationPayload("checkout", {
         expected_url: expectedURL,
         target_id: latestOpenedCheckoutTargetID,
-        trace_id: ensureAutomationTraceID("checkout"),
-      }),
+      })),
     });
     const data = await resp.json();
     if (data?.target?.id || data?.target_id) {
@@ -1214,6 +1487,19 @@ async function autoSelectOpenedCheckoutPaymentMethod(expectedURL) {
     console.error("auto payment method select error:", error);
     return null;
   }
+}
+
+function scheduleCloseIncognitoAfterTerminal(reason, delayMS) {
+  reason = String(reason || "terminal").trim() || "terminal";
+  var waitMS = Math.min(30000, Math.max(2500, Number(delayMS || 8000)));
+  appendCheckoutWatcherEvent("incognito-close-scheduled", "流程已进入终态，" + Math.round(waitMS / 1000) + " 秒后自动关闭无痕窗口：" + reason);
+  window.setTimeout(function () {
+    if (luckMailCodePollingActive || gopayPaymentFlowRunning || gopayCheckoutWatcherActive) {
+      appendCheckoutWatcherEvent("incognito-close-skipped", "仍有验证码或支付监听任务运行，跳过自动关闭窗口");
+      return;
+    }
+    void closeIncognitoWindow();
+  }, waitMS);
 }
 
 /**
@@ -1250,6 +1536,10 @@ function stopPlusSubscribeSessionTriggerWatcher() {
 }
 
 function schedulePlusSubscribeSessionTriggerWatcher(reason, delayMS) {
+  if (automationRunIsTerminal()) {
+    stopPlusSubscribeSessionTriggerWatcher();
+    return;
+  }
   if (!fetchSessionBtn || Date.now() > plusSubscribeWatcherExpiresAt) {
     stopPlusSubscribeSessionTriggerWatcher();
     return;
@@ -1266,16 +1556,23 @@ function schedulePlusSubscribeSessionTriggerWatcher(reason, delayMS) {
 
 function startPlusSubscribeSessionTriggerWatcher(reason) {
   if (!fetchSessionBtn) return;
+  if (automationRunIsTerminal()) return;
   plusSubscribeWatcherReason = reason || plusSubscribeWatcherReason || "watch";
   plusSubscribeWatcherExpiresAt = Math.max(plusSubscribeWatcherExpiresAt, Date.now() + PLUS_SUBSCRIBE_WATCH_WINDOW_MS);
   if (!plusSubscribeWatcherTimer && !plusSubscribeProbeInFlight) {
     plusSubscribeProbeConsecutiveMisses = 0;
     plusSubscribeProbeLastSignature = "";
+    plusSubscribeNoProgressCount = 0;
+    transitionAutomationState("auto_trigger_waiting", { reason: plusSubscribeWatcherReason });
     schedulePlusSubscribeSessionTriggerWatcher(plusSubscribeWatcherReason, PLUS_SUBSCRIBE_WATCH_INITIAL_DELAY_MS);
   }
 }
 
 function nextPlusSubscribeProbeDelay(data) {
+  var serverDelay = Number(data?.poll_after_ms || data?.retry_after_ms || 0);
+  if (Number.isFinite(serverDelay) && serverDelay > 0) {
+    return Math.min(PLUS_SUBSCRIBE_WATCH_MAX_INTERVAL_MS, Math.max(PLUS_SUBSCRIBE_WATCH_MIN_INTERVAL_MS, Math.round(serverDelay)));
+  }
   const signature = plusSubscribeProbeSignature(data || {});
   if (signature && signature !== plusSubscribeProbeLastSignature) {
     plusSubscribeProbeConsecutiveMisses = 0;
@@ -1292,8 +1589,88 @@ function nextPlusSubscribeProbeDelay(data) {
   return Math.min(PLUS_SUBSCRIBE_WATCH_MAX_INTERVAL_MS, Math.round(baseDelay * multiplier));
 }
 
+function handlePlusSubscribeProbeContract(data) {
+  if (!data) return { keepWatching: true };
+  var terminal = !!data.terminal || data.page_classification === "terminal_after_payment";
+  if (terminal) {
+    appendMonitorEvent({
+      domain: "Log",
+      method: "plus-subscribe-terminal",
+      summary: data.human_message || "当前流程已结束，停止 Plus 页面探测",
+      ts: Date.now(),
+    });
+    finishAutomationRun(data.page_classification || data.stage || "terminal_after_payment", {
+      reason: data.next_action || data.stage || "terminal_after_payment",
+      context: { source: "plus_subscribe_probe" },
+    });
+    return { keepWatching: false };
+  }
+  var classification = String(data.page_classification || data.stage || "").trim();
+  var nextAction = String(data.next_action || "").trim();
+  var humanMessage = String(data.human_message || "").trim();
+  var noProgress = (
+    classification === "target_waiting" ||
+    classification === "cdp_recovering" ||
+    (
+      classification === "plus_subscribe_probe" &&
+      !data.safe_trigger_fetch_session &&
+      !data.plus_plan_detected &&
+      !data.subscribe_payment_detected
+    )
+  );
+  if (noProgress) {
+    plusSubscribeNoProgressCount += 1;
+  } else {
+    plusSubscribeNoProgressCount = 0;
+  }
+  if (plusSubscribeNoProgressCount >= 3) {
+    var reason = nextAction || classification || "plus_probe_no_progress";
+    appendMonitorEvent({
+      domain: "Log",
+      method: "plus-subscribe-no-progress-stop",
+      summary: humanMessage || "Plus 探测连续无进展，已停止本轮监听，等待明确页面动作。",
+      ts: Date.now(),
+    });
+    finishAutomationRun("manual_required", {
+      reason: reason,
+      context: { source: "plus_subscribe_probe_no_progress" },
+    });
+    return { keepWatching: false };
+  }
+  if (!humanMessage) return { keepWatching: true };
+  var noticeKey = [classification, nextAction, data.url || data.target?.url || ""].join("|").slice(0, 600);
+  if (noticeKey && noticeKey !== plusSubscribeLastActionNoticeKey) {
+    plusSubscribeLastActionNoticeKey = noticeKey;
+    appendMonitorEvent({
+      domain: "Log",
+      method: "plus-subscribe-next-action",
+      summary: humanMessage,
+      ts: Date.now(),
+    });
+    transitionAutomationState(nextAction || classification || "plus_probe_observed", { reason: classification });
+    if (nextAction === "review_and_click_subscribe") {
+      showAutoFillNotice(
+        "订阅确认需要人工处理",
+        "需确认",
+        humanMessage,
+        "你确认页面条款与金额后，可以点击下方本地授权按钮；系统只执行一次 CDP 真实鼠标点击。",
+        "warning"
+      );
+      showAuthorizedSubscribeAction(data);
+      announceLuckMailScene("checkout_subscription_confirmation_required", humanMessage, false);
+    } else if (nextAction === "wait_for_chrome_cdp" || nextAction === "open_chatgpt_checkout_or_incognito") {
+      announceLuckMailScene("plus_probe_" + nextAction, humanMessage, false);
+    }
+  }
+  return { keepWatching: true };
+}
+
 async function probePlusSubscribeSessionTrigger(reason, options) {
   options = options || {};
+  if (automationRunIsTerminal()) {
+    stopPlusSubscribeSessionTriggerWatcher();
+    return null;
+  }
   if (plusSubscribeProbeInFlight) return null;
   if (Date.now() > plusSubscribeWatcherExpiresAt) {
     stopPlusSubscribeSessionTriggerWatcher();
@@ -1312,10 +1689,14 @@ async function probePlusSubscribeSessionTrigger(reason, options) {
     const response = await fetch("/api/pricing/plus-subscribe-probe", {
       method: "POST",
       headers: buildRequestHeaders(),
-      body: JSON.stringify({ reason: reason || "watch", trace_id: ensureAutomationTraceID("plus") }),
+      body: JSON.stringify(buildAutomationPayload("plus", { reason: reason || "watch" })),
     });
     data = await response.json();
     if (!response.ok || !data?.safe_trigger_fetch_session) {
+      var contract = handlePlusSubscribeProbeContract(data);
+      if (contract && contract.keepWatching === false) {
+        keepWatching = false;
+      }
       return data;
     }
     const signature = plusSubscribeProbeSignature(data);
@@ -1392,6 +1773,7 @@ function resetResult() {
     alertHint.hidden = true;
     setText(alertHint, "-");
   }
+  hideAlertActions();
   if (alertSteps) {
     alertSteps.hidden = true;
   }
@@ -1619,6 +2001,7 @@ async function runCheckoutGenerate(activeSubmitButton, options) {
     options.paymentMethod = activeSubmitButton.dataset.paymentMethod;
   }
   resetResult();
+  beginAutomationRun("checkout_creating", { reason: options.fetchSessionFirst ? "session_then_checkout" : "manual_checkout_start", tracePrefix: "checkout" });
   paymentSubmitButtons.forEach(function (button) { button.disabled = true; });
   var activeSubmitLabel = activeSubmitButton ? activeSubmitButton.textContent : "Popay";
   activePaymentLabel = activeSubmitLabel || "Popay";
@@ -1634,6 +2017,13 @@ async function runCheckoutGenerate(activeSubmitButton, options) {
     }
     const { response, data } = await postJSON("/api/checkout/start", buildStartPayload(options));
     renderResult(data, Math.round(performance.now() - startedAt), response.ok);
+    if (data?.terminal) {
+      finishAutomationRun(data.stage || "checkout_terminal", {
+        reason: data.next_action || data.stage || data.error || "checkout_terminal",
+        error: data.error,
+      });
+      return false;
+    }
     if (response.ok && latestCheckoutURL) {
       void copyCurrentCheckoutURL();
       void openPaymentInIncognito();
@@ -1669,6 +2059,9 @@ paypalSubmitButton?.addEventListener("click", async () => {
 async function autoFetchAndGenerate(options) {
   options = options || {};
   if (!fetchSessionBtn || autoFetchAndGenerateRunning) return false;
+  if (automationRunIsTerminal() || automationRun.state === "idle") {
+    beginAutomationRun("session_capturing", { reason: options.source || "manual_session_fetch", tracePrefix: "checkout" });
+  }
   autoFetchAndGenerateRunning = true;
   fetchSessionBtn.disabled = true;
   setWorkflowButtonState(fetchSessionBtn, "running");
@@ -1719,6 +2112,9 @@ openPaymentShortcutBtn?.addEventListener("click", async () => {
 
 openIncognitoBtn?.addEventListener("click", async () => {
   if (!openIncognitoBtn) return;
+  if (automationRunIsTerminal() || automationRun.state === "idle") {
+    beginAutomationRun("login_browser_preparing", { reason: "open_incognito", tracePrefix: "login" });
+  }
   var originalText = openIncognitoBtn.textContent || "打开无痕窗口";
   openIncognitoBtn.disabled = true;
   setWorkflowButtonState(openIncognitoBtn, "running");
@@ -1760,6 +2156,9 @@ closeIncognitoBtn?.addEventListener("click", () => {
 
 autoFillCheckoutBtn?.addEventListener("click", async () => {
   if (!autoFillCheckoutBtn) return;
+  if (automationRunIsTerminal() || automationRun.state === "idle") {
+    beginAutomationRun("checkout_autofilling", { reason: "manual_auto_fill", tracePrefix: "checkout" });
+  }
   autoFillCheckoutBtn.disabled = true;
   setWorkflowButtonState(autoFillCheckoutBtn, "running");
   var origText = "自动填地址";
@@ -1784,11 +2183,10 @@ autoFillCheckoutBtn?.addEventListener("click", async () => {
     var resp = await fetch("/api/checkout/auto-fill", {
       method: "POST",
       headers: buildRequestHeaders(),
-      body: JSON.stringify({
+      body: JSON.stringify(buildAutomationPayload("checkout", {
         expected_url: latestOpenedCheckoutURL,
         target_id: latestOpenedCheckoutTargetID,
-        trace_id: ensureAutomationTraceID("checkout"),
-      }),
+      })),
     });
     var data = await resp.json();
     if (data?.page_target?.id || data?.target_id) {
@@ -2031,12 +2429,20 @@ function renderGopayStageResults(stages) {
   }
 }
 
-function releaseGopayAutomationAfterTerminal() {
+function releaseGopayAutomationAfterTerminal(reason) {
   gopayAutoTriggerRunning = false;
   gopayPaymentFlowRunning = false;
   gopayCheckoutWatcherActive = false;
+  plusSubscribeWatcherExpiresAt = 0;
+  stopPlusSubscribeSessionTriggerWatcher();
   if (gopayLinkBtn) gopayLinkBtn.disabled = false;
   if (gopayMonitorBtn) gopayMonitorBtn.disabled = false;
+  if (!automationRunIsTerminal()) {
+    finishAutomationRun("terminal_after_payment", {
+      reason: reason || "gopay_terminal",
+      context: { source: "gopay_release" },
+    });
+  }
 }
 
 function nextGopayPollDelayMs(data, result, unchangedPolls) {
@@ -2056,8 +2462,10 @@ function nextGopayPollDelayMs(data, result, unchangedPolls) {
   var paymentExpired = !!(data.payment_expired ?? result.payment_expired);
   var paymentFailed = !!(data.payment_failed ?? result.payment_failed);
   var stableCount = Math.max(0, Number(unchangedPolls || 0));
+  var serverDelay = Number(data.poll_after_ms ?? result.poll_after_ms ?? 0);
 
   if (paymentCompleted || paymentExpired || paymentFailed) return 0;
+  if (Number.isFinite(serverDelay) && serverDelay > 0) return Math.min(60000, Math.max(450, Math.round(serverDelay)));
   if (pageStage === "pin_entry_payment" || pageStage === "pin_entry_binding" || pinStage || hasPinField) return 550;
   if (pageStage === "otp_entry" || hasOTPField) return 900;
   if (["pay_now_post_click_wait", "pay_now_trusted_click"].includes(pageStage) || autoActionStage === "pay_now_trusted_click") return 650;
@@ -2071,6 +2479,7 @@ function nextGopayPollDelayMs(data, result, unchangedPolls) {
 }
 
 function startGopayOTPAutoCapture(options) {
+  if (automationRunIsTerminal()) return null;
   if (typeof stopGopayOTPAutoCapture === "function") {
     stopGopayOTPAutoCapture();
   }
@@ -2089,18 +2498,23 @@ function startGopayOTPAutoCapture(options) {
   var unchangedPolls = 0;
   var payNowStalledNoticeShown = false;
   var insufficientBalanceNoticeShown = false;
+  var midtransSuccessObservedAt = 0;
+  var merchantCallbackPendingNoticeShown = false;
 
   var poll = async function () {
+    if (automationRunIsTerminal()) {
+      stop = true;
+      return;
+    }
     if (stop || attempts >= maxAttempts) return;
     attempts++;
 
     try {
-      var payload = {
+      var payload = buildAutomationPayload("gopay", {
         otp: (gopayOTPInput?.value || "").trim(),
         pin: currentGopayPINValue(),
-        trace_id: ensureAutomationTraceID("gopay"),
         poll_delay_ms: pollDelayMs,
-      };
+      });
       Object.keys(captureContext).forEach(function (key) {
         if (captureContext[key]) payload[key] = captureContext[key];
       });
@@ -2112,6 +2526,9 @@ function startGopayOTPAutoCapture(options) {
       var data = await resp.json();
       var result = data.result || {};
       var pageStage = (data.stage || result.page_stage || "").trim();
+      var pageClassification = (data.page_classification || result.page_classification || "").trim();
+      var nextAction = (data.next_action || result.next_action || "").trim();
+      var humanMessage = (data.human_message || result.human_message || "").trim();
       var pinStage = (data.pin_stage || result.pin_stage || "").trim();
       var otpManualRequired = !!(data.otp_manual_required ?? result.otp_manual_required);
       var pinAutoFilled = !!(data.pin_auto_filled ?? result.pin_auto_filled);
@@ -2136,9 +2553,15 @@ function startGopayOTPAutoCapture(options) {
       var pinAutoBlockReason = (data.pin_auto_block_reason || result.pin_auto_block_reason || "").trim();
       var pinAttemptCount = data.pin_attempt_count ?? result.pin_attempt_count ?? "";
       var paymentCompleted = !!(data.payment_completed ?? result.payment_completed);
+      var midtransPaymentSuccessWaiting = !!(data.midtrans_payment_success ?? result.midtrans_payment_success) || pageStage === "midtrans_payment_success_waiting_redirect";
+      var merchantLoginRequiredAfterPayment = !!(data.merchant_login_required_after_payment ?? result.merchant_login_required_after_payment) || pageStage === "merchant_login_required_after_payment";
       var paymentExpired = !!(data.payment_expired ?? result.payment_expired);
       var paymentFailed = !!(data.payment_failed ?? result.payment_failed) || pageStage === "gopay_payment_failed";
       var paymentFailureReason = (data.payment_failure_reason || result.payment_failure_reason || "").trim();
+      if (midtransPaymentSuccessWaiting && !midtransSuccessObservedAt) {
+        midtransSuccessObservedAt = Date.now();
+      }
+      var paymentExpiredAfterMidtransSuccess = paymentExpired && midtransSuccessObservedAt > 0 && !paymentCompleted && !merchantLoginRequiredAfterPayment;
       var stageKey = [
         pageStage,
         pinStage,
@@ -2147,6 +2570,7 @@ function startGopayOTPAutoCapture(options) {
         balanceState,
         orderAmount,
         paymentExpired ? "payment-expired" : "",
+        paymentExpiredAfterMidtransSuccess ? "merchant-callback-pending-after-midtrans" : "",
         paymentFailed ? "payment-failed" : "",
         paymentFailureReason,
         balanceAmount,
@@ -2160,12 +2584,17 @@ function startGopayOTPAutoCapture(options) {
         payNowBlockReason,
         payNowPostClickElapsedMS,
         autoActionPaused ? "paused" : "",
+        midtransPaymentSuccessWaiting ? "midtrans-success-waiting-redirect" : "",
+        merchantLoginRequiredAfterPayment ? "merchant-login-required-after-payment" : "",
         otpManualRequired ? "otp-manual" : "",
         pinAutoFilled ? "pin-filled" : "",
         pinAutoSubmitted ? "pin-submitted" : "",
         pinAutoBlockReason,
         pinAttemptCount,
         inputStrategy,
+        pageClassification,
+        nextAction,
+        humanMessage,
       ].join("|");
       var stageChanged = stageKey && stageKey !== lastStageKey;
       if (stageKey) {
@@ -2173,15 +2602,82 @@ function startGopayOTPAutoCapture(options) {
       }
       pollDelayMs = nextGopayPollDelayMs(data, result, unchangedPolls) || pollDelayMs;
 
+      if (stageChanged && humanMessage) {
+        appendCheckoutWatcherEvent("gopay-next-action", humanMessage);
+      }
+
+      if (merchantLoginRequiredAfterPayment) {
+        setGopayStep("success", "error", "支付后跳到登录页，未确认 OpenAI 最终成功");
+        appendCheckoutWatcherEvent("merchant-login-required-after-payment", "支付后页面跳到登录页，已停止成功记录，必须重新登录后确认订阅是否生效");
+        showAutoFillNotice(
+          "支付后需要重新登录",
+          "未记录成功",
+          "Midtrans 支付后没有进入 OpenAI 最终成功页，而是跳到了登录页。",
+          "请重新登录 ChatGPT 后确认订阅状态；确认成功前系统不会导出成功记录。",
+          "error"
+        );
+        if (gopayBadge) {
+          setText(gopayBadge, "需登录确认");
+          gopayBadge.className = "badge error";
+        }
+        stop = true;
+        stopGopayOTPAutoCapture = null;
+        finishAutomationRun("merchant_login_required_after_payment", {
+          reason: "relogin_and_verify_subscription",
+          context: { source: "gopay_cdp_otp", pageStage: pageStage },
+        });
+        return;
+      }
+
       if (paymentCompleted || pageStage === "gopay_complete") {
         setGopayStep("success", "done", "支付已完成");
-        appendCheckoutWatcherEvent("gopay-complete", "检测到 GoPay 支付完成，开始保存 GPT Plus 成功记录");
+        appendCheckoutWatcherEvent("gopay-complete", "检测到 OpenAI 最终成功页，开始保存 GPT Plus 成功记录");
         if (gopayBadge) {
           setText(gopayBadge, "支付完成");
           gopayBadge.className = "badge";
         }
         await saveGPTPlusSuccessRecord(Object.assign({}, data, { stage: "gopay_complete" }));
         stop = true;
+        stopGopayOTPAutoCapture = null;
+        finishAutomationRun("terminal_after_payment", {
+          reason: "save_success_record_and_cleanup",
+          context: { source: "gopay_cdp_otp", pageStage: pageStage },
+        });
+        return;
+      }
+      if (midtransPaymentSuccessWaiting) {
+        setGopayStep("success", "active", "Midtrans 已支付成功，等待 OpenAI 最终跳转确认");
+        if (stageChanged) {
+          appendCheckoutWatcherEvent("midtrans-success-waiting-merchant", "Midtrans 已显示 Payment successful，继续等待 OpenAI 最终成功页，不提前保存记录");
+        }
+        if (gopayBadge) {
+          setText(gopayBadge, "等最终跳转");
+          gopayBadge.className = "badge neutral";
+        }
+      }
+      if (paymentExpiredAfterMidtransSuccess) {
+        setGopayStep("success", "active", "Midtrans 已支付成功，继续等待 OpenAI 支付回调完成");
+        if (!merchantCallbackPendingNoticeShown || stageChanged) {
+          merchantCallbackPendingNoticeShown = true;
+          appendCheckoutWatcherEvent(
+            "merchant-callback-pending-after-midtrans-success",
+            "已先检测到 Midtrans Payment successful，当前 pay.openai.com 超时页不作为失败终态；继续等待 OpenAI 成功页或登录确认，不关闭窗口"
+          );
+        }
+        if (stageChanged) {
+          showAutoFillNotice(
+            "等待 OpenAI 支付回调",
+            "继续等待",
+            "Midtrans 已显示支付成功，但 OpenAI 最终成功页尚未确认。",
+            "当前 checkout 超时提示可能出现在回调跳转过程中；确认成功页或登录确认前不会关闭窗口，也不会保存成功记录。",
+            "warning"
+          );
+        }
+        if (gopayBadge) {
+          setText(gopayBadge, "等回调");
+          gopayBadge.className = "badge neutral";
+        }
+        window.setTimeout(poll, Math.max(1200, pollDelayMs || 3000));
         return;
       }
       if (paymentExpired || pageStage === "gopay_session_expired") {
@@ -2198,9 +2694,13 @@ function startGopayOTPAutoCapture(options) {
           setText(gopayBadge, "已超时");
           gopayBadge.className = "badge error";
         }
-        releaseGopayAutomationAfterTerminal();
-        stopGopayOTPAutoCapture = null;
         stop = true;
+        stopGopayOTPAutoCapture = null;
+        finishAutomationRun("payment_expired", {
+          reason: "regenerate_checkout",
+          context: { source: "gopay_cdp_otp", pageStage: pageStage },
+        });
+        scheduleCloseIncognitoAfterTerminal("gopay_session_expired", 12000);
         return;
       }
       if (paymentFailed) {
@@ -2217,9 +2717,13 @@ function startGopayOTPAutoCapture(options) {
           setText(gopayBadge, "支付失败");
           gopayBadge.className = "badge error";
         }
-        releaseGopayAutomationAfterTerminal();
-        stopGopayOTPAutoCapture = null;
         stop = true;
+        stopGopayOTPAutoCapture = null;
+        finishAutomationRun("payment_failed", {
+          reason: "regenerate_checkout",
+          context: { source: "gopay_cdp_otp", pageStage: pageStage, paymentFailureReason: paymentFailureReason },
+        });
+        scheduleCloseIncognitoAfterTerminal("gopay_payment_failed", 12000);
         return;
       }
 
@@ -2344,7 +2848,7 @@ function startGopayOTPAutoCapture(options) {
       console.error("otp auto capture failed:", error);
     }
 
-    if (!stop && attempts < maxAttempts) {
+    if (!stop && !automationRunIsTerminal() && attempts < maxAttempts) {
       window.setTimeout(poll, pollDelayMs);
     }
   };
@@ -2433,6 +2937,7 @@ function midtransRedirectionAccountID(currentURL) {
 }
 
 const checkoutWatcherVoiceEventMessages = {
+  "auto-trigger-watch": "已开始等待订阅提交，系统会在支付页满足条件后触发 GoPay。",
   "checkout-submitted": "检测到订阅付款页面已提交，正在等待 GoPay 支付页面。",
   "auto-trigger-ready": "GoPay 支付页面已识别，正在自动填写绑定信息。",
   "midtrans-linking-fill": "GoPay 绑定信息已填写并提交。",
@@ -2491,7 +2996,18 @@ function prepareCheckoutWatcherMonitor() {
 }
 
 async function checkGopayAutoTriggerReady(payload) {
-  payload = Object.assign({ trace_id: ensureAutomationTraceID("gopay") }, payload || {});
+  if (automationRunIsTerminal()) {
+    return {
+      ok: false,
+      stage: "automation_terminal",
+      terminal: true,
+      retryable: false,
+      next_action: automationRun.terminalReason || "terminal",
+      human_message: "本轮流程已进入终态，停止新的 GoPay 自动触发检查。",
+      poll_after_ms: 0,
+    };
+  }
+  payload = buildAutomationPayload("gopay", payload || {});
   var response = await fetch("/api/gopay/auto-trigger-check", {
     method: "POST",
     headers: buildRequestHeaders(),
@@ -2518,15 +3034,14 @@ async function fillCurrentMidtransLinkingPage(targetURL, checkoutURL) {
   var response = await fetch("/api/gopay/midtrans-linking-fill", {
     method: "POST",
     headers: buildRequestHeaders(),
-    body: JSON.stringify({
+    body: JSON.stringify(buildAutomationPayload("gopay", {
       target_url: targetURL,
       checkout_url: checkoutURL || "",
       country_code: countryCode,
       phone_number: phoneNumber,
       aggressive_retry: aggressiveRetry,
       debug_network: debugNetworkOnce,
-      trace_id: ensureAutomationTraceID("gopay"),
-    }),
+    })),
   });
   var data = await response.json();
   if (!response.ok) {
@@ -2556,7 +3071,15 @@ function midtransPhoneBindingRequired(data) {
   );
 }
 
+function checkoutWatcherDelayMS(value, fallback) {
+  var delay = Number(value || 0);
+  if (!Number.isFinite(delay) || delay <= 0) delay = Number(fallback || 2000);
+  if (!Number.isFinite(delay) || delay <= 0) delay = 2000;
+  return Math.min(30000, Math.max(1200, Math.round(delay)));
+}
+
 function startCheckoutSubmitWatcher(autoFillData) {
+  if (automationRunIsTerminal()) return;
   var checkoutURL = autoFillData?.current_url || autoFillData?.expected_url || latestOpenedCheckoutURL;
   var checkoutKey = checkoutAutoTriggerKey(checkoutURL);
   var pageText = checkoutAutoFillProbeText(autoFillData);
@@ -2573,8 +3096,10 @@ function startCheckoutSubmitWatcher(autoFillData) {
   checkoutSubmitWatcherId += 1;
   var watcherId = checkoutSubmitWatcherId;
   var attempts = 0;
-  var maxAttempts = 45;
+  var maxAttempts = 120;
   var lastCurrentURL = "";
+  var lastAutoTriggerReadyNoticeKey = "";
+  var midtransNonLinkingWatchKeys = new Set();
   var watcherButtonText = gopayLinkBtn ? gopayLinkBtn.textContent : "";
   var finishWatcher = function () {
     if (watcherId !== checkoutSubmitWatcherId) return;
@@ -2594,6 +3119,7 @@ function startCheckoutSubmitWatcher(autoFillData) {
     setText(gopayLinkBtn, "自动监控中...");
   }
   appendCheckoutWatcherEvent("auto-trigger-watch", "已开始等待支付页订阅提交：" + checkoutKey);
+  transitionAutomationState("auto_trigger_waiting", { reason: "checkout_submit_watcher", context: { checkoutKey: checkoutKey } });
 
   void checkGopayAutoTriggerReady({
     source: "checkout-auto-fill-watch",
@@ -2607,8 +3133,24 @@ function startCheckoutSubmitWatcher(autoFillData) {
   });
 
   var poll = async function () {
-    if (watcherId !== checkoutSubmitWatcherId || gopayAutoTriggeredCheckoutKeys.has(checkoutKey)) {
+    if (automationRunIsTerminal() || watcherId !== checkoutSubmitWatcherId || gopayAutoTriggeredCheckoutKeys.has(checkoutKey)) {
       finishWatcher();
+      return;
+    }
+    var nextPollDelayMS = 2000;
+    var cooldownRemainingBeforeProbe = gopayMidtransRetryNotBefore - Date.now();
+    if (cooldownRemainingBeforeProbe > 0) {
+      var cooldownSecondsBeforeProbe = Math.ceil(cooldownRemainingBeforeProbe / 1000);
+      var cooldownNoticeKey = checkoutKey + "|cooldown|" + Math.ceil(gopayMidtransRetryNotBefore / 5000);
+      if (cooldownNoticeKey !== gopayMidtransCooldownNoticeKey) {
+        gopayMidtransCooldownNoticeKey = cooldownNoticeKey;
+        appendCheckoutWatcherEvent("midtrans-linking-cooldown", "Midtrans 页面仍在冷却中，约 " + cooldownSecondsBeforeProbe + " 秒后再尝试");
+      }
+      if (monitorBadge) {
+        monitorBadge.textContent = "冷却中";
+        monitorBadge.className = "badge neutral";
+      }
+      window.setTimeout(poll, checkoutWatcherDelayMS(cooldownRemainingBeforeProbe, 10000));
       return;
     }
     attempts += 1;
@@ -2617,13 +3159,22 @@ function startCheckoutSubmitWatcher(autoFillData) {
       var response = await fetch("/api/checkout/resolve-target", {
         method: "POST",
         headers: buildRequestHeaders(),
-        body: JSON.stringify({
+        body: JSON.stringify(buildAutomationPayload("checkout", {
           opened_url: checkoutURL,
           target_id: latestOpenedCheckoutTargetID,
-          trace_id: ensureAutomationTraceID("checkout"),
-        }),
+        })),
       });
       var data = await response.json();
+      nextPollDelayMS = checkoutWatcherDelayMS(data?.poll_after_ms || data?.retry_after_ms, nextPollDelayMS);
+      if (data?.terminal) {
+        finishAutomationRun(data.page_classification || data.stage || "manual_required", {
+          reason: data.next_action || data.stage || "checkout_resolve_terminal",
+          error: data.error,
+          context: { source: "checkout_submit_watcher" },
+        });
+        finishWatcher();
+        return;
+      }
       if (data?.target?.id || data?.target_id) {
         latestOpenedCheckoutTargetID = data.target?.id || data.target_id;
       }
@@ -2661,8 +3212,10 @@ function startCheckoutSubmitWatcher(autoFillData) {
           page_text: pageText,
           submitted: true,
         });
+        nextPollDelayMS = checkoutWatcherDelayMS(decision.poll_after_ms || decision.retry_after_ms, nextPollDelayMS);
 
         if (decision.ready) {
+          transitionAutomationState("auto_trigger_ready", { reason: decision.reason || "ready", context: { checkoutKey: checkoutKey } });
           if (monitorBadge) {
             monitorBadge.textContent = "自动触发";
             monitorBadge.className = "badge";
@@ -2686,72 +3239,111 @@ function startCheckoutSubmitWatcher(autoFillData) {
                 monitorBadge.textContent = "冷却中";
                 monitorBadge.className = "badge neutral";
               }
+              nextPollDelayMS = checkoutWatcherDelayMS(cooldownRemainingMs, nextPollDelayMS);
             } else {
-            appendCheckoutWatcherEvent("auto-trigger-ready", "条件满足，填写当前 Midtrans GoPay 页面：" + midtransRedirectionAccountID(linkingURL));
-            gopayAutoTriggerRunning = true;
-            try {
-              var fillResult = await fillCurrentMidtransLinkingPage(linkingURL, checkoutURL);
-              if (gopayOutput) setText(gopayOutput, JSON.stringify(fillResult, null, 2));
-              if (fillResult.ok) {
-                gopayMidtransRetryNotBefore = 0;
-                gopayMidtransCooldownNoticeKey = "";
-                gopayAutoTriggeredCheckoutKeys.add(checkoutKey);
-                appendCheckoutWatcherEvent("midtrans-linking-fill", "已填写 +" + (fillResult.country_code || "86") + " / " + (fillResult.phone_number || "18120322232") + " 并提交 Link and pay");
-                if (monitorBadge) {
-                  monitorBadge.textContent = "已提交绑定";
-                  monitorBadge.className = "badge";
-                }
-                startGopayOTPAutoCapture({
-                  target_id: fillResult.cdp_target_id || "",
-                  target_url: fillResult.cdp_target_url || fillResult.target_url || linkingURL,
-                  account_id: fillResult.account_id || midtransRedirectionAccountID(linkingURL),
-                  checkout_url: checkoutURL,
-                });
-                finishWatcher();
-                return;
-              } else {
-                if (midtransPhoneBindingRequired(fillResult)) {
-                  var phoneBindingPrompt = fillResult.voice_prompt || fillResult.browser_result?.voice_prompt || "请解除手机绑定";
-                  var phoneBindingText = fillResult.phone_binding_error_text || fillResult.browser_result?.phone_binding_error_text || "Please use another phone number";
-                  appendCheckoutWatcherEvent("midtrans-phone-binding-required", "检测到手机号不可用：" + phoneBindingText);
-                  setGopayStep("linking", "error", "手机号已绑定或不可用，请先解除手机绑定");
-                  if (gopayBadge) {
-                    setText(gopayBadge, "解绑手机");
-                    gopayBadge.className = "badge error";
-                  }
+              var readyNoticeKey = linkingURL + "|" + Math.floor(Date.now() / 10000);
+              if (readyNoticeKey !== lastAutoTriggerReadyNoticeKey) {
+                lastAutoTriggerReadyNoticeKey = readyNoticeKey;
+                appendCheckoutWatcherEvent("auto-trigger-ready", "条件满足，填写当前 Midtrans GoPay 页面：" + midtransRedirectionAccountID(linkingURL));
+              }
+              gopayAutoTriggerRunning = true;
+              try {
+                var fillResult = await fillCurrentMidtransLinkingPage(linkingURL, checkoutURL);
+                if (gopayOutput) setText(gopayOutput, JSON.stringify(fillResult, null, 2));
+                if (fillResult.ok) {
+                  gopayMidtransRetryNotBefore = 0;
+                  gopayMidtransCooldownNoticeKey = "";
+                  gopayAutoTriggeredCheckoutKeys.add(checkoutKey);
+                  appendCheckoutWatcherEvent("midtrans-linking-fill", "已填写 +" + (fillResult.country_code || "86") + " / " + (fillResult.phone_number || "18120322232") + " 并提交 Link and pay");
                   if (monitorBadge) {
-                    monitorBadge.textContent = "需解绑";
-                    monitorBadge.className = "badge error";
+                    monitorBadge.textContent = "已提交绑定";
+                    monitorBadge.className = "badge";
                   }
-                  announceLuckMailScene("gopay_phone_binding_required_" + (fillResult.phone_number || ""), phoneBindingPrompt);
+                  startGopayOTPAutoCapture({
+                    target_id: fillResult.cdp_target_id || "",
+                    target_url: fillResult.cdp_target_url || fillResult.target_url || linkingURL,
+                    account_id: fillResult.account_id || midtransRedirectionAccountID(linkingURL),
+                    checkout_url: checkoutURL,
+                  });
                   finishWatcher();
                   return;
-                }
-                var retryHint = fillResult.aggressive_retry ? "（保守恢复已开启）" : "";
-                var fillStage = fillResult.stage || fillResult.error || "unknown";
-                var retryAfterMs = Number(fillResult.retry_after_ms || fillResult.cooldown_ms || 0);
-                if (!Number.isFinite(retryAfterMs)) retryAfterMs = 0;
-                if (!retryAfterMs && fillStage === "midtrans_linking_rate_limited") retryAfterMs = 90000;
-                if (!retryAfterMs && (fillStage === "midtrans_linking_blank_shell" || fillStage === "midtrans_linking_loading_stuck")) retryAfterMs = 30000;
-                if (retryAfterMs > 0) {
-                  retryAfterMs = Math.min(Math.max(retryAfterMs, 5000), 120000);
-                  gopayMidtransRetryNotBefore = Date.now() + retryAfterMs;
-                  gopayMidtransCooldownNoticeKey = "";
-                  appendCheckoutWatcherEvent("midtrans-linking-cooldown", "页面处于 " + fillStage + "，冷却 " + Math.ceil(retryAfterMs / 1000) + " 秒后再尝试");
+                } else {
+                  if (midtransPhoneBindingRequired(fillResult)) {
+                    var phoneBindingPrompt = fillResult.voice_prompt || fillResult.browser_result?.voice_prompt || "请解除手机绑定";
+                    var phoneBindingText = fillResult.phone_binding_error_text || fillResult.browser_result?.phone_binding_error_text || "Please use another phone number";
+                    appendCheckoutWatcherEvent("midtrans-phone-binding-required", "检测到手机号不可用：" + phoneBindingText);
+                    setGopayStep("linking", "error", "手机号已绑定或不可用，请先解除手机绑定");
+                    if (gopayBadge) {
+                      setText(gopayBadge, "解绑手机");
+                      gopayBadge.className = "badge error";
+                    }
+                    if (monitorBadge) {
+                      monitorBadge.textContent = "需解绑";
+                      monitorBadge.className = "badge error";
+                    }
+                    announceLuckMailScene("gopay_phone_binding_required_" + (fillResult.phone_number || ""), phoneBindingPrompt);
+                    finishAutomationRun("manual_required_phone_binding", {
+                      reason: "change_or_unbind_phone_number",
+                      error: phoneBindingText,
+                      context: {
+                        source: "midtrans_linking_fill",
+                        phoneNumber: fillResult.phone_number || "",
+                        checkoutKey: checkoutKey,
+                      },
+                    });
+                    finishWatcher();
+                    return;
+                  }
+                  var retryHint = fillResult.aggressive_retry ? "（保守恢复已开启）" : "";
+                  var fillStage = fillResult.stage || fillResult.error || "unknown";
+                  if (fillStage === "midtrans_not_linking_current_state") {
+                    var nonLinkingKey = checkoutKey + "|" + midtransRedirectionAccountID(linkingURL) + "|watch";
+                    if (!midtransNonLinkingWatchKeys.has(nonLinkingKey)) {
+                      midtransNonLinkingWatchKeys.add(nonLinkingKey);
+                      appendCheckoutWatcherEvent("midtrans-not-linking-watch", "当前 Midtrans 页面已离开手机号 linking 状态，转入 GoPay OTP/PIN/Pay now 被动监听");
+                    }
+                    gopayAutoTriggeredCheckoutKeys.add(checkoutKey);
+                    if (monitorBadge) {
+                      monitorBadge.textContent = "监听 PIN";
+                      monitorBadge.className = "badge neutral";
+                    }
+                    startGopayOTPAutoCapture({
+                      target_id: fillResult.cdp_target_id || "",
+                      target_url: fillResult.cdp_target_url || fillResult.target_url || linkingURL,
+                      account_id: fillResult.account_id || midtransRedirectionAccountID(linkingURL),
+                      checkout_url: checkoutURL,
+                    });
+                    finishWatcher();
+                    return;
+                  }
+                  var retryAfterMs = Number(fillResult.retry_after_ms || fillResult.cooldown_ms || 0);
+                  if (!Number.isFinite(retryAfterMs)) retryAfterMs = 0;
+                  if (!retryAfterMs && fillStage === "midtrans_linking_rate_limited") retryAfterMs = 90000;
+                  if (!retryAfterMs && (fillStage === "midtrans_linking_blank_shell" || fillStage === "midtrans_linking_loading_stuck")) retryAfterMs = 30000;
+                  if (retryAfterMs > 0) {
+                    retryAfterMs = Math.min(Math.max(retryAfterMs, 5000), 120000);
+                    gopayMidtransRetryNotBefore = Date.now() + retryAfterMs;
+                    gopayMidtransCooldownNoticeKey = "";
+                    nextPollDelayMS = checkoutWatcherDelayMS(retryAfterMs, nextPollDelayMS);
+                    transitionAutomationState("gopay_linking_cooldown", {
+                      reason: fillStage,
+                      context: { checkoutKey: checkoutKey, retryAfterMs: retryAfterMs },
+                    });
+                    appendCheckoutWatcherEvent("midtrans-linking-cooldown", "页面处于 " + fillStage + "，冷却 " + Math.ceil(retryAfterMs / 1000) + " 秒后再尝试");
+                    if (monitorBadge) {
+                      monitorBadge.textContent = fillStage === "midtrans_linking_rate_limited" ? "已限流" : "加载中";
+                      monitorBadge.className = "badge neutral";
+                    }
+                  }
+                  appendCheckoutWatcherEvent("midtrans-linking-fill", "页面填充未完成：" + fillStage + retryHint);
                   if (monitorBadge) {
-                    monitorBadge.textContent = fillStage === "midtrans_linking_rate_limited" ? "已限流" : "加载中";
+                    monitorBadge.textContent = retryAfterMs > 0 ? "冷却中" : "继续等待";
                     monitorBadge.className = "badge neutral";
                   }
                 }
-                appendCheckoutWatcherEvent("midtrans-linking-fill", "页面填充未完成：" + fillStage + retryHint);
-                if (monitorBadge) {
-                  monitorBadge.textContent = retryAfterMs > 0 ? "冷却中" : "继续等待";
-                  monitorBadge.className = "badge neutral";
-                }
+              } finally {
+                gopayAutoTriggerRunning = false;
               }
-            } finally {
-              gopayAutoTriggerRunning = false;
-            }
             }
           }
           if (gopayAutoTriggeredCheckoutKeys.has(checkoutKey)) return;
@@ -2759,6 +3351,12 @@ function startCheckoutSubmitWatcher(autoFillData) {
 
         if (!decision.ready) {
           appendCheckoutWatcherEvent("auto-trigger-skip", "自动触发检查未通过：" + (decision.reason || "unknown"));
+          if (decision.terminal) {
+            finishAutomationRun(decision.page_classification || "manual_required", {
+              reason: decision.next_action || decision.reason || "auto_trigger_terminal",
+              context: { source: "checkout_submit_watcher", checkoutKey: checkoutKey },
+            });
+          }
           if (monitorBadge) {
             monitorBadge.textContent = "未触发";
             monitorBadge.className = "badge neutral";
@@ -2771,14 +3369,18 @@ function startCheckoutSubmitWatcher(autoFillData) {
       appendCheckoutWatcherEvent("auto-trigger-error", error.message || "自动触发监控失败");
     }
 
-    if (attempts < maxAttempts) {
-      window.setTimeout(poll, 2000);
+    if (!automationRunIsTerminal() && attempts < maxAttempts) {
+      window.setTimeout(poll, nextPollDelayMS);
     } else {
       appendCheckoutWatcherEvent("auto-trigger-timeout", "等待订阅提交超时，未自动触发 GoPay 一键绑定");
       if (monitorBadge) {
         monitorBadge.textContent = "等待超时";
         monitorBadge.className = "badge neutral";
       }
+      finishAutomationRun("manual_required_timeout", {
+        reason: "checkout_submit_timeout",
+        context: { source: "checkout_submit_watcher", checkoutKey: checkoutKey },
+      });
       finishWatcher();
     }
   };
@@ -2792,6 +3394,9 @@ async function runGopayFullLinkPayment(options) {
   if (gopayPaymentFlowRunning) {
     showAutoFillNotice("GoPay 付款进行中", "提示", "当前一键绑定付款流程仍在执行，请等待本次流程完成。", "", "");
     return null;
+  }
+  if (automationRunIsTerminal() || automationRun.state === "idle") {
+    beginAutomationRun("gopay_linking", { reason: triggerSource === "auto-trigger" ? "auto_trigger_gopay" : "manual_gopay_full_link", tracePrefix: "gopay" });
   }
 
   var countryCode = (gopayCountryCode?.value || "86").trim();
@@ -2830,13 +3435,12 @@ async function runGopayFullLinkPayment(options) {
     setGopayStep("linking", "active", "正在提取最新 Session 并生成新的 Plus 结账链路...");
     startGopayOTPAutoCapture({ checkout_url: latestOpenedCheckoutURL || "" });
 
-    var payload = {
+    var payload = buildAutomationPayload("gopay", {
       access_token: accessToken,
       country_code: countryCode,
       phone_number: phoneNumber,
       otp_channel: otpChannel,
-      trace_id: ensureAutomationTraceID("gopay"),
-    };
+    });
     if (otpCode) payload.otp = otpCode;
     if (pinCode) payload.pin = pinCode;
 
@@ -2902,6 +3506,11 @@ async function runGopayFullLinkPayment(options) {
       if (manualStages.length > 0) renderGopayStageResults(manualStages);
     }
 
+    if (data.human_message) {
+      appendCheckoutWatcherEvent("gopay-api-next-action", data.human_message);
+      announceLuckMailScene("gopay_api_" + (data.stage || data.next_action || "next_action"), data.human_message, false);
+    }
+
     if (data.ok) {
       var successText = "GoPay 绑定成功";
       var badgeText = data.reused_existing ? "已复用" : "已绑定";
@@ -2914,7 +3523,10 @@ async function runGopayFullLinkPayment(options) {
       setGopayStep("success", "done", successText);
       if (gopayBadge) { setText(gopayBadge, badgeText); gopayBadge.className = "badge"; }
       setWorkflowButtonState(gopayLinkBtn, "done");
-      if (data.stage === "gopay_complete") await saveGPTPlusSuccessRecord(data);
+      if (data.stage === "gopay_complete") {
+        await saveGPTPlusSuccessRecord(data);
+        releaseGopayAutomationAfterTerminal("save_success_record_and_cleanup");
+      }
     } else if (data.stage === "otp_all_failed") {
       if (gopayBadge) { setText(gopayBadge, "需真实验证码"); gopayBadge.className = "badge error"; }
       setWorkflowButtonState(gopayLinkBtn, "error");
@@ -2944,6 +3556,10 @@ async function runGopayFullLinkPayment(options) {
         "请关闭当前旧支付页，重新生成 OpenAI 结账链接后再触发 GoPay。",
         "error"
       );
+      finishAutomationRun("payment_failed", {
+        reason: "regenerate_checkout",
+        context: { source: "gopay_full_link", stage: data.stage },
+      });
     } else {
       if (gopayBadge) { setText(gopayBadge, "失败"); gopayBadge.className = "badge error"; }
       setWorkflowButtonState(gopayLinkBtn, "error");
@@ -3032,15 +3648,18 @@ const luckmailMailsList = document.querySelector("#luckmailMailsList");
 let latestLuckMailCode = "";
 let luckMailVerificationSinceUnixMS = 0;
 let luckMailCodePollingActive = false;
-let lastVoicePromptKey = "";
-let activeLuckMailVoiceUtterance = null;
 let cachedLuckMailVoices = [];
-let voicePromptPlaybackQueue = Promise.resolve();
 let voicePromptRecentKeys = new Map();
 const luckmailVoicePromptStorageKey = "luckmail_voice_prompt_enabled";
 const luckmailVoiceVolumeStorageKey = "luckmail_voice_prompt_volume";
 const luckmailVoiceRateStorageKey = "luckmail_voice_prompt_rate";
 const voicePromptDedupeWindowMS = 6000;
+const lowPriorityVoicePromptPatterns = [
+  /^继续监听/,
+  /^自动触发判定/,
+  /等待页面响应/,
+  /等待 Pay now 按钮可点击/,
+];
 
 function speechPromptSupported() {
   return "speechSynthesis" in window && "SpeechSynthesisUtterance" in window;
@@ -3057,7 +3676,7 @@ function clampVoiceNumber(value, fallback, min, max) {
 }
 
 function voicePromptVolume() {
-  return clampVoiceNumber(luckmailVoiceVolume?.value, 100, 0, 100);
+  return clampVoiceNumber(luckmailVoiceVolume?.value, 100, 20, 100);
 }
 
 function voicePromptRate() {
@@ -3068,6 +3687,42 @@ function browserVoiceRate() {
   return Math.min(1.8, Math.max(0.5, 1 + voicePromptRate() / 10));
 }
 
+const voicePromptChineseTermReplacements = [
+  [/\bsession\s+json\b/gi, "会话信息"],
+  [/\bbrowser\s+use\b/gi, "浏览器分析"],
+  [/\bchrome\s+cdp\b/gi, "浏览器连接"],
+  [/\bpay\s+now\b/gi, "立即支付"],
+  [/\bgpt\s+plus\b/gi, "订阅服务"],
+  [/\bluck\s*mail\b/gi, "邮箱接码"],
+  [/\bgopay\b/gi, "支付"],
+  [/\bpin\b/gi, "支付密码"],
+  [/\botp\b/gi, "验证码"],
+  [/\btoken\b/gi, "邮箱令牌"],
+  [/\bsub2api\b/gi, "订阅凭证"],
+  [/\bcheckout\b/gi, "结账"],
+  [/\bjson\b/gi, "信息"],
+  [/\bcdp\b/gi, "浏览器连接"],
+];
+
+function replaceVoiceEnglishTermsWithChinese(message) {
+  var text = String(message || "");
+  voicePromptChineseTermReplacements.forEach(function (item) {
+    text = text.replace(item[0], item[1]);
+  });
+  text = text
+    .replace(/支付\s*支付页面/g, "支付页面")
+    .replace(/支付\s*支付/g, "支付")
+    .replace(/按\s*邮箱令牌\s*读取/g, "读取")
+    .replace(/按当前\s*邮箱令牌\s*读取/g, "读取")
+    .replace(/当前\s*邮箱令牌/g, "当前令牌")
+    .replace(/\s+/g, " ")
+    .trim();
+  while (/[\u4e00-\u9fff]\s+[\u4e00-\u9fff]/.test(text)) {
+    text = text.replace(/([\u4e00-\u9fff])\s+([\u4e00-\u9fff])/g, "$1$2");
+  }
+  return text;
+}
+
 function normalizeVoicePromptMessage(message) {
   var text = String(message || "")
     .replace(/<script[^>]*>[\s\S]*?<\/script>|<style[^>]*>[\s\S]*?<\/style>/gi, " ")
@@ -3075,9 +3730,35 @@ function normalizeVoicePromptMessage(message) {
     .replace(/[\u0000-\u001f\u007f-\u009f]/g, " ")
     .replace(/[\u200b-\u200d\ufeff\ufe0e\ufe0f]/gi, "")
     .replace(/[\u{1f000}-\u{1faff}\u2600-\u27bf]/gu, " ");
+  text = replaceVoiceEnglishTermsWithChinese(text);
   text = text.replace(/\s+/g, " ").trim();
   var chars = Array.from(text);
   if (chars.length > 160) text = chars.slice(0, 160).join("");
+  return text;
+}
+
+function isLowPriorityVoicePrompt(message) {
+  var text = normalizeVoicePromptMessage(message);
+  return !!text && lowPriorityVoicePromptPatterns.some(function (pattern) {
+    return pattern.test(text);
+  });
+}
+
+function progressOnlyVoicePromptMessage(message) {
+  var text = normalizeVoicePromptMessage(message);
+  if (!text) return "";
+  var lower = text.toLowerCase();
+  if (/cs_live_|cs_test_|已开始等待支付页订阅提交/.test(text)) return "已开始等待订阅提交。";
+  if (/waiting_for_checkout_submit|自动触发判定/i.test(text)) return "";
+  if (/chrome cdp/i.test(text) && /暂未就绪|not ready/i.test(text)) return "正在等待浏览器连接恢复。";
+  if (/gopay/i.test(text) && /target|waiting/i.test(lower)) return "正在等待支付页面。";
+  if (/浏览器连接/i.test(text) && /暂未就绪|not ready/i.test(text)) return "正在等待浏览器连接恢复。";
+  if (/支付/i.test(text) && /target|waiting/i.test(lower)) return "正在等待支付页面。";
+  text = text.replace(/\b(?:cs_live|cs_test|checkout|trace|token|session)[A-Za-z0-9_\-:]{8,}\b/gi, "");
+  text = text.replace(/https?:\/\/\S+|[A-Za-z0-9_\-]{28,}/g, "");
+  text = replaceVoiceEnglishTermsWithChinese(text);
+  text = text.replace(/\s+/g, " ").trim();
+  if (!/[一-龥]/.test(text)) return "";
   return text;
 }
 
@@ -3132,11 +3813,12 @@ function luckMailVoiceErrorMessage(reason) {
   if (reason === "not-allowed") return "语音被浏览器拦截，请再点一次开关";
   if (reason === "synthesis-failed") return "语音启动失败，请检查系统音量或浏览器语音包";
   if (reason === "audio-busy") return "语音设备忙，请稍后重试";
+  if (reason === "missing-zh-voice") return "未找到可用中文语音，请安装中文语音包";
   return "语音播放失败：" + (reason || "未知错误");
 }
 
 async function speakLuckMailPromptLocally(message) {
-  var speechText = normalizeVoicePromptMessage(message);
+  var speechText = progressOnlyVoicePromptMessage(message);
   if (!speechText) throw new Error("empty voice message");
   var result = await fetchJSONWithTimeout("/api/voice/speak", {
     method: "POST",
@@ -3152,68 +3834,85 @@ async function speakLuckMailPromptLocally(message) {
 function speakLuckMailPromptInBrowser(key, message, force) {
   if (!speechPromptSupported()) {
     setLuckMailVoicePromptStatus("浏览器不支持语音");
-    return false;
+    return Promise.resolve(false);
   }
-  var speechText = normalizeVoicePromptMessage(message);
-  if (!speechText) return false;
+  var speechText = progressOnlyVoicePromptMessage(message);
+  if (!speechText) return Promise.resolve(false);
   var promptKey = String(key || message);
-  if (!force && lastVoicePromptKey === promptKey) return false;
+  if (!force && lastVoicePromptKey === promptKey) return Promise.resolve(false);
   lastVoicePromptKey = promptKey;
-  try {
-    refreshLuckMailVoices();
-    var utterance = new SpeechSynthesisUtterance(speechText);
-    var selectedVoice = selectLuckMailVoice();
-    if (selectedVoice) {
+  return new Promise(function (resolve) {
+    var settled = false;
+    var timer = null;
+    var settle = function (ok, reason) {
+      if (settled) return;
+      settled = true;
+      if (timer) window.clearTimeout(timer);
+      if (activeLuckMailVoiceUtterance === utterance) {
+        activeLuckMailVoiceUtterance = null;
+      }
+      if (!ok && reason) setLuckMailVoicePromptStatus(luckMailVoiceErrorMessage(reason));
+      resolve(!!ok);
+    };
+    var utterance = null;
+    try {
+      refreshLuckMailVoices();
+      utterance = new SpeechSynthesisUtterance(speechText);
+      var selectedVoice = selectLuckMailVoice();
+      if (!selectedVoice) {
+        setLuckMailVoicePromptStatus("未找到可用中文语音，请安装中文语音包");
+        settle(false, "missing-zh-voice");
+        return;
+      }
       utterance.voice = selectedVoice;
       utterance.lang = selectedVoice.lang || "zh-CN";
-    } else {
-      utterance.lang = "zh-CN";
-    }
-    utterance.rate = browserVoiceRate();
-    utterance.pitch = 1;
-    utterance.volume = voicePromptVolume() / 100;
-    utterance.onstart = function () {
-      setLuckMailVoicePromptStatus(speechText);
-    };
-    utterance.onend = function () {
-      if (activeLuckMailVoiceUtterance === utterance) {
-        activeLuckMailVoiceUtterance = null;
-      }
-    };
-    utterance.onerror = function (event) {
-      if (activeLuckMailVoiceUtterance === utterance) {
-        activeLuckMailVoiceUtterance = null;
-      }
-      var reason = event?.error || "unknown";
-      if (reason === "interrupted" || reason === "canceled") return;
-      setLuckMailVoicePromptStatus(luckMailVoiceErrorMessage(reason));
-    };
-    activeLuckMailVoiceUtterance = utterance;
-    window.speechSynthesis.cancel();
-    if (typeof window.speechSynthesis.resume === "function") {
-      window.speechSynthesis.resume();
-    }
-    setLuckMailVoicePromptStatus(speechText);
-    window.speechSynthesis.speak(utterance);
-    window.setTimeout(function () {
-      if (luckmailVoicePromptToggle?.checked && window.speechSynthesis.paused && typeof window.speechSynthesis.resume === "function") {
+      utterance.rate = browserVoiceRate();
+      utterance.pitch = 1;
+      utterance.volume = voicePromptVolume() / 100;
+      utterance.onstart = function () {
+        setLuckMailVoicePromptStatus(speechText);
+      };
+      utterance.onend = function () {
+        settle(true);
+      };
+      utterance.onerror = function (event) {
+        var reason = event?.error || "unknown";
+        if (reason === "interrupted" || reason === "canceled") {
+          settle(false);
+          return;
+        }
+        settle(false, reason);
+      };
+      activeLuckMailVoiceUtterance = utterance;
+      if (typeof window.speechSynthesis.resume === "function") {
         window.speechSynthesis.resume();
       }
-    }, 250);
-    return true;
-  } catch (error) {
-    setLuckMailVoicePromptStatus(luckMailVoiceErrorMessage(error?.message || "未知错误"));
-    return false;
-  }
+      setLuckMailVoicePromptStatus(speechText);
+      window.speechSynthesis.speak(utterance);
+      window.setTimeout(function () {
+        if (luckmailVoicePromptToggle?.checked && window.speechSynthesis.paused && typeof window.speechSynthesis.resume === "function") {
+          window.speechSynthesis.resume();
+        }
+      }, 250);
+      timer = window.setTimeout(function () {
+        settle(true);
+      }, Math.min(18000, Math.max(4500, Array.from(speechText).length * 260)));
+    } catch (error) {
+      settle(false, error?.message || "未知错误");
+    }
+  });
 }
 
 function speakLuckMailPrompt(key, message, force) {
-  var speechText = normalizeVoicePromptMessage(message);
+  var speechText = progressOnlyVoicePromptMessage(message);
   if (!speechText) return false;
   if (!voicePromptEnabled()) return false;
   var promptKey = String(key || speechText);
+  if (!force && isLowPriorityVoicePrompt(speechText)) return false;
+  if (!force && voicePromptPendingKeys.has(promptKey)) return false;
   if (!shouldAnnounceVoicePrompt(promptKey, force, voicePromptDedupeWindowMS)) return false;
   lastVoicePromptKey = promptKey;
+  voicePromptPendingKeys.add(promptKey);
   setLuckMailVoicePromptStatus("中文语音排队中...");
   voicePromptPlaybackQueue = voicePromptPlaybackQueue.catch(function () {}).then(async function () {
     if (!voicePromptEnabled()) return;
@@ -3222,11 +3921,13 @@ function speakLuckMailPrompt(key, message, force) {
       await speakLuckMailPromptLocally(speechText);
       setLuckMailVoicePromptStatus(speechText);
     } catch (error) {
-      var usedBrowserFallback = speakLuckMailPromptInBrowser(promptKey, speechText, true);
+      var usedBrowserFallback = await speakLuckMailPromptInBrowser(promptKey, speechText, true);
       if (!usedBrowserFallback) {
         setLuckMailVoicePromptStatus("本机语音失败：" + (error?.message || "未知错误"));
       }
     }
+  }).finally(function () {
+    voicePromptPendingKeys.delete(promptKey);
   });
   return true;
 }
@@ -3244,7 +3945,7 @@ function restoreLuckMailVoicePromptPreference() {
   if (!luckmailVoicePromptToggle) return;
   try {
     luckmailVoicePromptToggle.checked = window.localStorage?.getItem(luckmailVoicePromptStorageKey) === "1";
-    if (luckmailVoiceVolume) luckmailVoiceVolume.value = String(clampVoiceNumber(window.localStorage?.getItem(luckmailVoiceVolumeStorageKey), 100, 0, 100));
+    if (luckmailVoiceVolume) luckmailVoiceVolume.value = String(clampVoiceNumber(window.localStorage?.getItem(luckmailVoiceVolumeStorageKey), 100, 20, 100));
     if (luckmailVoiceRate) luckmailVoiceRate.value = String(clampVoiceNumber(window.localStorage?.getItem(luckmailVoiceRateStorageKey), 0, -4, 4));
   } catch (_err) {
     luckmailVoicePromptToggle.checked = false;
@@ -3275,6 +3976,7 @@ luckmailVoicePromptToggle?.addEventListener("change", function () {
     if ("speechSynthesis" in window) window.speechSynthesis.cancel();
     activeLuckMailVoiceUtterance = null;
     lastVoicePromptKey = "";
+    voicePromptPendingKeys.clear();
     setLuckMailVoicePromptStatus("未开启");
   }
 });
@@ -3759,6 +4461,9 @@ async function saveGPTPlusSuccessRecord(paymentData) {
     var data = await response.json();
     if (!data.ok) gptPlusSuccessRecordKeys.delete(recordKey);
     appendCheckoutWatcherEvent("gptpls-record", data.ok ? ("已保存 GPT Plus 成功记录：" + (data.file_path || "gptpls") + (data.code_view_url ? " · 验证码查看链接已生成" : "")) : (data.error || "GPT Plus 成功记录保存失败"));
+    if (data.ok) {
+      scheduleCloseIncognitoAfterTerminal("gptplus_success_record_saved", 9000);
+    }
     return data;
   } catch (error) {
     gptPlusSuccessRecordKeys.delete(recordKey);

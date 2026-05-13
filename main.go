@@ -86,6 +86,13 @@ type checkoutRequest struct {
 	CheckoutSession checkoutSession `json:"checkout_session"`
 	GopayLink       gopayLink       `json:"gopay_link"`
 	TraceID         string          `json:"trace_id,omitempty"`
+	RunID           string          `json:"run_id,omitempty"`
+}
+
+const automationContractVersion = "automation-p0-p4-20260511"
+
+func requestAutomationRunID(r *http.Request, bodyRunID string) string {
+	return firstNonEmpty(strings.TrimSpace(bodyRunID), strings.TrimSpace(r.Header.Get("X-Automation-Run-Id")))
 }
 
 type billingDetails struct {
@@ -379,18 +386,28 @@ type gopayAutoTriggerCheckRequest struct {
 	PageText    string `json:"page_text"`
 	Submitted   bool   `json:"submitted"`
 	TraceID     string `json:"trace_id,omitempty"`
+	RunID       string `json:"run_id,omitempty"`
 }
 
 type gopayAutoTriggerDecision struct {
-	OK               bool           `json:"ok"`
-	Stage            string         `json:"stage"`
-	Ready            bool           `json:"ready"`
-	AlreadyTriggered bool           `json:"already_triggered"`
-	CheckoutKey      string         `json:"checkout_key,omitempty"`
-	Reason           string         `json:"reason"`
-	Source           string         `json:"source,omitempty"`
-	TraceID          string         `json:"trace_id,omitempty"`
-	Conditions       map[string]any `json:"conditions"`
+	OK                 bool           `json:"ok"`
+	Stage              string         `json:"stage"`
+	Ready              bool           `json:"ready"`
+	AlreadyTriggered   bool           `json:"already_triggered"`
+	CheckoutKey        string         `json:"checkout_key,omitempty"`
+	Reason             string         `json:"reason"`
+	Source             string         `json:"source,omitempty"`
+	TraceID            string         `json:"trace_id,omitempty"`
+	RunID              string         `json:"run_id,omitempty"`
+	Conditions         map[string]any `json:"conditions"`
+	ContractVersion    string         `json:"contract_version"`
+	PageClassification string         `json:"page_classification"`
+	NextAction         string         `json:"next_action"`
+	HumanMessage       string         `json:"human_message"`
+	Retryable          bool           `json:"retryable"`
+	Terminal           bool           `json:"terminal"`
+	PollAfterMS        int64          `json:"poll_after_ms"`
+	RetryAfterMS       int64          `json:"retry_after_ms,omitempty"`
 }
 
 type gopayOTPRequest struct {
@@ -1165,6 +1182,487 @@ func copyPaymentVoucherFields(voucher map[string]any, source any) {
 	}
 }
 
+type paymentVoucherReplayContext struct {
+	CurrentAccountID          string
+	CurrentCheckoutURL        string
+	CurrentCheckoutSessionID  string
+	CurrentCheckoutKey        string
+	CurrentAccountEmail       string
+	CurrentPaymentReferenceID string
+}
+
+type paymentAuthorizationTamperAttempt struct {
+	Source   string
+	Claims   map[string]any
+	Evidence map[string]any
+	Voucher  map[string]any
+	Context  paymentVoucherReplayContext
+}
+
+type sandboxPaymentAuthorizationAssessRequest struct {
+	Scenario string                                      `json:"scenario,omitempty"`
+	Source   string                                      `json:"source,omitempty"`
+	Claims   map[string]any                              `json:"claims,omitempty"`
+	Evidence map[string]any                              `json:"evidence,omitempty"`
+	Voucher  map[string]any                              `json:"voucher,omitempty"`
+	Context  sandboxPaymentAuthorizationContextRequest   `json:"context,omitempty"`
+	Attempts []sandboxPaymentAuthorizationAttemptRequest `json:"attempts,omitempty"`
+}
+
+type sandboxPaymentAuthorizationAttemptRequest struct {
+	Name     string                                    `json:"name,omitempty"`
+	Scenario string                                    `json:"scenario,omitempty"`
+	Source   string                                    `json:"source,omitempty"`
+	Claims   map[string]any                            `json:"claims,omitempty"`
+	Evidence map[string]any                            `json:"evidence,omitempty"`
+	Voucher  map[string]any                            `json:"voucher,omitempty"`
+	Context  sandboxPaymentAuthorizationContextRequest `json:"context,omitempty"`
+}
+
+type sandboxPaymentAuthorizationContextRequest struct {
+	CurrentAccountID          string `json:"current_account_id,omitempty"`
+	CurrentCheckoutURL        string `json:"current_checkout_url,omitempty"`
+	CurrentCheckoutSessionID  string `json:"current_checkout_session_id,omitempty"`
+	CurrentCheckoutKey        string `json:"current_checkout_key,omitempty"`
+	CurrentAccountEmail       string `json:"current_account_email,omitempty"`
+	CurrentPaymentReferenceID string `json:"current_payment_reference_id,omitempty"`
+}
+
+func paymentVoucherReplayRiskContract(voucher map[string]any, context paymentVoucherReplayContext) map[string]any {
+	contract := map[string]any{
+		"ok":                     false,
+		"stage":                  "payment_voucher_replay_rejected",
+		"authorization_accepted": false,
+		"terminal":               true,
+		"retryable":              false,
+		"risk_level":             "high",
+		"next_action":            "use_current_checkout_authorization",
+		"human_message":          "历史支付凭证只能作为审计证据，不能替换当前账号或 checkout 的支付授权。",
+		"contract_version":       automationContractVersion,
+		"poll_after_ms":          int64(0),
+	}
+	reasons := []string{}
+	if len(voucher) == 0 {
+		reasons = append(reasons, "voucher_missing")
+		contract["risk_reasons"] = reasons
+		return contract
+	}
+
+	voucherAccountID := firstNonEmpty(
+		stringifyJSONValue(voucher["account_id"]),
+		stringifyJSONValue(voucher["snap_account_id"]),
+		stringifyJSONValue(voucher["gopay_account_id"]),
+	)
+	currentAccountID := strings.TrimSpace(context.CurrentAccountID)
+	voucherCheckoutSessionID := firstNonEmpty(
+		stringifyJSONValue(voucher["checkout_session_id"]),
+		sessionIDFromCheckoutURL(stringifyJSONValue(voucher["checkout_url"])),
+		sessionIDFromCheckoutURL(stringifyJSONValue(voucher["checkout_key"])),
+	)
+	currentCheckoutSessionID := firstNonEmpty(
+		strings.TrimSpace(context.CurrentCheckoutSessionID),
+		sessionIDFromCheckoutURL(context.CurrentCheckoutURL),
+		sessionIDFromCheckoutURL(context.CurrentCheckoutKey),
+	)
+	voucherEmail := strings.ToLower(strings.TrimSpace(firstNonEmpty(
+		stringifyJSONValue(voucher["account_email"]),
+		stringifyJSONValue(voucher["email_address"]),
+	)))
+	currentEmail := strings.ToLower(strings.TrimSpace(context.CurrentAccountEmail))
+	paymentReferenceID := firstNonEmpty(
+		stringifyJSONValue(voucher["payment_reference_id"]),
+		stringifyJSONValue(voucher["gopay_payment_reference_id"]),
+		stringifyJSONValue(voucher["reference_id"]),
+	)
+	transactionID := stringifyJSONValue(voucher["transaction_id"])
+
+	if paymentReferenceID == "" && transactionID == "" {
+		reasons = append(reasons, "voucher_missing_payment_identity")
+	}
+	if voucherAccountID == "" {
+		reasons = append(reasons, "voucher_missing_account_binding")
+	} else if currentAccountID != "" && voucherAccountID != currentAccountID {
+		reasons = append(reasons, "account_id_mismatch")
+	}
+	if voucherCheckoutSessionID == "" {
+		reasons = append(reasons, "voucher_missing_checkout_binding")
+	} else if currentCheckoutSessionID != "" && voucherCheckoutSessionID != currentCheckoutSessionID {
+		reasons = append(reasons, "checkout_session_mismatch")
+	}
+	if voucherEmail != "" && currentEmail != "" && voucherEmail != currentEmail {
+		reasons = append(reasons, "account_email_mismatch")
+	}
+
+	sensitiveFields := []string{}
+	for _, key := range []string{"pin", "payment_pin", "otp", "token", "payment_token", "gopay_payment_pin_token", "access_token", "refresh_token"} {
+		if value, exists := voucher[key]; exists && stringifyJSONValue(value) != "" {
+			sensitiveFields = append(sensitiveFields, key)
+		}
+	}
+	if len(sensitiveFields) > 0 {
+		reasons = append(reasons, "voucher_contains_sensitive_material")
+		contract["sensitive_fields_present"] = sensitiveFields
+	}
+	if len(reasons) == 0 {
+		reasons = append(reasons, "voucher_is_audit_evidence_only")
+	}
+
+	contract["risk_reasons"] = reasons
+	contract["payment_identity_present"] = paymentReferenceID != "" || transactionID != ""
+	contract["account_binding_present"] = voucherAccountID != ""
+	contract["checkout_binding_present"] = voucherCheckoutSessionID != ""
+	contract["account_id_matches"] = voucherAccountID != "" && currentAccountID != "" && voucherAccountID == currentAccountID
+	contract["checkout_session_matches"] = voucherCheckoutSessionID != "" && currentCheckoutSessionID != "" && voucherCheckoutSessionID == currentCheckoutSessionID
+	contract["payment_reference_matches_current"] = paymentReferenceID != "" && context.CurrentPaymentReferenceID != "" && paymentReferenceID == context.CurrentPaymentReferenceID
+	return contract
+}
+
+func paymentAuthorizationTamperRiskContract(attempt paymentAuthorizationTamperAttempt) map[string]any {
+	source := strings.ToLower(strings.TrimSpace(attempt.Source))
+	if source == "" {
+		source = "unknown"
+	}
+	contract := map[string]any{
+		"ok":                       false,
+		"stage":                    "payment_authorization_tamper_rejected",
+		"authorization_accepted":   false,
+		"accepted_authority":       false,
+		"source":                   source,
+		"terminal":                 true,
+		"retryable":                false,
+		"risk_level":               "high",
+		"next_action":              "use_current_checkout_authorization",
+		"human_message":            "当前支付授权必须来自本轮 checkout 的服务端状态，客户端 evidence、历史日志和旧 voucher 均不能作为授权。",
+		"contract_version":         automationContractVersion,
+		"poll_after_ms":            int64(0),
+		"trusted_authority_needed": "current_checkout_server_state",
+	}
+	reasons := []string{}
+
+	if source != "current_checkout_server_state" {
+		reasons = append(reasons, "untrusted_authorization_source")
+	}
+	if clientClaimsPaymentSuccess(attempt.Claims) {
+		reasons = append(reasons, "client_claimed_payment_success")
+	}
+	if clientClaimsPaymentSuccess(attempt.Evidence) {
+		reasons = append(reasons, "client_evidence_claimed_payment_success")
+	}
+	if len(attempt.Evidence) > 0 {
+		reasons = append(reasons, "client_evidence_not_authoritative")
+		if localEvidenceValuePresent(attempt.Evidence, "checkoutWorkbenchPaymentEvidence") || localEvidenceValuePresent(attempt.Evidence, "__checkoutWorkbenchPaymentEvidence") {
+			reasons = append(reasons, "local_evidence_injection_detected")
+		}
+	}
+	if len(attempt.Voucher) > 0 {
+		voucherContract := paymentVoucherReplayRiskContract(attempt.Voucher, attempt.Context)
+		contract["voucher_replay_contract"] = voucherContract
+		for _, reason := range stringSliceFromAny(voucherContract["risk_reasons"]) {
+			reasons = append(reasons, reason)
+		}
+	} else {
+		reasons = append(reasons, "server_payment_voucher_missing")
+	}
+	if len(reasons) == 0 {
+		reasons = append(reasons, "authorization_not_backed_by_current_checkout")
+	}
+	contract["risk_reasons"] = uniqueStrings(reasons)
+	return contract
+}
+
+func localEvidenceValuePresent(values map[string]any, key string) bool {
+	value, exists := values[key]
+	return exists && value != nil
+}
+
+func clientClaimsPaymentSuccess(values map[string]any) bool {
+	if len(values) == 0 {
+		return false
+	}
+	for _, key := range []string{"authorization_accepted", "payment_completed", "subscription_active", "checkout_complete"} {
+		if boolMapValue(values, key) {
+			return true
+		}
+	}
+	stage := strings.ToLower(firstNonEmpty(
+		stringifyJSONValue(values["stage"]),
+		stringifyJSONValue(values["payment_stage"]),
+		stringifyJSONValue(values["page_classification"]),
+	))
+	if stage == "gopay_complete" || stage == "terminal_after_payment" || stage == "payment_completed" || stage == "checkout_complete" {
+		return true
+	}
+	status := strings.ToLower(firstNonEmpty(
+		stringifyJSONValue(values["status"]),
+		stringifyJSONValue(values["payment_status"]),
+		stringifyJSONValue(values["transaction_status"]),
+	))
+	return status == "paid" || status == "settlement" || status == "capture" || status == "succeeded" || status == "success"
+}
+
+func stringSliceFromAny(value any) []string {
+	switch typed := value.(type) {
+	case []string:
+		return typed
+	case []any:
+		values := make([]string, 0, len(typed))
+		for _, item := range typed {
+			if text := stringifyJSONValue(item); text != "" {
+				values = append(values, text)
+			}
+		}
+		return values
+	default:
+		return nil
+	}
+}
+
+func uniqueStrings(values []string) []string {
+	if len(values) == 0 {
+		return nil
+	}
+	seen := make(map[string]struct{}, len(values))
+	unique := make([]string, 0, len(values))
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			continue
+		}
+		if _, exists := seen[value]; exists {
+			continue
+		}
+		seen[value] = struct{}{}
+		unique = append(unique, value)
+	}
+	return unique
+}
+
+func defaultSandboxPaymentAuthorizationContext() paymentVoucherReplayContext {
+	return paymentVoucherReplayContext{
+		CurrentAccountID:          "mock-account-current",
+		CurrentCheckoutURL:        "https://mock.checkout.local/checkout/openai_llc/cs_mock_current",
+		CurrentCheckoutSessionID:  "cs_mock_current",
+		CurrentCheckoutKey:        "cs_mock_current",
+		CurrentAccountEmail:       "current@example.test",
+		CurrentPaymentReferenceID: "pay-ref-current",
+	}
+}
+
+func (req sandboxPaymentAuthorizationContextRequest) mergeInto(base paymentVoucherReplayContext) paymentVoucherReplayContext {
+	if value := strings.TrimSpace(req.CurrentAccountID); value != "" {
+		base.CurrentAccountID = value
+	}
+	if value := strings.TrimSpace(req.CurrentCheckoutURL); value != "" {
+		base.CurrentCheckoutURL = value
+	}
+	if value := strings.TrimSpace(req.CurrentCheckoutSessionID); value != "" {
+		base.CurrentCheckoutSessionID = value
+	}
+	if value := strings.TrimSpace(req.CurrentCheckoutKey); value != "" {
+		base.CurrentCheckoutKey = value
+	}
+	if value := strings.TrimSpace(req.CurrentAccountEmail); value != "" {
+		base.CurrentAccountEmail = value
+	}
+	if value := strings.TrimSpace(req.CurrentPaymentReferenceID); value != "" {
+		base.CurrentPaymentReferenceID = value
+	}
+	return base
+}
+
+func (req sandboxPaymentAuthorizationAssessRequest) hasDirectAttempt() bool {
+	return strings.TrimSpace(req.Source) != "" || len(req.Claims) > 0 || len(req.Evidence) > 0 || len(req.Voucher) > 0
+}
+
+func sandboxPaymentAuthorizationAttemptFixtures(scenario string, context paymentVoucherReplayContext) ([]sandboxPaymentAuthorizationAttemptRequest, error) {
+	scenario = strings.ToLower(strings.TrimSpace(scenario))
+	if scenario == "" {
+		scenario = "full_flow"
+	}
+	forged := sandboxPaymentAuthorizationAttemptRequest{
+		Name:     "forged_payment_authorization",
+		Scenario: "forged_payment_authorization",
+		Source:   "manual_payload",
+		Claims: map[string]any{
+			"authorization_accepted": true,
+			"stage":                  "gopay_complete",
+		},
+	}
+	localEvidence := sandboxPaymentAuthorizationAttemptRequest{
+		Name:     "local_evidence_injection",
+		Scenario: "local_evidence_injection",
+		Source:   "client_local_storage",
+		Evidence: map[string]any{
+			"checkoutWorkbenchPaymentEvidence": map[string]any{
+				"checkout_session_id": context.CurrentCheckoutSessionID,
+				"payment_completed":   true,
+			},
+			"payment_completed": true,
+		},
+	}
+	crossAccount := sandboxPaymentAuthorizationAttemptRequest{
+		Name:     "cross_account_voucher_injection",
+		Scenario: "cross_account_voucher_injection",
+		Source:   "legacy_voucher",
+		Voucher: map[string]any{
+			"payment_reference_id": "pay-ref-old-account",
+			"account_id":           "mock-account-old",
+			"checkout_url":         "https://mock.checkout.local/checkout/openai_llc/cs_mock_old_account",
+		},
+	}
+	oldCheckout := sandboxPaymentAuthorizationAttemptRequest{
+		Name:     "old_checkout_replay",
+		Scenario: "old_checkout_replay",
+		Source:   "old_checkout",
+		Voucher: map[string]any{
+			"payment_reference_id": "pay-ref-old-checkout",
+			"account_id":           context.CurrentAccountID,
+			"checkout_session_id":  "cs_mock_old_checkout",
+		},
+	}
+	switch scenario {
+	case "full_flow", "all", "mock_full_flow":
+		return []sandboxPaymentAuthorizationAttemptRequest{forged, localEvidence, crossAccount, oldCheckout}, nil
+	case "forged_payment_authorization", "forged_authorization", "manual_payload":
+		return []sandboxPaymentAuthorizationAttemptRequest{forged}, nil
+	case "local_evidence_injection", "client_local_storage", "window_evidence":
+		return []sandboxPaymentAuthorizationAttemptRequest{localEvidence}, nil
+	case "cross_account_voucher_injection", "cross_account", "legacy_voucher":
+		return []sandboxPaymentAuthorizationAttemptRequest{crossAccount}, nil
+	case "old_checkout_replay", "old_checkout":
+		return []sandboxPaymentAuthorizationAttemptRequest{oldCheckout}, nil
+	default:
+		return nil, fmt.Errorf("unknown sandbox payment authorization scenario %q", scenario)
+	}
+}
+
+func sandboxPaymentAuthorizationAttempts(req sandboxPaymentAuthorizationAssessRequest, context paymentVoucherReplayContext) ([]sandboxPaymentAuthorizationAttemptRequest, string, error) {
+	if len(req.Attempts) > 0 {
+		return req.Attempts, "custom_attempts", nil
+	}
+	if req.hasDirectAttempt() {
+		name := strings.TrimSpace(req.Scenario)
+		if name == "" {
+			name = "custom_attempt"
+		}
+		return []sandboxPaymentAuthorizationAttemptRequest{{
+			Name:     name,
+			Scenario: name,
+			Source:   req.Source,
+			Claims:   req.Claims,
+			Evidence: req.Evidence,
+			Voucher:  req.Voucher,
+			Context:  req.Context,
+		}}, name, nil
+	}
+	scenario := strings.TrimSpace(req.Scenario)
+	attempts, err := sandboxPaymentAuthorizationAttemptFixtures(scenario, context)
+	if err != nil {
+		return nil, "", err
+	}
+	if scenario == "" {
+		scenario = "full_flow"
+	}
+	return attempts, strings.ToLower(scenario), nil
+}
+
+func sandboxPaymentAuthorizationAttemptFromRequest(req sandboxPaymentAuthorizationAttemptRequest, defaultContext paymentVoucherReplayContext) paymentAuthorizationTamperAttempt {
+	context := req.Context.mergeInto(defaultContext)
+	return paymentAuthorizationTamperAttempt{
+		Source:   req.Source,
+		Claims:   req.Claims,
+		Evidence: req.Evidence,
+		Voucher:  req.Voucher,
+		Context:  context,
+	}
+}
+
+func sandboxPaymentAuthorizationContextSummary(context paymentVoucherReplayContext) map[string]any {
+	return map[string]any{
+		"current_account_id":           context.CurrentAccountID,
+		"current_checkout_session_id":  firstNonEmpty(context.CurrentCheckoutSessionID, sessionIDFromCheckoutURL(context.CurrentCheckoutURL), sessionIDFromCheckoutURL(context.CurrentCheckoutKey)),
+		"current_payment_reference_id": context.CurrentPaymentReferenceID,
+		"current_account_email_domain": emailDomain(context.CurrentAccountEmail),
+	}
+}
+
+func emailDomain(email string) string {
+	email = strings.TrimSpace(strings.ToLower(email))
+	if at := strings.LastIndex(email, "@"); at >= 0 && at+1 < len(email) {
+		return email[at+1:]
+	}
+	return ""
+}
+
+func assessSandboxPaymentAuthorization(req sandboxPaymentAuthorizationAssessRequest) (map[string]any, error) {
+	context := req.Context.mergeInto(defaultSandboxPaymentAuthorizationContext())
+	attempts, scenario, err := sandboxPaymentAuthorizationAttempts(req, context)
+	if err != nil {
+		return nil, err
+	}
+	results := make([]map[string]any, 0, len(attempts))
+	acceptedCount := 0
+	rejectedCount := 0
+	allReasons := []string{}
+	for i, attemptReq := range attempts {
+		name := strings.TrimSpace(firstNonEmpty(attemptReq.Name, attemptReq.Scenario))
+		if name == "" {
+			name = fmt.Sprintf("attempt_%d", i+1)
+		}
+		attempt := sandboxPaymentAuthorizationAttemptFromRequest(attemptReq, context)
+		contract := paymentAuthorizationTamperRiskContract(attempt)
+		accepted := boolJSONValue(contract["authorization_accepted"])
+		if accepted {
+			acceptedCount++
+		} else {
+			rejectedCount++
+		}
+		reasons := stringSliceFromAny(contract["risk_reasons"])
+		allReasons = append(allReasons, reasons...)
+		results = append(results, map[string]any{
+			"name":                   name,
+			"scenario":               firstNonEmpty(strings.TrimSpace(attemptReq.Scenario), name),
+			"source":                 firstNonEmpty(strings.TrimSpace(attempt.Source), "unknown"),
+			"authorization_accepted": accepted,
+			"risk_reasons":           reasons,
+			"contract":               contract,
+		})
+	}
+	allRejected := acceptedCount == 0
+	return map[string]any{
+		"ok":                       true,
+		"stage":                    "payment_authorization_sandbox_assessed",
+		"sandbox":                  true,
+		"mode":                     "mock",
+		"scenario":                 scenario,
+		"scenario_count":           len(results),
+		"accepted_count":           acceptedCount,
+		"rejected_count":           rejectedCount,
+		"all_rejected":             allRejected,
+		"authorization_accepted":   false,
+		"accepted_authority":       false,
+		"payment_action_executed":  false,
+		"real_checkout_touched":    false,
+		"real_credential_used":     false,
+		"trusted_authority_needed": "current_checkout_server_state",
+		"risk_reasons":             uniqueStrings(allReasons),
+		"mock_context":             sandboxPaymentAuthorizationContextSummary(context),
+		"mock_checkout": map[string]any{
+			"checkout_session_id": firstNonEmpty(context.CurrentCheckoutSessionID, sessionIDFromCheckoutURL(context.CurrentCheckoutURL), sessionIDFromCheckoutURL(context.CurrentCheckoutKey)),
+			"checkout_url":        context.CurrentCheckoutURL,
+			"checkout_key":        context.CurrentCheckoutKey,
+		},
+		"mock_voucher_policy": "audit_evidence_only",
+		"scenarios":           results,
+		"contract_version":    automationContractVersion,
+		"terminal":            true,
+		"retryable":           false,
+		"next_action":         "keep_sandbox_or_use_official_test_merchant",
+		"human_message":       "本次只执行本地 mock/sandbox 支付授权篡改评估，没有触碰真实支付页、真实凭证或真实 checkout 授权。",
+		"poll_after_ms":       int64(0),
+	}, nil
+}
+
 func sanitizeAuditValue(value any) any {
 	switch typed := value.(type) {
 	case map[string]any:
@@ -1293,6 +1791,7 @@ func main() {
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/health", handleHealth)
+	mux.HandleFunc("/api/sandbox/payment-authorization/assess", handleSandboxPaymentAuthorizationAssess)
 	mux.HandleFunc("/api/voice/speak", handleVoiceSpeak)
 	mux.HandleFunc("/api/checkout", handleCheckout)
 	mux.HandleFunc("/api/checkout/start", handleCheckout)
@@ -1324,6 +1823,7 @@ func main() {
 	mux.HandleFunc("/api/checkout/resolve-target", handleCheckoutResolveTarget)
 	mux.HandleFunc("/api/checkout/auto-fill", handleCheckoutAutoFill)
 	mux.HandleFunc("/api/checkout/payment-method-select", handleCheckoutPaymentMethodSelect)
+	mux.HandleFunc("/api/checkout/authorized-subscribe-click", handleCheckoutAuthorizedSubscribeClick)
 	mux.HandleFunc("/api/perf/client", handleClientPerformanceLog)
 	mux.Handle("/", staticAssetHandler(staticFiles))
 
@@ -1380,13 +1880,9 @@ func staticAssetHandler(staticFiles fs.FS) http.Handler {
 			contentType = http.DetectContentType(data)
 		}
 		w.Header().Set("Content-Type", contentType)
-		if fileName == "index.html" || ext == ".html" {
-			w.Header().Set("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
-			w.Header().Set("Pragma", "no-cache")
-			w.Header().Set("Expires", "0")
-		} else {
-			w.Header().Set("Cache-Control", "public, max-age=86400")
-		}
+		w.Header().Set("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
+		w.Header().Set("Pragma", "no-cache")
+		w.Header().Set("Expires", "0")
 		serveStaticBytes(w, r, data)
 	})
 }
@@ -1431,6 +1927,39 @@ func handleHealth(w http.ResponseWriter, r *http.Request) {
 		"status": "ok",
 		"time":   time.Now().Format(time.RFC3339),
 	})
+}
+
+func handleSandboxPaymentAuthorizationAssess(w http.ResponseWriter, r *http.Request) {
+	if !requireLocalSettingsAccess(w, r) {
+		return
+	}
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	defer r.Body.Close()
+
+	var req sandboxPaymentAuthorizationAssessRequest
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req); err != nil && !errors.Is(err, io.EOF) {
+		writeJSON(w, http.StatusBadRequest, map[string]any{
+			"ok":               false,
+			"stage":            "payment_authorization_sandbox_invalid_request",
+			"error":            "invalid json",
+			"contract_version": automationContractVersion,
+		})
+		return
+	}
+	result, err := assessSandboxPaymentAuthorization(req)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{
+			"ok":               false,
+			"stage":            "payment_authorization_sandbox_invalid_request",
+			"error":            err.Error(),
+			"contract_version": automationContractVersion,
+		})
+		return
+	}
+	writeJSON(w, http.StatusOK, result)
 }
 
 type voiceSpeakRequest struct {
@@ -1495,6 +2024,10 @@ func handleVoiceSpeak(w http.ResponseWriter, r *http.Request) {
 
 func normalizeVoiceSpeakMessage(message string) string {
 	message = htmlTextToPlain(message)
+	message = normalizeProgressVoiceMessage(message)
+	if message == "" {
+		return ""
+	}
 	var builder strings.Builder
 	for _, r := range message {
 		switch {
@@ -1519,6 +2052,84 @@ func normalizeVoiceSpeakMessage(message string) string {
 	return message
 }
 
+var voiceLongIdentifierPattern = regexp.MustCompile(`(?i)\b(?:cs_live|cs_test|checkout|trace|token|session)[A-Za-z0-9_\-:]{8,}\b|https?://\S+|[A-Za-z0-9_\-]{28,}`)
+var voiceCJKSpacePattern = regexp.MustCompile(`([\p{Han}])\s+([\p{Han}])`)
+
+var voiceChineseTermReplacements = []struct {
+	Pattern     *regexp.Regexp
+	Replacement string
+}{
+	{regexp.MustCompile(`(?i)\bsession\s+json\b`), "会话信息"},
+	{regexp.MustCompile(`(?i)\bbrowser\s+use\b`), "浏览器分析"},
+	{regexp.MustCompile(`(?i)\bchrome\s+cdp\b`), "浏览器连接"},
+	{regexp.MustCompile(`(?i)\bpay\s+now\b`), "立即支付"},
+	{regexp.MustCompile(`(?i)\bgpt\s+plus\b`), "订阅服务"},
+	{regexp.MustCompile(`(?i)\bluck\s*mail\b`), "邮箱接码"},
+	{regexp.MustCompile(`(?i)\bgopay\b`), "支付"},
+	{regexp.MustCompile(`(?i)\bpin\b`), "支付密码"},
+	{regexp.MustCompile(`(?i)\botp\b`), "验证码"},
+	{regexp.MustCompile(`(?i)\btoken\b`), "邮箱令牌"},
+	{regexp.MustCompile(`(?i)\bsub2api\b`), "订阅凭证"},
+	{regexp.MustCompile(`(?i)\bcheckout\b`), "结账"},
+	{regexp.MustCompile(`(?i)\bjson\b`), "信息"},
+	{regexp.MustCompile(`(?i)\bcdp\b`), "浏览器连接"},
+}
+
+func normalizeProgressVoiceMessage(message string) string {
+	message = strings.TrimSpace(strings.Join(strings.Fields(message), " "))
+	if message == "" {
+		return ""
+	}
+	lower := strings.ToLower(message)
+	switch {
+	case strings.Contains(lower, "cs_live_") || strings.Contains(lower, "cs_test_") || strings.Contains(message, "已开始等待支付页订阅提交"):
+		return "已开始等待订阅提交。"
+	case strings.Contains(lower, "waiting_for_checkout_submit") || strings.Contains(message, "自动触发判定"):
+		return ""
+	case strings.Contains(lower, "chrome cdp") && (strings.Contains(message, "暂未就绪") || strings.Contains(lower, "not ready")):
+		return "正在等待浏览器连接恢复。"
+	case strings.Contains(lower, "gopay") && strings.Contains(lower, "target") && strings.Contains(lower, "waiting"):
+		return "正在等待支付页面。"
+	}
+	message = voiceLongIdentifierPattern.ReplaceAllString(message, "")
+	message = replaceVoiceEnglishTermsWithChinese(message)
+	message = strings.TrimSpace(strings.Join(strings.Fields(message), " "))
+	message = removeVoiceCJKSpaces(message)
+	if message == "" {
+		return ""
+	}
+	return message
+}
+
+func replaceVoiceEnglishTermsWithChinese(message string) string {
+	message = strings.TrimSpace(message)
+	if message == "" {
+		return ""
+	}
+	for _, item := range voiceChineseTermReplacements {
+		message = item.Pattern.ReplaceAllString(message, item.Replacement)
+	}
+	replacer := strings.NewReplacer(
+		"支付 支付页面", "支付页面",
+		"支付支付页面", "支付页面",
+		"支付 支付", "支付",
+		"支付支付", "支付",
+		"按 邮箱令牌 读取", "读取",
+		"按当前 邮箱令牌 读取", "读取",
+		"当前 邮箱令牌", "当前令牌",
+	)
+	return strings.TrimSpace(replacer.Replace(message))
+}
+
+func removeVoiceCJKSpaces(message string) string {
+	previous := ""
+	for message != previous {
+		previous = message
+		message = voiceCJKSpacePattern.ReplaceAllString(message, "$1$2")
+	}
+	return message
+}
+
 func isDecorativeVoiceRune(r rune) bool {
 	if r >= 0xFE00 && r <= 0xFE0F {
 		return true
@@ -1536,8 +2147,8 @@ func normalizeVoiceSpeakVolume(volume *int) int {
 	if volume == nil {
 		return 100
 	}
-	if *volume < 0 {
-		return 0
+	if *volume < 20 {
+		return 20
 	}
 	if *volume > 100 {
 		return 100
@@ -1560,7 +2171,7 @@ func normalizeVoiceSpeakRate(rate *int) int {
 
 func localVoiceEngine() string {
 	if runtime.GOOS == "windows" {
-		return "windows_system_speech"
+		return "windows_sapi_chinese"
 	}
 	return "unsupported_" + runtime.GOOS
 }
@@ -1599,7 +2210,7 @@ func speakLocalVoice(ctx context.Context, message string, options voiceSpeakOpti
 
 func windowsSpeechPowerShellScript() string {
 	return `$ErrorActionPreference = 'Stop'
-Add-Type -AssemblyName System.Speech
+try { [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false) } catch {}
 $text = [Environment]::GetEnvironmentVariable('CHECKOUT_WORKBENCH_TTS_TEXT')
 if ([string]::IsNullOrWhiteSpace($text)) { throw 'empty_text' }
 $volume = 100
@@ -1616,17 +2227,60 @@ if (-not [string]::IsNullOrWhiteSpace($rateRaw)) {
 }
 if ($rate -lt -10) { $rate = -10 }
 if ($rate -gt 10) { $rate = 10 }
-$synth = New-Object System.Speech.Synthesis.SpeechSynthesizer
+$voice = $null
 try {
-  $synth.Volume = $volume
-  $synth.Rate = $rate
+  $voice = New-Object -ComObject SAPI.SpVoice
+  $tokens = $voice.GetVoices()
+  $selected = $null
+  for ($i = 0; $i -lt $tokens.Count; $i++) {
+    $token = $tokens.Item($i)
+    $language = ''
+    $name = ''
+    $description = ''
+    try { $language = [string]$token.GetAttribute('Language') } catch {}
+    try { $name = [string]$token.GetAttribute('Name') } catch {}
+    try { $description = [string]$token.GetDescription() } catch {}
+    $voiceMeta = ($language + ' ' + $name + ' ' + $description)
+    if ($language -match '(^|;)804($|;)' -or $voiceMeta -match '(?i)Chinese|Mandarin|Huihui|中文|普通话|简体') {
+      $selected = $token
+      break
+    }
+  }
+  if ($null -eq $selected) { throw 'zh_voice_not_found' }
+  $selectedDescription = ''
+  try { $selectedDescription = [string]$selected.GetDescription() } catch {}
   try {
-    $culture = [System.Globalization.CultureInfo]::GetCultureInfo('zh-CN')
-    $synth.SelectVoiceByHints([System.Speech.Synthesis.VoiceGender]::NotSet, [System.Speech.Synthesis.VoiceAge]::NotSet, 0, $culture)
-  } catch {}
-  $synth.Speak($text)
+    $tokenId = [string]$selected.Id
+    if ($tokenId -like 'HKEY_LOCAL_MACHINE\*') {
+      $registryPath = 'Registry::' + $tokenId
+      $voiceConfig = Get-ItemProperty -LiteralPath $registryPath -ErrorAction SilentlyContinue
+      foreach ($propertyName in @('VoicePath', 'LangDataPath')) {
+        $configuredPath = [string]$voiceConfig.$propertyName
+        if (-not [string]::IsNullOrWhiteSpace($configuredPath)) {
+          $windowsRoot = $env:WINDIR
+          if ([string]::IsNullOrWhiteSpace($windowsRoot)) { $windowsRoot = $env:SystemRoot }
+          if ([string]::IsNullOrWhiteSpace($windowsRoot)) { $windowsRoot = 'C:\Windows' }
+          $expandedPath = $configuredPath.Replace('%windir%', $windowsRoot).Replace('%WINDIR%', $windowsRoot)
+          $expandedPath = [Environment]::ExpandEnvironmentVariables($expandedPath)
+          if (-not (Test-Path -LiteralPath $expandedPath)) {
+            throw ('zh_voice_files_missing: voice={0}; {1}={2}' -f $selectedDescription, $propertyName, $expandedPath)
+          }
+        }
+      }
+    }
+  } catch {
+    if ($_.Exception.Message -like 'zh_voice_files_missing:*') { throw }
+  }
+  $voice.Voice = $selected
+  $voice.Volume = $volume
+  $voice.Rate = $rate
+  try {
+    [void]$voice.Speak($text)
+  } catch {
+    throw ('zh_voice_speak_failed: hresult=0x{0:X8}; voice={1}; message={2}' -f ($_.Exception.HResult -band 0xffffffff), $selectedDescription, $_.Exception.Message)
+  }
 } finally {
-  if ($synth -ne $null) { $synth.Dispose() }
+  if ($voice -ne $null) { [void][System.Runtime.InteropServices.Marshal]::ReleaseComObject($voice) }
 }`
 }
 
@@ -5034,7 +5688,54 @@ func dispatchCDPKeyboardPIN(conn *websocket.Conn, rawFocusRect any, pin string) 
 		}
 		time.Sleep(55 * time.Millisecond)
 	}
+	time.Sleep(180 * time.Millisecond)
+	enterBase := map[string]any{
+		"key":                   "Enter",
+		"code":                  "Enter",
+		"windowsVirtualKeyCode": 13,
+		"nativeVirtualKeyCode":  13,
+		"unmodifiedText":        "\r",
+	}
+	enterDown := cloneStringAnyMap(enterBase)
+	enterDown["type"] = "rawKeyDown"
+	if _, err := sendCDPCommandWithID(conn, atomic.AddInt64(&cdpCommandCounter, 1), "Input.dispatchKeyEvent", enterDown); err != nil {
+		return err
+	}
+	enterUp := cloneStringAnyMap(enterBase)
+	enterUp["type"] = "keyUp"
+	if _, err := sendCDPCommandWithID(conn, atomic.AddInt64(&cdpCommandCounter, 1), "Input.dispatchKeyEvent", enterUp); err != nil {
+		return err
+	}
 	return nil
+}
+
+func markGopayCDPPINSubmitted(conn *websocket.Conn, result map[string]any) {
+	if conn == nil || result == nil {
+		return
+	}
+	stage := stringifyJSONValue(result["pin_stage"])
+	if stage != "binding" && stage != "payment" {
+		return
+	}
+	actionScope := stringifyJSONValue(result["cdp_url_host"]) + stringifyJSONValue(result["cdp_url_path"])
+	if actionScope == "" {
+		return
+	}
+	prefix := "gopay_cdp_binding_pin_submitted_at_"
+	field := "binding_pin_submitted_at"
+	if stage == "payment" {
+		prefix = "gopay_cdp_payment_pin_submitted_at_"
+		field = "payment_pin_submitted_at"
+	}
+	now := time.Now().UnixMilli()
+	key := prefix + actionScope
+	script := fmt.Sprintf(`(() => { try { window.sessionStorage?.setItem(%q, String(Date.now())); return "ok"; } catch (_err) { return "error"; } })()`, key)
+	if contextID, ok := numberFromAny(result["execution_context_id"]); ok && contextID > 0 {
+		_, _ = executeCDPScriptInContext(conn, script, int(contextID))
+	} else {
+		_, _ = executeCDPScript(conn, script)
+	}
+	result[field] = now
 }
 
 func cloneStringAnyMap(in map[string]any) map[string]any {
@@ -5417,8 +6118,23 @@ func annotateGopayCDPContextResult(result map[string]any, ctx gopayCDPExecutionC
 	result["default_context_has_pin_field"] = boolMapValue(defaultResult, "has_pin_field")
 }
 
-func executeGopayCDPFlowScript(conn *websocket.Conn, script string) (string, error) {
-	defaultJSON, err := executeCDPScript(conn, script)
+func gopayCDPFlowDefaultActionNeeded(result map[string]any) bool {
+	if result == nil {
+		return false
+	}
+	stage := stringifyJSONValue(result["page_stage"])
+	autoActionStage := stringifyJSONValue(result["auto_action_stage"])
+	return strings.HasPrefix(stage, "pin_entry_") ||
+		boolMapValue(result, "has_pin_field") ||
+		boolMapValue(result, "pay_now_button_detected") ||
+		stage == "pay_now_ready_observed" ||
+		stage == "pay_now_post_click_wait" ||
+		autoActionStage == "pay_now_ready_observed" ||
+		autoActionStage == "balance_ready_observed"
+}
+
+func executeGopayCDPFlowScript(conn *websocket.Conn, probeScript string, actionScript string) (string, error) {
+	defaultJSON, err := executeCDPScript(conn, probeScript)
 	if err != nil {
 		return "", err
 	}
@@ -5448,11 +6164,13 @@ func executeGopayCDPFlowScript(conn *websocket.Conn, script string) (string, err
 	}
 
 	contextErrors := make([]string, 0, 3)
+	var selectedContext *gopayCDPExecutionContext
+	var selectedContextProbe map[string]any
 	for _, ctx := range contexts {
 		if !isGopayCDPPINExecutionContextCandidate(ctx) {
 			continue
 		}
-		contextJSON, err := executeCDPScriptInContext(conn, script, ctx.ID)
+		contextJSON, err := executeCDPScriptInContext(conn, probeScript, ctx.ID)
 		if err != nil {
 			if len(contextErrors) < 3 {
 				contextErrors = append(contextErrors, fmt.Sprintf("context %d: %s", ctx.ID, err.Error()))
@@ -5465,13 +6183,38 @@ func executeGopayCDPFlowScript(conn *websocket.Conn, script string) (string, err
 		contextResult := decodeGopayCDPFlowResult(contextJSON)
 		annotateGopayCDPContextResult(contextResult, ctx, defaultResult)
 		if gopayCDPContextResultBeatsDefault(contextResult, defaultResult) {
-			return encodeGopayCDPFlowResult(contextResult), nil
+			ctxCopy := ctx
+			selectedContext = &ctxCopy
+			selectedContextProbe = contextResult
+			break
 		}
+	}
+	if selectedContext != nil {
+		actionJSON, actionErr := executeCDPScriptInContext(conn, actionScript, selectedContext.ID)
+		if actionErr != nil {
+			if selectedContextProbe == nil {
+				selectedContextProbe = map[string]any{}
+			}
+			selectedContextProbe["execution_context_action_error"] = actionErr.Error()
+			return encodeGopayCDPFlowResult(selectedContextProbe), nil
+		}
+		actionResult := decodeGopayCDPFlowResult(actionJSON)
+		annotateGopayCDPContextResult(actionResult, *selectedContext, defaultResult)
+		return encodeGopayCDPFlowResult(actionResult), nil
 	}
 	if len(contextErrors) > 0 {
 		defaultResult["execution_context_errors"] = contextErrors
 	}
 	defaultResult["pin_context_selected"] = false
+	if gopayCDPFlowDefaultActionNeeded(defaultResult) {
+		actionJSON, actionErr := executeCDPScript(conn, actionScript)
+		if actionErr == nil && actionJSON != "" {
+			return actionJSON, nil
+		}
+		if actionErr != nil {
+			defaultResult["default_context_action_error"] = actionErr.Error()
+		}
+	}
 	return encodeGopayCDPFlowResult(defaultResult), nil
 }
 
@@ -5871,6 +6614,7 @@ type gopayMidtransLinkingFillRequest struct {
 	DebugNetwork    bool   `json:"debug_network,omitempty"`
 	AggressiveRetry bool   `json:"aggressive_retry,omitempty"`
 	TraceID         string `json:"trace_id,omitempty"`
+	RunID           string `json:"run_id,omitempty"`
 }
 
 type usAddress struct {
@@ -5975,169 +6719,179 @@ func (l *auditLogger) Close() error {
 const auditAnalysisLogVersion = "checkout-payment-flow-v1"
 
 var auditFlowStages = map[string]string{
-	"/api/health":                         "system_health",
-	"/api/voice/speak":                    "local_voice_speak",
-	"/api/incognito/open":                 "login_browser_prepare",
-	"/api/incognito/close":                "browser_cleanup",
-	"/api/login/email-fill":               "login_email_prepare",
-	"/api/session/fetch":                  "session_capture",
-	"/api/checkout":                       "checkout_create",
-	"/api/checkout/start":                 "checkout_create",
-	"/api/checkout/resolve-target":        "checkout_target_resolve",
-	"/api/checkout/payment-method-select": "checkout_payment_method_select",
-	"/api/checkout/auto-fill":             "checkout_page_fill",
-	"/api/gopay/auto-trigger-check":       "gopay_auto_trigger_decision",
-	"/api/gopay/midtrans-linking-fill":    "gopay_midtrans_page_linking",
-	"/api/gopay/full-link":                "gopay_full_payment_flow",
-	"/api/gopay/force-link":               "gopay_linking",
-	"/api/gopay/auto-link":                "gopay_linking",
-	"/api/gopay/smart-link":               "gopay_linking",
-	"/api/gopay/cdp-otp":                  "gopay_otp_pin_browser_flow",
-	"/api/gopay/snap-probe":               "gopay_snap_probe",
-	"/api/gopay/monitor":                  "payment_monitoring",
-	"/api/pricing/monitor":                "pricing_monitoring",
-	"/api/pricing/plus-subscribe-probe":   "pricing_plus_subscribe_probe",
-	"/api/luckmail/create-and-wait":       "luckmail_email_code_flow",
-	"/api/luckmail/token-code":            "luckmail_purchased_email_code_flow",
-	"/api/luckmail/token-mails":           "luckmail_purchased_email_mail_list",
+	"/api/health": "system_health",
+	"/api/sandbox/payment-authorization/assess": "payment_authorization_sandbox",
+	"/api/voice/speak":                          "local_voice_speak",
+	"/api/incognito/open":                       "login_browser_prepare",
+	"/api/incognito/close":                      "browser_cleanup",
+	"/api/login/email-fill":                     "login_email_prepare",
+	"/api/session/fetch":                        "session_capture",
+	"/api/checkout":                             "checkout_create",
+	"/api/checkout/start":                       "checkout_create",
+	"/api/checkout/resolve-target":              "checkout_target_resolve",
+	"/api/checkout/payment-method-select":       "checkout_payment_method_select",
+	"/api/checkout/authorized-subscribe-click":  "checkout_authorized_subscribe_click",
+	"/api/checkout/auto-fill":                   "checkout_page_fill",
+	"/api/gopay/auto-trigger-check":             "gopay_auto_trigger_decision",
+	"/api/gopay/midtrans-linking-fill":          "gopay_midtrans_page_linking",
+	"/api/gopay/full-link":                      "gopay_full_payment_flow",
+	"/api/gopay/force-link":                     "gopay_linking",
+	"/api/gopay/auto-link":                      "gopay_linking",
+	"/api/gopay/smart-link":                     "gopay_linking",
+	"/api/gopay/cdp-otp":                        "gopay_otp_pin_browser_flow",
+	"/api/gopay/snap-probe":                     "gopay_snap_probe",
+	"/api/gopay/monitor":                        "payment_monitoring",
+	"/api/pricing/monitor":                      "pricing_monitoring",
+	"/api/pricing/plus-subscribe-probe":         "pricing_plus_subscribe_probe",
+	"/api/luckmail/create-and-wait":             "luckmail_email_code_flow",
+	"/api/luckmail/token-code":                  "luckmail_purchased_email_code_flow",
+	"/api/luckmail/token-mails":                 "luckmail_purchased_email_mail_list",
 }
 
 var auditFlowStepIndexes = map[string]int{
-	"/api/health":                         10,
-	"/api/voice/speak":                    11,
-	"/api/incognito/open":                 20,
-	"/api/incognito/close":                190,
-	"/api/login/click":                    23,
-	"/api/login/email-fill":               25,
-	"/api/login/code-fill":                27,
-	"/api/session/fetch":                  30,
-	"/api/checkout":                       40,
-	"/api/checkout/start":                 40,
-	"/api/checkout/resolve-target":        50,
-	"/api/checkout/payment-method-select": 55,
-	"/api/checkout/auto-fill":             60,
-	"/api/gopay/auto-trigger-check":       70,
-	"/api/gopay/midtrans-linking-fill":    80,
-	"/api/gopay/force-link":               90,
-	"/api/gopay/auto-link":                90,
-	"/api/gopay/smart-link":               90,
-	"/api/gopay/cdp-otp":                  100,
-	"/api/gopay/full-link":                110,
-	"/api/gopay/snap-probe":               120,
-	"/api/gopay/monitor":                  130,
-	"/api/pricing/monitor":                140,
-	"/api/pricing/plus-subscribe-probe":   141,
-	"/api/luckmail/create-and-wait":       150,
-	"/api/luckmail/token-code":            151,
-	"/api/luckmail/token-mails":           152,
-	"/api/luckmail/purchases":             153,
-	"/api/luckmail/config":                154,
-	"/api/luckmail/config/test":           155,
+	"/api/health":                              10,
+	"/api/voice/speak":                         11,
+	"/api/incognito/open":                      20,
+	"/api/incognito/close":                     190,
+	"/api/login/click":                         23,
+	"/api/login/email-fill":                    25,
+	"/api/login/code-fill":                     27,
+	"/api/session/fetch":                       30,
+	"/api/checkout":                            40,
+	"/api/checkout/start":                      40,
+	"/api/checkout/resolve-target":             50,
+	"/api/checkout/payment-method-select":      55,
+	"/api/checkout/authorized-subscribe-click": 58,
+	"/api/checkout/auto-fill":                  60,
+	"/api/gopay/auto-trigger-check":            70,
+	"/api/gopay/midtrans-linking-fill":         80,
+	"/api/gopay/force-link":                    90,
+	"/api/gopay/auto-link":                     90,
+	"/api/gopay/smart-link":                    90,
+	"/api/gopay/cdp-otp":                       100,
+	"/api/gopay/full-link":                     110,
+	"/api/gopay/snap-probe":                    120,
+	"/api/gopay/monitor":                       130,
+	"/api/pricing/monitor":                     140,
+	"/api/pricing/plus-subscribe-probe":        141,
+	"/api/luckmail/create-and-wait":            150,
+	"/api/luckmail/token-code":                 151,
+	"/api/luckmail/token-mails":                152,
+	"/api/luckmail/purchases":                  153,
+	"/api/luckmail/config":                     154,
+	"/api/luckmail/config/test":                155,
 }
 
 var auditFlowRouteRoles = map[string]string{
-	"/api/health":                         "确认本地 Go 服务可用，是全流程运行前的环境健康信号",
-	"/api/voice/speak":                    "调用本机系统语音播报当前流程状态，作为浏览器语音 API 的本地兜底",
-	"/api/incognito/open":                 "打开或复用系统 Chrome 无痕窗口，为登录态、checkout 页面和 CDP 观测建立浏览器上下文",
-	"/api/incognito/close":                "关闭本工具管理的 Chrome 无痕窗口或相关 CDP 页面，作为流程收尾清理动作",
-	"/api/login/email-fill":               "监控无痕窗口页面，点击登录入口、填写已购邮箱地址、点击继续并等待验证码页面",
-	"/api/login/code-fill":                "监控无痕窗口验证码页面，自动填入 LuckMail 邮箱验证码并尝试提交",
-	"/api/session/fetch":                  "从浏览器上下文读取 ChatGPT Session JSON，用于后续 checkout token 获取或诊断",
-	"/api/checkout":                       "基于账号 token、套餐、账单地区和税区信息生成 OpenAI/Stripe checkout 链接",
-	"/api/checkout/start":                 "基于账号 token、套餐、账单地区和税区信息生成 OpenAI/Stripe checkout 链接",
-	"/api/checkout/resolve-target":        "从当前浏览器页面或输入链接中锁定真实 checkout 支付页目标",
-	"/api/checkout/payment-method-select": "在 checkout 页面只选择支付方式，优先 GoPay，缺失时选择 PayPal，不触发最终订阅提交",
-	"/api/checkout/auto-fill":             "在 checkout 页面执行地址、支付方式和提交相关自动化动作",
-	"/api/gopay/auto-trigger-check":       "判断页面是否已满足 GoPay 自动触发条件，避免重复或过早执行支付链路",
-	"/api/gopay/midtrans-linking-fill":    "在 Midtrans/GoPay 页面填充手机号并推进绑定入口",
-	"/api/gopay/full-link":                "执行 GoPay 绑定、PIN 验证、支付处理和最终状态查询的后端全流程辅助",
-	"/api/gopay/force-link":               "执行 GoPay 指定参数绑定请求",
-	"/api/gopay/auto-link":                "执行 GoPay 自动绑定请求",
-	"/api/gopay/smart-link":               "执行 GoPay 智能绑定请求并处理冲突复用场景",
-	"/api/gopay/cdp-otp":                  "通过 CDP 观测或操作 GoPay OTP/PIN 页面，但不记录明文 OTP/PIN",
-	"/api/gopay/snap-probe":               "探测 Snap/Midtrans 页面结构与账号标识",
-	"/api/gopay/monitor":                  "采集支付相关页面、网络和控制台状态，用于异常定位和流畅性分析",
-	"/api/pricing/monitor":                "采集定价页面状态，用于 checkout 前置页面诊断",
-	"/api/pricing/plus-subscribe-probe":   "探测 ChatGPT 页面是否出现 Plus 套餐和订阅并付款特征，用于触发 Session 获取流程但不点击最终付款",
-	"/api/luckmail/create-and-wait":       "创建 LuckMail 邮箱接码订单并等待邮件验证码返回，后续可用于人工填入验证码",
-	"/api/luckmail/token-code":            "通过 LuckMail 已购邮箱 Token 等待或查询最新邮件验证码",
-	"/api/luckmail/token-mails":           "通过 LuckMail 已购邮箱 Token 查询邮件列表摘要，用于确认邮件是否到达",
-	"/api/luckmail/purchases":             "通过 LuckMail API Key 查询已购邮箱列表，并选择可用邮箱 Token",
-	"/api/luckmail/config":                "管理本机保存的 LuckMail API Key 配置档案，只返回密钥摘要",
-	"/api/luckmail/config/test":           "使用 LuckMail API Key 配置发起用户信息探测，验证鉴权是否可用",
+	"/api/health":                              "确认本地 Go 服务可用，是全流程运行前的环境健康信号",
+	"/api/voice/speak":                         "调用本机系统语音播报当前流程状态，作为浏览器语音 API 的本地兜底",
+	"/api/incognito/open":                      "打开或复用系统 Chrome 无痕窗口，为登录态、checkout 页面和 CDP 观测建立浏览器上下文",
+	"/api/incognito/close":                     "关闭本工具管理的 Chrome 无痕窗口或相关 CDP 页面，作为流程收尾清理动作",
+	"/api/login/email-fill":                    "监控无痕窗口页面，点击登录入口、填写已购邮箱地址、点击继续并等待验证码页面",
+	"/api/login/code-fill":                     "监控无痕窗口验证码页面，自动填入 LuckMail 邮箱验证码并尝试提交",
+	"/api/session/fetch":                       "从浏览器上下文读取 ChatGPT Session JSON，用于后续 checkout token 获取或诊断",
+	"/api/checkout":                            "基于账号 token、套餐、账单地区和税区信息生成 OpenAI/Stripe checkout 链接",
+	"/api/checkout/start":                      "基于账号 token、套餐、账单地区和税区信息生成 OpenAI/Stripe checkout 链接",
+	"/api/checkout/resolve-target":             "从当前浏览器页面或输入链接中锁定真实 checkout 支付页目标",
+	"/api/checkout/payment-method-select":      "在 checkout 页面只选择支付方式，优先 GoPay，缺失时选择 PayPal，不触发最终订阅提交",
+	"/api/checkout/authorized-subscribe-click": "仅在本地用户明确授权后，对当前订阅确认页执行一次 CDP 真实鼠标点击，并阻止重复提交",
+	"/api/checkout/auto-fill":                  "在 checkout 页面执行地址、支付方式和提交相关自动化动作",
+	"/api/gopay/auto-trigger-check":            "判断页面是否已满足 GoPay 自动触发条件，避免重复或过早执行支付链路",
+	"/api/gopay/midtrans-linking-fill":         "在 Midtrans/GoPay 页面填充手机号并推进绑定入口",
+	"/api/gopay/full-link":                     "执行 GoPay 绑定、PIN 验证、支付处理和最终状态查询的后端全流程辅助",
+	"/api/gopay/force-link":                    "执行 GoPay 指定参数绑定请求",
+	"/api/gopay/auto-link":                     "执行 GoPay 自动绑定请求",
+	"/api/gopay/smart-link":                    "执行 GoPay 智能绑定请求并处理冲突复用场景",
+	"/api/gopay/cdp-otp":                       "通过 CDP 观测或操作 GoPay OTP/PIN 页面，但不记录明文 OTP/PIN",
+	"/api/gopay/snap-probe":                    "探测 Snap/Midtrans 页面结构与账号标识",
+	"/api/gopay/monitor":                       "采集支付相关页面、网络和控制台状态，用于异常定位和流畅性分析",
+	"/api/pricing/monitor":                     "采集定价页面状态，用于 checkout 前置页面诊断",
+	"/api/pricing/plus-subscribe-probe":        "探测 ChatGPT 页面是否出现 Plus 套餐和订阅并付款特征，用于触发 Session 获取流程但不点击最终付款",
+	"/api/luckmail/create-and-wait":            "创建 LuckMail 邮箱接码订单并等待邮件验证码返回，后续可用于人工填入验证码",
+	"/api/luckmail/token-code":                 "通过 LuckMail 已购邮箱 Token 等待或查询最新邮件验证码",
+	"/api/luckmail/token-mails":                "通过 LuckMail 已购邮箱 Token 查询邮件列表摘要，用于确认邮件是否到达",
+	"/api/luckmail/purchases":                  "通过 LuckMail API Key 查询已购邮箱列表，并选择可用邮箱 Token",
+	"/api/luckmail/config":                     "管理本机保存的 LuckMail API Key 配置档案，只返回密钥摘要",
+	"/api/luckmail/config/test":                "使用 LuckMail API Key 配置发起用户信息探测，验证鉴权是否可用",
 }
 
 var flowAuditLogger = newAuditLogger(filepath.Join(".", "log"), 24*time.Hour, 8<<20, 512)
 
 var gopayAutoTriggerMu sync.Mutex
 var gopayAutoTriggeredCheckout = map[string]time.Time{}
+var authorizedSubscribeClickMu sync.Mutex
+var authorizedSubscribeClickedCheckout = map[string]time.Time{}
 
 var operationDisplayNames = map[string]string{
-	"/api/health":                         "健康检查",
-	"/api/voice/speak":                    "本机语音播报",
-	"/api/checkout":                       "生成支付链接",
-	"/api/checkout/start":                 "生成支付链接",
-	"/api/incognito/open":                 "打开无痕窗口",
-	"/api/incognito/close":                "关闭无痕窗口",
-	"/api/login/click":                    "登录按钮自动点击",
-	"/api/login/email-fill":               "登录页填写邮箱",
-	"/api/login/code-fill":                "登录验证码自动填入",
-	"/api/session/fetch":                  "获取 Session JSON",
-	"/api/gopay/force-link":               "GoPay 强制绑定",
-	"/api/gopay/auto-link":                "GoPay 自动绑定",
-	"/api/gopay/cdp-otp":                  "CDP OTP 获取",
-	"/api/gopay/smart-link":               "GoPay 智能绑定",
-	"/api/gopay/snap-probe":               "Snap 探测",
-	"/api/gopay/monitor":                  "流程监控",
-	"/api/pricing/monitor":                "定价监控",
-	"/api/pricing/plus-subscribe-probe":   "Plus 订阅探测",
-	"/api/gopay/full-link":                "GoPay 全流程绑定",
-	"/api/gopay/auto-trigger-check":       "GoPay 自动触发检查",
-	"/api/gopay/midtrans-linking-fill":    "Midtrans GoPay 页面填充",
-	"/api/checkout/resolve-target":        "Checkout 目标解析",
-	"/api/checkout/payment-method-select": "Checkout 支付方式选择",
-	"/api/checkout/auto-fill":             "Checkout 自动填充",
-	"/api/perf/client":                    "客户端性能日志",
-	"/api/luckmail/create-and-wait":       "LuckMail 邮箱接码",
-	"/api/luckmail/token-code":            "LuckMail 已购邮箱验证码",
-	"/api/luckmail/token-mails":           "LuckMail 已购邮箱邮件列表",
-	"/api/luckmail/purchases":             "LuckMail 已购邮箱列表",
-	"/api/luckmail/config":                "LuckMail API 配置管理",
-	"/api/luckmail/config/test":           "LuckMail API 配置测试",
+	"/api/health": "健康检查",
+	"/api/sandbox/payment-authorization/assess": "支付授权 sandbox 评估",
+	"/api/voice/speak":                          "本机语音播报",
+	"/api/checkout":                             "生成支付链接",
+	"/api/checkout/start":                       "生成支付链接",
+	"/api/incognito/open":                       "打开无痕窗口",
+	"/api/incognito/close":                      "关闭无痕窗口",
+	"/api/login/click":                          "登录按钮自动点击",
+	"/api/login/email-fill":                     "登录页填写邮箱",
+	"/api/login/code-fill":                      "登录验证码自动填入",
+	"/api/session/fetch":                        "获取 Session JSON",
+	"/api/gopay/force-link":                     "GoPay 强制绑定",
+	"/api/gopay/auto-link":                      "GoPay 自动绑定",
+	"/api/gopay/cdp-otp":                        "CDP OTP 获取",
+	"/api/gopay/smart-link":                     "GoPay 智能绑定",
+	"/api/gopay/snap-probe":                     "Snap 探测",
+	"/api/gopay/monitor":                        "流程监控",
+	"/api/pricing/monitor":                      "定价监控",
+	"/api/pricing/plus-subscribe-probe":         "Plus 订阅探测",
+	"/api/gopay/full-link":                      "GoPay 全流程绑定",
+	"/api/gopay/auto-trigger-check":             "GoPay 自动触发检查",
+	"/api/gopay/midtrans-linking-fill":          "Midtrans GoPay 页面填充",
+	"/api/checkout/resolve-target":              "Checkout 目标解析",
+	"/api/checkout/payment-method-select":       "Checkout 支付方式选择",
+	"/api/checkout/authorized-subscribe-click":  "本地授权订阅点击",
+	"/api/checkout/auto-fill":                   "Checkout 自动填充",
+	"/api/perf/client":                          "客户端性能日志",
+	"/api/luckmail/create-and-wait":             "LuckMail 邮箱接码",
+	"/api/luckmail/token-code":                  "LuckMail 已购邮箱验证码",
+	"/api/luckmail/token-mails":                 "LuckMail 已购邮箱邮件列表",
+	"/api/luckmail/purchases":                   "LuckMail 已购邮箱列表",
+	"/api/luckmail/config":                      "LuckMail API 配置管理",
+	"/api/luckmail/config/test":                 "LuckMail API 配置测试",
 }
 
 var operationTypes = map[string]string{
-	"/api/health":                         "system_health",
-	"/api/voice/speak":                    "local_voice_speak",
-	"/api/checkout":                       "checkout_create",
-	"/api/checkout/start":                 "checkout_create",
-	"/api/incognito/open":                 "login_open_window",
-	"/api/incognito/close":                "browser_cleanup",
-	"/api/login/click":                    "login_click",
-	"/api/login/email-fill":               "login_email_fill",
-	"/api/login/code-fill":                "login_code_fill",
-	"/api/session/fetch":                  "session_query",
-	"/api/gopay/force-link":               "gopay_link",
-	"/api/gopay/auto-link":                "gopay_link",
-	"/api/gopay/cdp-otp":                  "otp_query",
-	"/api/gopay/smart-link":               "gopay_link",
-	"/api/gopay/snap-probe":               "data_query",
-	"/api/gopay/monitor":                  "monitor_trace",
-	"/api/pricing/monitor":                "monitor_trace",
-	"/api/pricing/plus-subscribe-probe":   "data_query",
-	"/api/gopay/full-link":                "gopay_full_flow",
-	"/api/gopay/auto-trigger-check":       "gopay_auto_trigger",
-	"/api/gopay/midtrans-linking-fill":    "gopay_browser_linking",
-	"/api/checkout/resolve-target":        "data_query",
-	"/api/checkout/payment-method-select": "data_modify",
-	"/api/checkout/auto-fill":             "data_modify",
-	"/api/perf/client":                    "performance_trace",
-	"/api/luckmail/create-and-wait":       "email_code_query",
-	"/api/luckmail/token-code":            "email_code_query",
-	"/api/luckmail/token-mails":           "email_mail_query",
-	"/api/luckmail/purchases":             "email_mail_query",
-	"/api/luckmail/config":                "credential_config",
-	"/api/luckmail/config/test":           "credential_config_test",
+	"/api/health": "system_health",
+	"/api/sandbox/payment-authorization/assess": "payment_authorization_sandbox",
+	"/api/voice/speak":                          "local_voice_speak",
+	"/api/checkout":                             "checkout_create",
+	"/api/checkout/start":                       "checkout_create",
+	"/api/incognito/open":                       "login_open_window",
+	"/api/incognito/close":                      "browser_cleanup",
+	"/api/login/click":                          "login_click",
+	"/api/login/email-fill":                     "login_email_fill",
+	"/api/login/code-fill":                      "login_code_fill",
+	"/api/session/fetch":                        "session_query",
+	"/api/gopay/force-link":                     "gopay_link",
+	"/api/gopay/auto-link":                      "gopay_link",
+	"/api/gopay/cdp-otp":                        "otp_query",
+	"/api/gopay/smart-link":                     "gopay_link",
+	"/api/gopay/snap-probe":                     "data_query",
+	"/api/gopay/monitor":                        "monitor_trace",
+	"/api/pricing/monitor":                      "monitor_trace",
+	"/api/pricing/plus-subscribe-probe":         "data_query",
+	"/api/gopay/full-link":                      "gopay_full_flow",
+	"/api/gopay/auto-trigger-check":             "gopay_auto_trigger",
+	"/api/gopay/midtrans-linking-fill":          "gopay_browser_linking",
+	"/api/checkout/resolve-target":              "data_query",
+	"/api/checkout/payment-method-select":       "data_modify",
+	"/api/checkout/authorized-subscribe-click":  "user_authorized_browser_click",
+	"/api/checkout/auto-fill":                   "data_modify",
+	"/api/perf/client":                          "performance_trace",
+	"/api/luckmail/create-and-wait":             "email_code_query",
+	"/api/luckmail/token-code":                  "email_code_query",
+	"/api/luckmail/token-mails":                 "email_mail_query",
+	"/api/luckmail/purchases":                   "email_mail_query",
+	"/api/luckmail/config":                      "credential_config",
+	"/api/luckmail/config/test":                 "credential_config_test",
 }
 
 var sensitiveJSONKeys = map[string]struct{}{
@@ -6210,11 +6964,39 @@ const auditMaxResponseBodyBytes = 512 << 10
 var auditResponseSummaryKeys = map[string]struct{}{
 	"ok":                            {},
 	"stage":                         {},
+	"sandbox":                       {},
+	"scenario":                      {},
+	"scenario_count":                {},
+	"accepted_count":                {},
+	"rejected_count":                {},
+	"all_rejected":                  {},
 	"ready":                         {},
 	"reason":                        {},
 	"strategy":                      {},
 	"error":                         {},
+	"risk_reasons":                  {},
+	"authorization_accepted":        {},
+	"accepted_authority":            {},
+	"payment_action_executed":       {},
+	"real_checkout_touched":         {},
+	"real_credential_used":          {},
+	"trusted_authority_needed":      {},
 	"code":                          {},
+	"terminal":                      {},
+	"retryable":                     {},
+	"next_action":                   {},
+	"human_message":                 {},
+	"poll_after_ms":                 {},
+	"retry_after_ms":                {},
+	"page_classification":           {},
+	"contract_version":              {},
+	"trace_id":                      {},
+	"run_id":                        {},
+	"token_state":                   {},
+	"phone_binding_state":           {},
+	"manual_required":               {},
+	"primary_button":                {},
+	"secondary_button":              {},
 	"account_id":                    {},
 	"target_url":                    {},
 	"target_title":                  {},
@@ -6581,6 +7363,7 @@ func handleCheckout(w http.ResponseWriter, r *http.Request) {
 	}
 
 	normalizeCheckoutRequest(&req)
+	req.RunID = requestAutomationRunID(r, req.RunID)
 	if err := validateCheckoutRequest(req); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
@@ -6630,6 +7413,10 @@ func handleCheckout(w http.ResponseWriter, r *http.Request) {
 	}
 
 	contentType := resp.Header.Get("Content-Type")
+	if contract, ok := checkoutUpstreamBusinessContract(resp.StatusCode, contentType, upstreamURL, body, req); ok {
+		writeJSON(w, http.StatusOK, contract)
+		return
+	}
 	if !strings.Contains(strings.ToLower(contentType), "application/json") {
 		writeJSON(w, resp.StatusCode, checkoutUpstreamNonJSONPayload(resp.StatusCode, contentType, upstreamURL, body))
 		return
@@ -6726,6 +7513,7 @@ func handleCheckout(w http.ResponseWriter, r *http.Request) {
 		"checkout_session_id": firstNonEmpty(stripeInit.CheckoutSessionID, findStringField(checkoutData, "checkout_session_id", "id"), sessionIDFromCheckoutURL(checkoutURL)),
 		"payment_method":      req.PaymentMethod,
 		"trace_id":            req.TraceID,
+		"run_id":              req.RunID,
 	})
 	return
 }
@@ -7530,6 +8318,122 @@ func gopayTokenNotFound(result map[string]any, reqErr error) bool {
 	return false
 }
 
+func gopayTokenLifecycleContract(result map[string]any, reqErr error) map[string]any {
+	status := int64(0)
+	if result != nil {
+		if parsed, ok := jsonNumberToInt(result["status"]); ok {
+			status = parsed
+		} else if parsed, ok := jsonNumberToInt(result["http_status"]); ok {
+			status = parsed
+		}
+	}
+	candidates := gopayLinkingErrorMessages(result)
+	if reqErr != nil {
+		candidates = append(candidates, reqErr.Error())
+	}
+	for _, key := range []string{"error", "message", "raw_body"} {
+		if result != nil {
+			if text := stringifyJSONValue(result[key]); text != "" {
+				candidates = append(candidates, text)
+			}
+		}
+	}
+	lower := strings.ToLower(strings.Join(candidates, " | "))
+	contract := map[string]any{
+		"token_state":      "unknown",
+		"next_action":      "retry_or_regenerate_checkout",
+		"retryable":        true,
+		"terminal":         false,
+		"human_message":    "GoPay token 状态暂不明确，将退避后重试；如持续失败请重新生成结账链路。",
+		"contract_version": automationContractVersion,
+	}
+	switch {
+	case reqErr == nil && result != nil && stringifyJSONValue(result["reference_id"]) != "":
+		contract["token_state"] = "fresh"
+		contract["next_action"] = "continue_otp_or_pin"
+		contract["retryable"] = false
+		contract["human_message"] = "GoPay reference 已创建，继续执行 OTP/PIN 绑定流程。"
+	case status == 404 || strings.Contains(lower, "token not found"):
+		contract["token_state"] = "not_found"
+		contract["next_action"] = "regenerate_checkout"
+		contract["retryable"] = false
+		contract["terminal"] = true
+		contract["human_message"] = "GoPay token 不存在，旧结账链路已不可继续，请重新生成支付链接。"
+	case status == 407 || strings.Contains(lower, "token has expired") || strings.Contains(lower, "token expired") || strings.Contains(lower, "expired"):
+		contract["token_state"] = "expired"
+		contract["next_action"] = "regenerate_checkout"
+		contract["retryable"] = false
+		contract["terminal"] = true
+		contract["human_message"] = "GoPay token 已过期，请关闭旧支付页并重新生成结账链路。"
+	case status == 429 || strings.Contains(lower, "rate limit") || strings.Contains(lower, "ratelimit") || strings.Contains(lower, "too many"):
+		contract["token_state"] = "rate_limited"
+		contract["next_action"] = "wait_cooldown"
+		contract["retryable"] = true
+		contract["terminal"] = false
+		contract["retry_after_ms"] = int64(90000)
+		contract["poll_after_ms"] = int64(90000)
+		contract["human_message"] = "GoPay/Midtrans 返回限流，已进入冷却等待，避免重复请求扩大失败。"
+	case reqErr != nil:
+		contract["token_state"] = "error_unknown"
+		contract["next_action"] = "retry_or_regenerate_checkout"
+		contract["retryable"] = true
+		contract["poll_after_ms"] = int64(30000)
+	}
+	return contract
+}
+
+func attachGopayTokenLifecycle(response map[string]any, resolution gopayLinkingResolution, reqErr error) {
+	if response == nil {
+		return
+	}
+	var contract map[string]any
+	if reqErr == nil && resolution.ReusedExisting {
+		contract = map[string]any{
+			"token_state":      "reused_existing",
+			"next_action":      "continue_reused_account",
+			"retryable":        false,
+			"terminal":         false,
+			"human_message":    "当前 GoPay 账号已绑定，可直接复用并继续支付或记录流程。",
+			"contract_version": automationContractVersion,
+		}
+	} else {
+		contract = gopayTokenLifecycleContract(resolution.LinkResult, reqErr)
+	}
+	for key, value := range contract {
+		if _, exists := response[key]; !exists || key == "token_state" || key == "next_action" || key == "retryable" || key == "terminal" || key == "human_message" {
+			response[key] = value
+		}
+	}
+}
+
+func attachGopayTerminalAutomationContract(response map[string]any) {
+	if response == nil {
+		return
+	}
+	stage := stringifyJSONValue(response["stage"])
+	response["contract_version"] = automationContractVersion
+	switch stage {
+	case "gopay_complete":
+		response["terminal"] = true
+		response["retryable"] = false
+		response["next_action"] = "save_success_record_and_cleanup"
+		response["human_message"] = "GoPay 支付已完成，保存成功记录后停止本轮所有 watcher。"
+		response["poll_after_ms"] = int64(0)
+	case "gopay_payment_failed":
+		response["terminal"] = true
+		response["retryable"] = false
+		response["next_action"] = "regenerate_checkout"
+		response["human_message"] = "GoPay 支付失败，请重新生成结账链路或更换支付方式。"
+		response["poll_after_ms"] = int64(0)
+	case "payment_pin_all_failed":
+		response["terminal"] = false
+		response["retryable"] = false
+		response["next_action"] = "enter_correct_payment_pin"
+		response["human_message"] = "支付 PIN 自动尝试未通过，请确认面板 PIN 是否正确后重试。"
+		response["poll_after_ms"] = int64(0)
+	}
+}
+
 func validateGopayReferenceViaLocalMock(ctx context.Context, referenceID string) (map[string]any, error) {
 	referenceID = strings.TrimSpace(referenceID)
 	if referenceID == "" {
@@ -7959,6 +8863,7 @@ func completeGopayFullLinkPayment(ctx context.Context, response map[string]any, 
 			"ok":      false,
 			"message": "支付阶段失败: " + paymentErr.Error(),
 		})
+		attachGopayTerminalAutomationContract(response)
 		return
 	}
 
@@ -7969,6 +8874,7 @@ func completeGopayFullLinkPayment(ctx context.Context, response map[string]any, 
 	response["ok"] = true
 	response["stage"] = "gopay_complete"
 	response["reference_id"] = paymentResult.PaymentReferenceID
+	attachGopayTerminalAutomationContract(response)
 	appendGopayFullLinkStage(response, "pin-enum", map[string]any{
 		"ok":      true,
 		"pin":     firstNonEmpty(paymentResult.PinUsed, preferredPIN),
@@ -9438,6 +10344,7 @@ func normalizeCheckoutRequest(req *checkoutRequest) {
 	req.CheckoutSession.Cookie = strings.TrimSpace(req.CheckoutSession.Cookie)
 	req.CheckoutSession.UserAgent = strings.TrimSpace(req.CheckoutSession.UserAgent)
 	req.TraceID = strings.TrimSpace(req.TraceID)
+	req.RunID = strings.TrimSpace(req.RunID)
 }
 
 func normalizePaymentMethod(method string) string {
@@ -10204,6 +11111,39 @@ func checkoutUserAgent(session checkoutSession) string {
 		configString("CHECKOUT_USER_AGENT", config.CheckoutUserAgent, ""),
 		"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36 Edg/147.0.0.0",
 	)
+}
+
+func checkoutUpstreamBusinessContract(status int, contentType string, endpoint string, body []byte, req checkoutRequest) (map[string]any, bool) {
+	bodyText := strings.TrimSpace(string(body))
+	lowerBody := strings.ToLower(bodyText)
+	if !strings.Contains(lowerBody, "user is already paid") && !strings.Contains(lowerBody, "already paid") {
+		return nil, false
+	}
+	payload := map[string]any{
+		"ok":               false,
+		"stage":            "account_already_paid",
+		"terminal":         true,
+		"retryable":        false,
+		"next_action":      "export_subscription_or_switch_account",
+		"human_message":    "当前账号已付费，无需创建新的 checkout。",
+		"poll_after_ms":    int64(0),
+		"contract_version": automationContractVersion,
+		"trace_id":         strings.TrimSpace(req.TraceID),
+		"run_id":           strings.TrimSpace(req.RunID),
+		"status":           status,
+		"content_type":     contentType,
+		"endpoint":         endpoint,
+	}
+	if strings.Contains(strings.ToLower(contentType), "application/json") && len(body) > 0 {
+		var parsed any
+		if err := json.Unmarshal(body, &parsed); err == nil {
+			payload["upstream_body"] = parsed
+		}
+	}
+	if payload["upstream_body"] == nil && bodyText != "" {
+		payload["body_excerpt"] = trimForDisplay(bodyText, 600)
+	}
+	return payload, true
 }
 
 func checkoutUpstreamNonJSONPayload(status int, contentType string, endpoint string, body []byte) map[string]any {
@@ -12237,6 +13177,7 @@ func handleGopayAutoTriggerCheck(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid json")
 		return
 	}
+	req.RunID = requestAutomationRunID(r, req.RunID)
 	decision := markGopayAutoTriggerReady(req)
 	writeJSON(w, http.StatusOK, decision)
 }
@@ -12268,6 +13209,7 @@ func evaluateGopayAutoTrigger(req gopayAutoTriggerCheckRequest, captureSensitive
 	req.Source = strings.TrimSpace(req.Source)
 	req.CheckoutURL = strings.TrimSpace(req.CheckoutURL)
 	req.TraceID = strings.TrimSpace(req.TraceID)
+	req.RunID = strings.TrimSpace(req.RunID)
 	checkoutKey := checkoutAutoTriggerKey(req.CheckoutURL)
 	pageText := strings.TrimSpace(req.PageText)
 	checkoutURLOK := checkoutKey != ""
@@ -12283,28 +13225,64 @@ func evaluateGopayAutoTrigger(req gopayAutoTriggerCheckRequest, captureSensitive
 		"already_triggered":       alreadyTriggered,
 	}
 	decision := gopayAutoTriggerDecision{
-		OK:               true,
-		CheckoutKey:      checkoutKey,
-		Source:           req.Source,
-		TraceID:          req.TraceID,
-		AlreadyTriggered: alreadyTriggered,
-		Conditions:       conditions,
+		OK:                 true,
+		CheckoutKey:        checkoutKey,
+		Source:             req.Source,
+		TraceID:            req.TraceID,
+		RunID:              req.RunID,
+		AlreadyTriggered:   alreadyTriggered,
+		Conditions:         conditions,
+		ContractVersion:    automationContractVersion,
+		PageClassification: "auto_trigger_evaluating",
+		NextAction:         "continue_monitoring",
+		HumanMessage:       "继续等待支付页满足 GoPay 自动触发条件。",
+		Retryable:          true,
+		Terminal:           false,
+		PollAfterMS:        2500,
 	}
 
 	switch {
 	case !captureSensitive:
 		decision.Reason = "sensitive_capture_disabled"
+		decision.PageClassification = "manual_required"
+		decision.NextAction = "enable_sensitive_local_audit"
+		decision.HumanMessage = "本地敏感审计未开启，GoPay 自动触发需要先允许本地捕获必要上下文。"
+		decision.Retryable = false
+		decision.Terminal = true
+		decision.PollAfterMS = 0
 	case !checkoutURLOK:
 		decision.Reason = "not_checkout_payment_page"
+		decision.PageClassification = "checkout_target_waiting"
+		decision.NextAction = "wait_checkout_payment_page"
+		decision.HumanMessage = "尚未识别到有效 checkout 支付页，继续等待支付页打开。"
+		decision.PollAfterMS = 3000
 	case alreadyTriggered:
 		decision.Reason = "checkout_already_triggered"
+		decision.PageClassification = "auto_trigger_already_claimed"
+		decision.NextAction = "watch_gopay_otp_pin"
+		decision.HumanMessage = "当前 checkout 已经触发过 GoPay 绑定，停止重复触发并转入 GoPay OTP/PIN 监听。"
+		decision.Retryable = false
+		decision.Terminal = true
+		decision.PollAfterMS = 0
 	case !gopayDetected:
 		decision.Reason = "gopay_not_detected"
+		decision.PageClassification = "payment_method_missing"
+		decision.NextAction = "select_gopay_or_fallback_paypal"
+		decision.HumanMessage = "支付页尚未识别到 GoPay；请确认支付方式已选择，若无 GoPay 则回退 PayPal。"
+		decision.PollAfterMS = 5000
 	case !req.Submitted:
 		decision.Reason = "waiting_for_checkout_submit"
+		decision.PageClassification = "checkout_subscription_confirmation_required"
+		decision.NextAction = "review_and_click_subscribe"
+		decision.HumanMessage = "等待你在 checkout 页审阅条款并手动点击订阅；系统不会自动点击最终付款按钮。"
+		decision.PollAfterMS = 10000
 	default:
 		decision.Ready = true
 		decision.Reason = "ready"
+		decision.PageClassification = "auto_trigger_ready"
+		decision.NextAction = "fill_midtrans_gopay_linking"
+		decision.HumanMessage = "GoPay 支付页面已满足条件，准备填写 Midtrans 绑定信息。"
+		decision.PollAfterMS = 1200
 	}
 	if decision.Ready {
 		decision.Stage = "auto_trigger_ready"
@@ -12926,6 +13904,7 @@ func handleGopayMidtransLinkingFill(w http.ResponseWriter, r *http.Request) {
 	req.CountryCode = strings.TrimSpace(req.CountryCode)
 	req.PhoneNumber = strings.TrimSpace(req.PhoneNumber)
 	req.TraceID = strings.TrimSpace(req.TraceID)
+	req.RunID = requestAutomationRunID(r, req.RunID)
 	if req.CountryCode == "" {
 		req.CountryCode = "86"
 	}
@@ -12934,23 +13913,26 @@ func handleGopayMidtransLinkingFill(w http.ResponseWriter, r *http.Request) {
 	}
 	accountID := midtransRedirectionAccountID(req.TargetURL)
 	if accountID == "" {
-		writeJSON(w, http.StatusOK, map[string]any{
+		response := map[string]any{
 			"ok":         false,
 			"stage":      "midtrans_redirection_page_not_detected",
 			"error":      "target_url is not a Midtrans redirection page",
 			"target_url": req.TargetURL,
 			"trace_id":   req.TraceID,
-		})
+			"run_id":     req.RunID,
+		}
+		decorateMidtransLinkingFillAutomationResponse(response, nil)
+		writeJSON(w, http.StatusOK, response)
 		return
 	}
 	if !isCDPReady(cdpDebuggingPort) {
-		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"ok": false, "stage": "cdp_not_ready", "error": "CDP not ready"})
+		writeJSON(w, http.StatusServiceUnavailable, gopayCDPReadinessResponse("cdp_not_ready", "CDP not ready", req.TraceID, 5000, req.RunID))
 		return
 	}
 
 	targets, err := getCDPTargets(cdpDebuggingPort)
 	if err != nil {
-		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"ok": false, "stage": "cdp_targets_failed", "error": err.Error()})
+		writeJSON(w, http.StatusServiceUnavailable, gopayCDPReadinessResponse("cdp_targets_failed", err.Error(), req.TraceID, 5000, req.RunID))
 		return
 	}
 	var target *cdpTarget
@@ -12965,14 +13947,17 @@ func handleGopayMidtransLinkingFill(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if target == nil {
-		writeJSON(w, http.StatusOK, map[string]any{
+		response := map[string]any{
 			"ok":             false,
 			"stage":          "midtrans_linking_target_not_found",
 			"account_id":     accountID,
 			"target_url":     req.TargetURL,
 			"trace_id":       req.TraceID,
+			"run_id":         req.RunID,
 			"candidate_urls": checkoutResolveCandidateURLs(targets),
-		})
+		}
+		decorateMidtransLinkingFillAutomationResponse(response, nil)
+		writeJSON(w, http.StatusOK, response)
 		return
 	}
 
@@ -13651,6 +14636,7 @@ func handleGopayMidtransLinkingFill(w http.ResponseWriter, r *http.Request) {
 		"ok":                       ok,
 		"stage":                    stage,
 		"trace_id":                 req.TraceID,
+		"run_id":                   req.RunID,
 		"account_id":               accountID,
 		"cdp_target_id":            target.ID,
 		"cdp_target_url":           target.URL,
@@ -13676,7 +14662,66 @@ func handleGopayMidtransLinkingFill(w http.ResponseWriter, r *http.Request) {
 	if debugErr != nil {
 		response["network_debug_error"] = debugErr.Error()
 	}
+	decorateMidtransLinkingFillAutomationResponse(response, result)
 	writeJSON(w, http.StatusOK, response)
+}
+
+func decorateMidtransLinkingFillAutomationResponse(response map[string]any, result map[string]any) {
+	if response == nil {
+		return
+	}
+	stage := firstNonEmpty(stringifyJSONValue(response["stage"]), stringifyJSONValue(result["stage"]))
+	response["contract_version"] = automationContractVersion
+	response["page_classification"] = stage
+	response["retryable"] = true
+	response["terminal"] = false
+	response["next_action"] = "continue_gopay_linking"
+	response["human_message"] = "继续监听 Midtrans/GoPay 绑定页面。"
+	response["poll_after_ms"] = int64(2500)
+	switch stage {
+	case "midtrans_linking_submitted":
+		response["next_action"] = "wait_gopay_otp_or_pin"
+		response["human_message"] = "GoPay 绑定信息已提交，等待 OTP、PIN 或 GoPay 页面跳转。"
+		response["poll_after_ms"] = int64(1200)
+	case "midtrans_not_linking_current_state":
+		response["next_action"] = "watch_gopay_otp_pin"
+		response["human_message"] = "当前 Midtrans 页面已离开手机号 linking 状态，转入 GoPay OTP、PIN 或 Pay now 监听。"
+		response["retryable"] = false
+		response["poll_after_ms"] = int64(900)
+	case "midtrans_linking_rate_limited":
+		response["token_state"] = "rate_limited"
+		response["next_action"] = "wait_cooldown"
+		response["human_message"] = "Midtrans/GoPay 页面触发限流，已进入冷却等待，避免重复点击。"
+		response["retry_after_ms"] = firstNonZeroInt64(result["retry_after_ms"], result["cooldown_ms"], int64(90000))
+		response["poll_after_ms"] = response["retry_after_ms"]
+	case "midtrans_linking_blank_shell", "midtrans_linking_loading_stuck":
+		response["next_action"] = "wait_loading_shell_reload"
+		response["human_message"] = "GoPay 绑定页仍在加载，已安排退避或刷新后继续。"
+		response["poll_after_ms"] = firstNonZeroInt64(result["retry_after_ms"], result["cooldown_ms"], int64(30000))
+	case "midtrans_phone_binding_required":
+		response["next_action"] = "change_or_unbind_phone_number"
+		response["human_message"] = "当前手机号需要解除绑定或更换号码后才能继续 GoPay 绑定。"
+		response["retryable"] = false
+		response["terminal"] = true
+		response["manual_required"] = true
+		response["phone_binding_state"] = "binding_required"
+		response["poll_after_ms"] = int64(0)
+		response["primary_button"] = "更换手机号后重试"
+		response["secondary_button"] = "解除旧手机号绑定"
+	case "midtrans_redirection_page_not_detected", "midtrans_linking_target_not_found":
+		response["next_action"] = "reopen_payment_page"
+		response["human_message"] = "没有找到可操作的 Midtrans/GoPay 绑定页，请重新打开支付页。"
+		response["poll_after_ms"] = int64(10000)
+	}
+}
+
+func firstNonZeroInt64(values ...any) int64 {
+	for _, value := range values {
+		if parsed, ok := jsonNumberToInt(value); ok && parsed > 0 {
+			return parsed
+		}
+	}
+	return 0
 }
 
 func handleGopayForceLink(w http.ResponseWriter, r *http.Request) {
@@ -13716,6 +14761,7 @@ func handleGopayForceLink(w http.ResponseWriter, r *http.Request) {
 	resolution.AccountSource = firstNonEmpty(resolution.AccountSource, "manual_input")
 	resolution.AccountSourceNote = firstNonEmpty(resolution.AccountSourceNote, "account_id provided by request")
 	response["linking_diagnostics"] = gopayLinkingDiagnostics(resolution)
+	attachGopayTokenLifecycle(response, resolution, apiErr)
 	if apiErr != nil {
 		response["api"] = map[string]any{"ok": false, "error": apiErr.Error()}
 	} else {
@@ -13770,6 +14816,7 @@ func handleGopayAutoLink(w http.ResponseWriter, r *http.Request) {
 	}
 	resolution, linkErr := createOrReuseGopayLinkingViaLocalMock(ctx, req.AccountID, gopayLink{Type: "gopay", CountryCode: req.CountryCode, PhoneNumber: req.PhoneNumber})
 	response["linking_diagnostics"] = gopayLinkingDiagnostics(resolution)
+	attachGopayTokenLifecycle(response, resolution, linkErr)
 	if linkErr != nil {
 		response["stage"] = "linking"
 		response["ok"] = false
@@ -13932,6 +14979,7 @@ func handleGopaySmartLink(w http.ResponseWriter, r *http.Request) {
 	}
 	resolution, linkErr := createOrReuseGopayLinkingViaLocalMock(ctx, req.AccountID, gopayLink{Type: "gopay", CountryCode: req.CountryCode, PhoneNumber: req.PhoneNumber})
 	response["linking_diagnostics"] = gopayLinkingDiagnostics(resolution)
+	attachGopayTokenLifecycle(response, resolution, linkErr)
 	if linkErr != nil {
 		response["stage"] = "force_link_failed"
 		response["error"] = linkErr.Error()
@@ -13962,6 +15010,7 @@ func handleGopaySmartLink(w http.ResponseWriter, r *http.Request) {
 			response["gopay_payment_process"] = paymentResult.PaymentProcess
 			response["midtrans_status"] = paymentResult.MidtransStatus
 			response["payment_voucher"] = buildGopayPaymentVoucher(paymentResult)
+			attachGopayTerminalAutomationContract(response)
 			writeJSON(w, http.StatusOK, response)
 			return
 		}
@@ -13982,6 +15031,7 @@ func handleGopaySmartLink(w http.ResponseWriter, r *http.Request) {
 		response["gopay_payment_process"] = paymentResult.PaymentProcess
 		response["midtrans_status"] = paymentResult.MidtransStatus
 		response["payment_voucher"] = buildGopayPaymentVoucher(paymentResult)
+		attachGopayTerminalAutomationContract(response)
 		response["summary"] = map[string]any{
 			"reference_id":         paymentResult.PaymentReferenceID,
 			"payment_reference_id": paymentResult.PaymentReferenceID,
@@ -14107,14 +15157,16 @@ func handleGopayCDPOTP(w http.ResponseWriter, r *http.Request) {
 		AccountID   string `json:"account_id,omitempty"`
 		CheckoutURL string `json:"checkout_url,omitempty"`
 		TraceID     string `json:"trace_id,omitempty"`
+		RunID       string `json:"run_id,omitempty"`
 		PollDelayMS int    `json:"poll_delay_ms,omitempty"`
 	}
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<17)).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid json")
 		return
 	}
+	req.RunID = requestAutomationRunID(r, req.RunID)
 	if !isCDPReady(cdpDebuggingPort) {
-		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"ok": false, "error": "CDP not ready"})
+		writeJSON(w, http.StatusServiceUnavailable, gopayCDPReadinessResponse("cdp_not_ready", "CDP not ready", strings.TrimSpace(req.TraceID), 5000, req.RunID))
 		return
 	}
 
@@ -14137,12 +15189,14 @@ func handleGopayCDPOTP(w http.ResponseWriter, r *http.Request) {
 		CheckoutURL: req.CheckoutURL,
 	})
 	if terminalTarget, terminalResult, _ := findScopedTerminalGopayCDPTarget(cdpDebuggingPort, scope); terminalTarget != nil {
-		writeJSON(w, http.StatusOK, gopayCDPResponseForTarget(terminalTarget, scope, terminalResult, strings.TrimSpace(req.TraceID), req.PollDelayMS))
+		response := gopayCDPResponseForTarget(terminalTarget, scope, terminalResult, strings.TrimSpace(req.TraceID), req.PollDelayMS)
+		response["run_id"] = req.RunID
+		writeJSON(w, http.StatusOK, response)
 		return
 	}
 	target, err := findBestGopayCDPTarget(cdpDebuggingPort, scope)
 	if err != nil {
-		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"ok": false, "error": err.Error()})
+		writeJSON(w, http.StatusServiceUnavailable, gopayCDPReadinessResponse("gopay_target_waiting", err.Error(), strings.TrimSpace(req.TraceID), 5000, req.RunID))
 		return
 	}
 	conn, _, err := websocket.DefaultDialer.Dial(target.WebSocketDebuggerURL, nil)
@@ -14152,7 +15206,13 @@ func handleGopayCDPOTP(w http.ResponseWriter, r *http.Request) {
 	}
 	defer conn.Close()
 
-	resultJSON, _ := executeGopayCDPFlowScript(conn, gopayCDPFlowScript(normalizeGopayPIN(req.PIN), auditCaptureSensitive()))
+	normalizedPIN := normalizeGopayPIN(req.PIN)
+	captureSensitive := auditCaptureSensitive()
+	resultJSON, _ := executeGopayCDPFlowScript(
+		conn,
+		gopayCDPFlowScript(normalizedPIN, captureSensitive, false),
+		gopayCDPFlowScript(normalizedPIN, captureSensitive, true),
+	)
 	var result map[string]any
 	if resultJSON != "" {
 		json.Unmarshal([]byte(resultJSON), &result)
@@ -14178,6 +15238,7 @@ func handleGopayCDPOTP(w http.ResponseWriter, r *http.Request) {
 			result["pin_auto_filled"] = true
 			result["pin_auto_submitted"] = true
 			result["pin_input_strategy"] = "cdp_keyboard_events"
+			markGopayCDPPINSubmitted(conn, result)
 		} else {
 			result["pin_keyboard_input_error"] = err.Error()
 			if stringifyJSONValue(result["pin_auto_block_reason"]) == "" {
@@ -14190,90 +15251,276 @@ func handleGopayCDPOTP(w http.ResponseWriter, r *http.Request) {
 			result["detected_otp"] = detected
 		}
 	}
-	writeJSON(w, http.StatusOK, gopayCDPResponseForTarget(target, scope, result, strings.TrimSpace(req.TraceID), req.PollDelayMS))
+	response := gopayCDPResponseForTarget(target, scope, result, strings.TrimSpace(req.TraceID), req.PollDelayMS)
+	response["run_id"] = req.RunID
+	writeJSON(w, http.StatusOK, response)
 }
 
 func gopayCDPResponseForTarget(target *cdpTarget, scope gopayCDPTargetScope, result map[string]any, traceID string, pollDelayMS int) map[string]any {
 	if result == nil {
 		result = map[string]any{"error": "empty result"}
 	}
-	return map[string]any{
-		"ok":                              true,
-		"stage":                           firstNonEmpty(stringifyJSONValue(result["page_stage"]), "page_observed"),
-		"trace_id":                        strings.TrimSpace(traceID),
-		"poll_delay_ms":                   pollDelayMS,
-		"selected_target_id":              target.ID,
-		"selected_target_url":             target.URL,
-		"selected_target_type":            target.Type,
-		"selected_target_score":           gopayCDPTargetScore(*target) + gopayCDPTargetScopeScore(*target, scope),
-		"target_scope":                    map[string]any{"target_id": scope.TargetID, "target_url": scope.TargetURL, "account_id": scope.AccountID, "checkout_url": scope.CheckoutURL},
-		"payment_completed":               boolMapValue(result, "payment_completed"),
-		"payment_complete_reason":         stringifyJSONValue(result["payment_complete_reason"]),
-		"pin_stage":                       stringifyJSONValue(result["pin_stage"]),
-		"pin_auto_filled":                 boolMapValue(result, "pin_auto_filled"),
-		"pin_auto_submitted":              boolMapValue(result, "pin_auto_submitted"),
-		"pin_input_strategy":              stringifyJSONValue(result["pin_input_strategy"]),
-		"pin_keyboard_input_requested":    boolMapValue(result, "pin_keyboard_input_requested"),
-		"pin_keyboard_input_dispatched":   boolMapValue(result, "pin_keyboard_input_dispatched"),
-		"pin_keyboard_input_reason":       stringifyJSONValue(result["pin_keyboard_input_reason"]),
-		"pin_keyboard_focus_rect":         result["pin_keyboard_focus_rect"],
-		"pin_keyboard_input_error":        stringifyJSONValue(result["pin_keyboard_input_error"]),
-		"order_amount":                    result["order_amount"],
-		"balance_amount":                  result["balance_amount"],
-		"balance_state":                   stringifyJSONValue(result["balance_state"]),
-		"balance_shortfall":               result["balance_shortfall"],
-		"insufficient_balance_reason":     stringifyJSONValue(result["insufficient_balance_reason"]),
-		"hubungkan_auto_clicked":          boolMapValue(result, "hubungkan_auto_clicked"),
-		"pay_now_auto_clicked":            boolMapValue(result, "pay_now_auto_clicked"),
-		"pay_now_button_detected":         boolMapValue(result, "pay_now_button_detected"),
-		"pay_now_trusted_clicked":         boolMapValue(result, "pay_now_trusted_clicked"),
-		"pay_now_attempt_limit_reached":   boolMapValue(result, "pay_now_attempt_limit_reached"),
-		"pay_now_trusted_click_count":     result["pay_now_trusted_click_count"],
-		"pay_now_post_click_elapsed_ms":   result["pay_now_post_click_elapsed_ms"],
-		"pay_now_block_reason":            stringifyJSONValue(result["pay_now_block_reason"]),
-		"auto_action_paused":              boolMapValue(result, "auto_action_paused"),
-		"auto_action_stage":               stringifyJSONValue(result["auto_action_stage"]),
-		"payment_expired":                 boolMapValue(result, "payment_expired"),
-		"payment_expired_reason":          stringifyJSONValue(result["payment_expired_reason"]),
-		"payment_failed":                  boolMapValue(result, "payment_failed"),
-		"payment_failure_reason":          stringifyJSONValue(result["payment_failure_reason"]),
-		"otp_manual_required":             boolMapValue(result, "otp_manual_required"),
-		"has_otp_field":                   boolMapValue(result, "has_otp_field"),
-		"has_pin_field":                   boolMapValue(result, "has_pin_field"),
-		"pin_auto_block_reason":           stringifyJSONValue(result["pin_auto_block_reason"]),
-		"pin_attempt_count":               result["pin_attempt_count"],
-		"pin_detection_reason":            stringifyJSONValue(result["pin_detection_reason"]),
-		"pin_input_candidate_count":       result["pin_input_candidate_count"],
-		"pin_input_event_source":          stringifyJSONValue(result["pin_input_event_source"]),
-		"pin_input_event_is_trusted":      result["pin_input_event_is_trusted"],
-		"pin_input_event_type":            stringifyJSONValue(result["pin_input_event_type"]),
-		"pin_input_event_at":              result["pin_input_event_at"],
-		"pin_input_event_age_ms":          result["pin_input_event_age_ms"],
-		"pin_input_event_count":           result["pin_input_event_count"],
-		"pin_input_trusted_event_count":   result["pin_input_trusted_event_count"],
-		"pin_input_synthetic_event_count": result["pin_input_synthetic_event_count"],
-		"pin_input_observed_value":        stringifyJSONValue(result["pin_input_observed_value"]),
-		"pin_input_observed_value_length": result["pin_input_observed_value_length"],
-		"pin_input_expected_value":        stringifyJSONValue(result["pin_input_expected_value"]),
-		"pin_input_matches_expected":      boolMapValue(result, "pin_input_matches_expected"),
-		"pin_input_value_capture_enabled": boolMapValue(result, "pin_input_value_capture_enabled"),
-		"pin_input_events":                result["pin_input_events"],
-		"pin_page_by_signal":              boolMapValue(result, "pin_page_by_signal"),
-		"pin_surface_detected":            boolMapValue(result, "pin_surface_detected"),
-		"otp_page_detected":               boolMapValue(result, "otp_page_detected"),
-		"pin_context_selected":            boolMapValue(result, "pin_context_selected"),
-		"execution_context_id":            result["execution_context_id"],
-		"execution_context_origin":        stringifyJSONValue(result["execution_context_origin"]),
-		"execution_context_frame_id":      stringifyJSONValue(result["execution_context_frame_id"]),
-		"execution_context_frame_url":     stringifyJSONValue(result["execution_context_frame_url"]),
-		"execution_context_score":         result["execution_context_score"],
-		"execution_context_candidates":    result["execution_context_candidates"],
-		"execution_context_errors":        result["execution_context_errors"],
-		"execution_context_probe_error":   stringifyJSONValue(result["execution_context_probe_error"]),
-		"cdp_url_host":                    stringifyJSONValue(result["cdp_url_host"]),
-		"cdp_url_path":                    stringifyJSONValue(result["cdp_url_path"]),
-		"result":                          result,
+	response := map[string]any{
+		"ok":                                    true,
+		"stage":                                 firstNonEmpty(stringifyJSONValue(result["page_stage"]), "page_observed"),
+		"trace_id":                              strings.TrimSpace(traceID),
+		"poll_delay_ms":                         pollDelayMS,
+		"selected_target_id":                    target.ID,
+		"selected_target_url":                   target.URL,
+		"selected_target_type":                  target.Type,
+		"selected_target_score":                 gopayCDPTargetScore(*target) + gopayCDPTargetScopeScore(*target, scope),
+		"target_scope":                          map[string]any{"target_id": scope.TargetID, "target_url": scope.TargetURL, "account_id": scope.AccountID, "checkout_url": scope.CheckoutURL},
+		"payment_completed":                     boolMapValue(result, "payment_completed"),
+		"payment_complete_reason":               stringifyJSONValue(result["payment_complete_reason"]),
+		"midtrans_payment_success":              boolMapValue(result, "midtrans_payment_success"),
+		"merchant_login_required_after_payment": boolMapValue(result, "merchant_login_required_after_payment"),
+		"pin_stage":                             stringifyJSONValue(result["pin_stage"]),
+		"pin_auto_filled":                       boolMapValue(result, "pin_auto_filled"),
+		"pin_auto_submitted":                    boolMapValue(result, "pin_auto_submitted"),
+		"pin_input_strategy":                    stringifyJSONValue(result["pin_input_strategy"]),
+		"pin_keyboard_input_requested":          boolMapValue(result, "pin_keyboard_input_requested"),
+		"pin_keyboard_input_dispatched":         boolMapValue(result, "pin_keyboard_input_dispatched"),
+		"pin_keyboard_input_reason":             stringifyJSONValue(result["pin_keyboard_input_reason"]),
+		"pin_keyboard_focus_rect":               result["pin_keyboard_focus_rect"],
+		"pin_keyboard_input_error":              stringifyJSONValue(result["pin_keyboard_input_error"]),
+		"order_amount":                          result["order_amount"],
+		"balance_amount":                        result["balance_amount"],
+		"balance_state":                         stringifyJSONValue(result["balance_state"]),
+		"balance_shortfall":                     result["balance_shortfall"],
+		"insufficient_balance_reason":           stringifyJSONValue(result["insufficient_balance_reason"]),
+		"hubungkan_auto_clicked":                boolMapValue(result, "hubungkan_auto_clicked"),
+		"pay_now_auto_clicked":                  boolMapValue(result, "pay_now_auto_clicked"),
+		"pay_now_button_detected":               boolMapValue(result, "pay_now_button_detected"),
+		"pay_now_trusted_clicked":               boolMapValue(result, "pay_now_trusted_clicked"),
+		"pay_now_attempt_limit_reached":         boolMapValue(result, "pay_now_attempt_limit_reached"),
+		"pay_now_trusted_click_count":           result["pay_now_trusted_click_count"],
+		"pay_now_post_click_elapsed_ms":         result["pay_now_post_click_elapsed_ms"],
+		"pay_now_block_reason":                  stringifyJSONValue(result["pay_now_block_reason"]),
+		"auto_action_paused":                    boolMapValue(result, "auto_action_paused"),
+		"auto_action_stage":                     stringifyJSONValue(result["auto_action_stage"]),
+		"payment_expired":                       boolMapValue(result, "payment_expired"),
+		"payment_expired_reason":                stringifyJSONValue(result["payment_expired_reason"]),
+		"payment_failed":                        boolMapValue(result, "payment_failed"),
+		"payment_failure_reason":                stringifyJSONValue(result["payment_failure_reason"]),
+		"otp_manual_required":                   boolMapValue(result, "otp_manual_required"),
+		"has_otp_field":                         boolMapValue(result, "has_otp_field"),
+		"has_pin_field":                         boolMapValue(result, "has_pin_field"),
+		"pin_auto_block_reason":                 stringifyJSONValue(result["pin_auto_block_reason"]),
+		"pin_attempt_count":                     result["pin_attempt_count"],
+		"pin_detection_reason":                  stringifyJSONValue(result["pin_detection_reason"]),
+		"pin_input_candidate_count":             result["pin_input_candidate_count"],
+		"pin_input_event_source":                stringifyJSONValue(result["pin_input_event_source"]),
+		"pin_input_event_is_trusted":            result["pin_input_event_is_trusted"],
+		"pin_input_event_type":                  stringifyJSONValue(result["pin_input_event_type"]),
+		"pin_input_event_at":                    result["pin_input_event_at"],
+		"pin_input_event_age_ms":                result["pin_input_event_age_ms"],
+		"pin_input_event_count":                 result["pin_input_event_count"],
+		"pin_input_trusted_event_count":         result["pin_input_trusted_event_count"],
+		"pin_input_synthetic_event_count":       result["pin_input_synthetic_event_count"],
+		"pin_input_observed_value":              stringifyJSONValue(result["pin_input_observed_value"]),
+		"pin_input_observed_value_length":       result["pin_input_observed_value_length"],
+		"pin_input_expected_value":              stringifyJSONValue(result["pin_input_expected_value"]),
+		"pin_input_matches_expected":            boolMapValue(result, "pin_input_matches_expected"),
+		"pin_input_value_capture_enabled":       boolMapValue(result, "pin_input_value_capture_enabled"),
+		"pin_input_events":                      result["pin_input_events"],
+		"pin_trusted_keyboard_primary":          boolMapValue(result, "pin_trusted_keyboard_primary"),
+		"binding_pin_submitted_at":              result["binding_pin_submitted_at"],
+		"payment_pin_submitted_at":              result["payment_pin_submitted_at"],
+		"pin_reentry_after_submit":              boolMapValue(result, "pin_reentry_after_submit"),
+		"pin_reentry_elapsed_ms":                result["pin_reentry_elapsed_ms"],
+		"pin_reentry_sequence":                  result["pin_reentry_sequence"],
+		"pin_stage_reclassified":                boolMapValue(result, "pin_stage_reclassified"),
+		"pin_error_text_match":                  stringifyJSONValue(result["pin_error_text_match"]),
+		"pin_page_by_signal":                    boolMapValue(result, "pin_page_by_signal"),
+		"pin_surface_detected":                  boolMapValue(result, "pin_surface_detected"),
+		"otp_page_detected":                     boolMapValue(result, "otp_page_detected"),
+		"pin_context_selected":                  boolMapValue(result, "pin_context_selected"),
+		"execution_context_id":                  result["execution_context_id"],
+		"execution_context_origin":              stringifyJSONValue(result["execution_context_origin"]),
+		"execution_context_frame_id":            stringifyJSONValue(result["execution_context_frame_id"]),
+		"execution_context_frame_url":           stringifyJSONValue(result["execution_context_frame_url"]),
+		"execution_context_score":               result["execution_context_score"],
+		"execution_context_candidates":          result["execution_context_candidates"],
+		"execution_context_errors":              result["execution_context_errors"],
+		"execution_context_probe_error":         stringifyJSONValue(result["execution_context_probe_error"]),
+		"cdp_url_host":                          stringifyJSONValue(result["cdp_url_host"]),
+		"cdp_url_path":                          stringifyJSONValue(result["cdp_url_path"]),
+		"result":                                result,
 	}
+	return decorateGopayCDPAutomationResponse(response, result)
+}
+
+func gopayCDPReadinessResponse(stage string, message string, traceID string, pollAfterMS int64, runID ...string) map[string]any {
+	resolvedRunID := ""
+	if len(runID) > 0 {
+		resolvedRunID = strings.TrimSpace(runID[0])
+	}
+	response := map[string]any{
+		"ok":                    false,
+		"stage":                 stage,
+		"trace_id":              strings.TrimSpace(traceID),
+		"run_id":                resolvedRunID,
+		"error":                 message,
+		"cdp_ready":             false,
+		"page_classification":   "cdp_recovering",
+		"next_action":           "wait_for_chrome_cdp",
+		"human_message":         "Chrome CDP 暂未就绪，等待无痕窗口恢复后再继续监听。",
+		"retryable":             true,
+		"terminal":              false,
+		"poll_after_ms":         pollAfterMS,
+		"contract_version":      automationContractVersion,
+		"primary_button":        "刷新 CDP 状态",
+		"secondary_button":      "重新打开无痕窗口",
+		"safe_to_auto_continue": true,
+	}
+	if stage == "gopay_target_waiting" {
+		response["cdp_ready"] = true
+		response["page_classification"] = "target_waiting"
+		response["next_action"] = "wait_gopay_or_midtrans_target"
+		response["human_message"] = "尚未找到 GoPay/Midtrans 目标页面，继续等待页面跳转或手动打开支付页。"
+		response["primary_button"] = "继续监听"
+	}
+	return response
+}
+
+func decorateGopayCDPAutomationResponse(response map[string]any, result map[string]any) map[string]any {
+	if response == nil {
+		response = map[string]any{}
+	}
+	if result == nil {
+		result = map[string]any{}
+	}
+	response["contract_version"] = automationContractVersion
+	stage := firstNonEmpty(stringifyJSONValue(response["stage"]), stringifyJSONValue(result["page_stage"]), "page_observed")
+	pinStage := firstNonEmpty(stringifyJSONValue(response["pin_stage"]), stringifyJSONValue(result["pin_stage"]))
+	balanceState := firstNonEmpty(stringifyJSONValue(response["balance_state"]), stringifyJSONValue(result["balance_state"]))
+	payNowBlockReason := firstNonEmpty(stringifyJSONValue(response["pay_now_block_reason"]), stringifyJSONValue(result["pay_now_block_reason"]))
+	autoActionStage := firstNonEmpty(stringifyJSONValue(response["auto_action_stage"]), stringifyJSONValue(result["auto_action_stage"]))
+	midtransPaymentSuccessWaiting := boolMapValue(response, "midtrans_payment_success") || stage == "midtrans_payment_success_waiting_redirect"
+	merchantLoginRequiredAfterPayment := boolMapValue(response, "merchant_login_required_after_payment") || stage == "merchant_login_required_after_payment"
+	paymentCompleted := (boolMapValue(response, "payment_completed") || stage == "gopay_complete") && !midtransPaymentSuccessWaiting && !merchantLoginRequiredAfterPayment
+	paymentExpired := boolMapValue(response, "payment_expired") || stage == "gopay_session_expired"
+	paymentFailed := boolMapValue(response, "payment_failed") || stage == "gopay_payment_failed"
+	hasPIN := boolMapValue(response, "has_pin_field") || pinStage != ""
+	hasOTP := boolMapValue(response, "has_otp_field") || boolMapValue(response, "otp_manual_required")
+	pinSubmitted := boolMapValue(response, "pin_auto_submitted")
+	pinFilled := boolMapValue(response, "pin_auto_filled")
+	payNowDetected := boolMapValue(response, "pay_now_button_detected")
+	payNowClicked := boolMapValue(response, "pay_now_trusted_clicked") || boolMapValue(response, "pay_now_auto_clicked") || stage == "pay_now_trusted_click"
+	payNowWaiting := stage == "pay_now_post_click_wait" || autoActionStage == "pay_now_trusted_click" || payNowBlockReason == "trusted_click_already_sent" || payNowBlockReason == "trusted_click_no_transition"
+	insufficient := balanceState == "insufficient" || stage == "gopay_insufficient_balance"
+
+	pageClassification := stage
+	nextAction := "continue_monitoring"
+	humanMessage := "继续监听 GoPay 支付页面。"
+	retryable := true
+	terminal := false
+	pollAfterMS := int64(1500)
+	primaryButton := ""
+	secondaryButton := ""
+
+	switch {
+	case merchantLoginRequiredAfterPayment:
+		pageClassification = "merchant_login_required_after_payment"
+		nextAction = "relogin_and_verify_subscription"
+		humanMessage = "支付页已返回登录页，不能记录为成功；请重新登录并确认订阅结果。"
+		retryable = false
+		terminal = true
+		pollAfterMS = 0
+		primaryButton = "重新登录确认"
+	case midtransPaymentSuccessWaiting:
+		pageClassification = "midtrans_payment_success_waiting_redirect"
+		nextAction = "wait_merchant_success_redirect"
+		humanMessage = "Midtrans 已显示支付成功，继续等待 OpenAI 最终成功跳转确认。"
+		retryable = true
+		terminal = false
+		pollAfterMS = 1000
+	case paymentCompleted:
+		pageClassification = "terminal_after_payment"
+		nextAction = "save_success_record_and_cleanup"
+		humanMessage = "OpenAI 最终成功页已确认，正在保存成功记录并停止本轮监听。"
+		retryable = false
+		terminal = true
+		pollAfterMS = 0
+	case paymentExpired:
+		pageClassification = "payment_expired"
+		nextAction = "regenerate_checkout"
+		humanMessage = "GoPay 支付会话已超时，请关闭旧支付页并重新生成结账链路。"
+		retryable = false
+		terminal = true
+		pollAfterMS = 0
+		primaryButton = "重新生成支付链接"
+	case paymentFailed:
+		pageClassification = "payment_failed"
+		nextAction = "regenerate_checkout"
+		humanMessage = "GoPay 支付页返回失败，需要重新生成结账链路或更换支付方式。"
+		retryable = false
+		terminal = true
+		pollAfterMS = 0
+		primaryButton = "重新生成支付链接"
+	case insufficient:
+		pageClassification = "gopay_balance_insufficient"
+		nextAction = "recharge_gopay_or_refresh_balance"
+		humanMessage = "GoPay 余额不足，已暂停 Pay now 自动点击；充值后点击支付页 Refresh。"
+		pollAfterMS = 7000
+		primaryButton = "继续监听余额"
+	case hasPIN && pinSubmitted:
+		pageClassification = firstNonEmpty(stage, "pin_submitted")
+		nextAction = "wait_for_payment_result"
+		humanMessage = "PIN 已自动填入并提交，等待页面返回下一步或支付结果。"
+		pollAfterMS = 1200
+	case hasPIN && pinFilled:
+		pageClassification = firstNonEmpty(stage, "pin_filled")
+		nextAction = "wait_pin_submission_result"
+		humanMessage = "PIN 已自动填入，等待页面继续。"
+		pollAfterMS = 800
+	case hasPIN:
+		pageClassification = firstNonEmpty(stage, "pin_entry_detected")
+		nextAction = "enter_pin_automatically"
+		humanMessage = "检测到 PIN 页面，将自动输入面板中的 PIN。"
+		pollAfterMS = 550
+	case hasOTP:
+		pageClassification = "otp_manual_required"
+		nextAction = "enter_otp_manually"
+		humanMessage = "检测到 OTP 页面，请输入收到的验证码，系统会继续监听 PIN 与支付结果。"
+		pollAfterMS = 1200
+		primaryButton = "我已输入 OTP"
+	case payNowWaiting:
+		pageClassification = "pay_now_post_click_wait"
+		nextAction = "wait_payment_pin_or_manual_check"
+		humanMessage = "Pay now 已真实点击一次，系统不会重复点击；继续低频监听 PIN 页面或支付结果。"
+		pollAfterMS = 5000
+		primaryButton = "继续监听 PIN"
+	case payNowClicked:
+		pageClassification = "pay_now_trusted_click"
+		nextAction = "wait_payment_pin_or_redirect"
+		humanMessage = "已通过 CDP 真实鼠标点击 Pay now，等待页面跳转或出现支付 PIN。"
+		pollAfterMS = 2500
+	case payNowDetected:
+		pageClassification = "pay_now_ready_observed"
+		nextAction = "allow_one_trusted_pay_now_click"
+		humanMessage = "检测到 Pay now 按钮，系统只允许一次真实点击以保护支付链路。"
+		pollAfterMS = 1000
+	case balanceState == "rp0" || stage == "balance_wait_rp0":
+		pageClassification = "balance_wait_rp0"
+		nextAction = "wait_balance_refresh"
+		humanMessage = "检测到余额为 Rp0，暂停自动操作并等待余额变化。"
+		pollAfterMS = 5000
+	}
+
+	response["page_classification"] = pageClassification
+	response["next_action"] = nextAction
+	response["human_message"] = humanMessage
+	response["retryable"] = retryable
+	response["terminal"] = terminal
+	response["poll_after_ms"] = pollAfterMS
+	if primaryButton != "" {
+		response["primary_button"] = primaryButton
+	}
+	if secondaryButton != "" {
+		response["secondary_button"] = secondaryButton
+	}
+	return response
 }
 
 func gopayCDPTerminalProbeScript() string {
@@ -14357,9 +15604,14 @@ func gopayCDPFlowScript(preferredPIN string, captureSensitive ...bool) string {
 	if len(captureSensitive) > 0 {
 		capturePinInputValue = captureSensitive[0]
 	}
+	allowAutoActions := true
+	if len(captureSensitive) > 1 {
+		allowAutoActions = captureSensitive[1]
+	}
 	return fmt.Sprintf(`(async () => {
 		const preferredPin = %s;
 		const capturePinInputValue = %t;
+		const allowAutoActions = %t;
 		const currentURL = window.location.href || '';
 		const parsedURL = (() => { try { return new URL(currentURL); } catch (_err) { return null; } })();
 		const urlHost = (parsedURL?.host || '').toLowerCase();
@@ -14402,6 +15654,8 @@ func gopayCDPFlowScript(preferredPIN string, captureSensitive ...bool) string {
 			page_text_snippet: '',
 			payment_completed: false,
 			payment_complete_reason: '',
+			midtrans_payment_success: false,
+			merchant_login_required_after_payment: false,
 			payment_expired: false,
 			payment_expired_reason: '',
 			payment_failed: false,
@@ -14425,6 +15679,14 @@ func gopayCDPFlowScript(preferredPIN string, captureSensitive ...bool) string {
 			pin_input_matches_expected: false,
 			pin_input_value_capture_enabled: capturePinInputValue,
 			pin_input_events: [],
+			binding_pin_submitted_at: 0,
+			payment_pin_submitted_at: 0,
+			pin_trusted_keyboard_primary: false,
+			pin_reentry_after_submit: false,
+			pin_reentry_elapsed_ms: 0,
+			pin_reentry_sequence: 1,
+			pin_stage_reclassified: false,
+			pin_error_text_match: '',
 			pin_page_by_signal: false,
 			pin_surface_detected: false,
 			otp_page_detected: false,
@@ -14501,7 +15763,14 @@ func gopayCDPFlowScript(preferredPIN string, captureSensitive ...bool) string {
 			'订阅成功',
 			'已订阅'
 		];
-		const successURLPattern = /(?:success|complete|completed|finish|thank|receipt)/i.test(currentURL);
+		const isMidtransHost = /(^|\.)midtrans\.com$/i.test(urlHost);
+		const isOpenAIMerchantHost = /(^|\.)chatgpt\.com$/i.test(urlHost) || /(^|\.)openai\.com$/i.test(urlHost) || /(^|\.)pay\.openai\.com$/i.test(urlHost);
+		const loginURLPattern = /\/auth\/login|\/log-in|\/login|sign[_-]?in/i.test(currentURL) || /auth\.openai\.com/i.test(currentURL);
+		const loginTextPattern = /\b(log in|sign in|continue with email|welcome back)\b/i.test(pageText) || /登录|登入|继续使用邮箱|邮箱登录/.test(pageText);
+		const merchantLoginRequired = isOpenAIMerchantHost && (loginURLPattern || loginTextPattern);
+		const merchantSuccessText = successTextPatterns.some((pattern) => lowerText.includes(pattern)) || /you'?re all set|your subscription is ready|欢迎使用|订阅已开通|已升级/.test(lowerText);
+		const merchantSuccessURLPattern = isOpenAIMerchantHost && !loginURLPattern && /(?:success|complete|completed|finish|thank|receipt)/i.test(currentURL);
+		const midtransSuccessText = successTextPatterns.some((pattern) => lowerText.includes(pattern)) && (lowerText.includes('order id') || lowerText.includes('rp') || lowerText.includes('close in') || lowerText.includes('checkmark-success') || lowerText.includes('payment successful'));
 		const expiredTextPatterns = [
 			'waktunya habis',
 			'kalau kamu mau coba lagi',
@@ -14553,10 +15822,26 @@ func gopayCDPFlowScript(preferredPIN string, captureSensitive ...bool) string {
 			result.auto_action_stage = 'gopay_payment_failed';
 			return JSON.stringify(result);
 		}
-		if (successURLPattern || successTextPatterns.some((pattern) => lowerText.includes(pattern))) {
+		if (merchantLoginRequired) {
+			result.merchant_login_required_after_payment = true;
+			result.payment_failed = true;
+			result.payment_failure_reason = 'merchant_login_required_after_payment';
+			result.page_stage = 'merchant_login_required_after_payment';
+			result.auto_action_paused = true;
+			result.auto_action_stage = 'merchant_login_required_after_payment';
+			return JSON.stringify(result);
+		}
+		if ((merchantSuccessURLPattern || merchantSuccessText) && !isMidtransHost) {
 			result.payment_completed = true;
-			result.payment_complete_reason = successURLPattern ? 'url_or_text_success' : 'text_success';
+			result.payment_complete_reason = merchantSuccessURLPattern ? 'merchant_redirect_success_url' : 'merchant_redirect_success_text';
 			result.page_stage = 'gopay_complete';
+			return JSON.stringify(result);
+		}
+		if (isMidtransHost && midtransSuccessText) {
+			result.midtrans_payment_success = true;
+			result.payment_complete_reason = 'midtrans_success_waiting_merchant_redirect';
+			result.page_stage = 'midtrans_payment_success_waiting_redirect';
+			result.auto_action_stage = 'midtrans_payment_success_waiting_redirect';
 			return JSON.stringify(result);
 		}
 		const inputElements = () => collectElements('input, textarea').filter((el) => visible(el) && el.type !== 'hidden');
@@ -14695,6 +15980,8 @@ func gopayCDPFlowScript(preferredPIN string, captureSensitive ...bool) string {
 			try { window.sessionStorage?.setItem(key, String(next)); } catch (_err) {}
 			return next;
 		};
+		const bindingPinSubmittedAtKey = 'gopay_cdp_binding_pin_submitted_at_' + actionScope;
+		const paymentPinSubmittedAtKey = 'gopay_cdp_payment_pin_submitted_at_' + actionScope;
 		const findOtp = (text) => {
 			const match = String(text || '').match(/\b(\d{6})\b/);
 			return match ? match[1] : '';
@@ -14886,31 +16173,49 @@ func gopayCDPFlowScript(preferredPIN string, captureSensitive ...bool) string {
 		const pinPage = pinPageBySignal && pinInputs.length > 0;
 		const paymentContext = paymentPath || lowerText.includes('payment') || lowerText.includes('bayar') || lowerText.includes('pembayaran') || lowerText.includes('total') || lowerText.includes('subscribe') || lowerText.includes('subscription');
 		const bindingContext = bindingPath || lowerText.includes('link') || lowerText.includes('hubungkan') || lowerText.includes('authorize') || lowerText.includes('otorisasi');
+		const bindingPinSubmittedAt = storageNumber(bindingPinSubmittedAtKey);
+		const paymentPinSubmittedAt = storageNumber(paymentPinSubmittedAtKey);
+		const observedPinValueBeforeAction = pinValueSnapshot(pinInputs);
+		const pinErrorTextPatterns = ['pin salah', 'wrong pin', 'incorrect pin', 'invalid pin', 'pin tidak sesuai', 'pin keliru', 'pin gagal'];
+		const pinErrorTextMatch = pinErrorTextPatterns.find((pattern) => lowerText.includes(pattern)) || '';
+		result.binding_pin_submitted_at = bindingPinSubmittedAt;
+		result.payment_pin_submitted_at = paymentPinSubmittedAt;
+		result.pin_error_text_match = pinErrorTextMatch;
+		result.pin_reentry_elapsed_ms = bindingPinSubmittedAt > 0 ? Math.max(0, Date.now() - bindingPinSubmittedAt) : 0;
+		const authPinReentryAfterBinding = !!(
+			bindingPinPath &&
+			bindingPinSubmittedAt > 0 &&
+			paymentPinSubmittedAt <= 0 &&
+			pinInputs.length > 0 &&
+			observedPinValueBeforeAction.length === 0 &&
+			result.pin_reentry_elapsed_ms >= 700 &&
+			result.pin_reentry_elapsed_ms <= 120000 &&
+			!pinErrorTextMatch
+		);
+		if (authPinReentryAfterBinding) {
+			result.pin_reentry_after_submit = true;
+			result.pin_reentry_sequence = 2;
+		}
+		const classifyPinStage = () => {
+			if (paymentPath || authPinReentryAfterBinding) return 'payment';
+			if (bindingPath) return 'binding';
+			return paymentContext && !bindingContext ? 'payment' : 'binding';
+		};
+		const finalizePinClassification = (baseReason) => {
+			result.pin_stage = classifyPinStage();
+			result.page_stage = result.pin_stage === 'payment' ? 'pin_entry_payment' : 'pin_entry_binding';
+			result.pin_detection_reason = authPinReentryAfterBinding ? 'auth_pin_reentry_after_binding_submit' : baseReason;
+			result.pin_stage_reclassified = !!authPinReentryAfterBinding;
+		};
 
 		if (pinPageBySignal && pinInputs.length > 0) {
-			if (paymentPath) {
-				result.pin_stage = 'payment';
-			} else if (bindingPath) {
-				result.pin_stage = 'binding';
-			} else {
-				result.pin_stage = paymentContext && !bindingContext ? 'payment' : 'binding';
-			}
-			result.page_stage = result.pin_stage === 'payment' ? 'pin_entry_payment' : 'pin_entry_binding';
-			result.pin_detection_reason = otpPage ? 'pin_signal_wins_over_otp_text' : 'pin_signal_with_inputs';
+			finalizePinClassification(otpPage ? 'pin_signal_wins_over_otp_text' : 'pin_signal_with_inputs');
 		} else if (otpPage) {
 			result.page_stage = 'otp_entry';
 			result.otp_manual_required = true;
 			result.pin_detection_reason = pinPageBySignal ? 'pin_signal_without_inputs_on_otp_surface' : '';
 		} else if (pinPageBySignal) {
-			if (paymentPath) {
-				result.pin_stage = 'payment';
-			} else if (bindingPath) {
-				result.pin_stage = 'binding';
-			} else {
-				result.pin_stage = paymentContext && !bindingContext ? 'payment' : 'binding';
-			}
-			result.page_stage = result.pin_stage === 'payment' ? 'pin_entry_payment' : 'pin_entry_binding';
-			result.pin_detection_reason = framePinHint ? 'cross_origin_pin_frame_detected_without_attached_inputs' : 'pin_signal_without_inputs';
+			finalizePinClassification(framePinHint ? 'cross_origin_pin_frame_detected_without_attached_inputs' : 'pin_signal_without_inputs');
 		}
 
 		const isGoPayActionPage = urlHost.includes('gopayapi.com') ||
@@ -14959,7 +16264,7 @@ func gopayCDPFlowScript(preferredPIN string, captureSensitive ...bool) string {
 			const hubungkanButton = await findStableActionByExactText(['Hubungkan']);
 			const hubungkanKey = 'gopay_cdp_hubungkan_' + actionScope;
 			const hubungkanCooldownKey = 'gopay_cdp_hubungkan_cooldown_' + actionScope;
-			if (hubungkanButton && !storageGet(hubungkanKey) && !storageFresh(hubungkanCooldownKey, 10000)) {
+			if (allowAutoActions && hubungkanButton && !storageGet(hubungkanKey) && !storageFresh(hubungkanCooldownKey, 10000)) {
 				storageSet(hubungkanKey);
 				storageSetNow(hubungkanCooldownKey);
 				clickElement(hubungkanButton);
@@ -14985,7 +16290,7 @@ func gopayCDPFlowScript(preferredPIN string, captureSensitive ...bool) string {
 				result.pay_now_trusted_click_count = payNowTrustedAttempts;
 				result.pay_now_post_click_elapsed_ms = payNowPostClickElapsedMS;
 				result.pay_now_attempt_limit_reached = payNowTrustedLimitReached && payNowPostClickElapsedMS >= 20000;
-				if (payNowButton && result.pay_now_button_rect && !payNowTrustedLimitReached && !storageFresh(payNowTrustedCooldownKey, 2500)) {
+				if (allowAutoActions && payNowButton && result.pay_now_button_rect && !payNowTrustedLimitReached && !storageFresh(payNowTrustedCooldownKey, 2500)) {
 					result.pay_now_trusted_click_requested = true;
 					result.pay_now_trusted_click_count = storageIncrement(payNowTrustedKey);
 					storageSetNow(payNowTrustedCooldownKey);
@@ -15085,8 +16390,18 @@ func gopayCDPFlowScript(preferredPIN string, captureSensitive ...bool) string {
 			}
 			return false;
 		};
+		const trustedKeyboardCandidate = () => {
+			if (!result.page_stage.startsWith('pin_entry_') || !pinInputs.length || !preferredPin || preferredPin.length !== 6) return null;
+			const focusInput = splitPinInputs[0] || singlePinInput || pinInputs[0];
+			return rectFromElement(focusInput) || pinKeyboardFocusRect();
+		};
+		const trustedKeyboardRect = trustedKeyboardCandidate();
+		const useTrustedKeyboardPrimary = !!trustedKeyboardRect;
 		if (result.auto_action_paused) {
 			result.pin_auto_block_reason = 'auto_action_paused';
+		} else if (result.page_stage.startsWith('pin_entry_') && !allowAutoActions) {
+			result.pin_auto_block_reason = 'probe_only';
+			result.auto_action_stage = 'probe_only';
 		} else if (result.page_stage.startsWith('pin_entry_') && (!preferredPin || preferredPin.length !== 6)) {
 			result.pin_auto_block_reason = 'missing_or_invalid_pin';
 		} else if (result.page_stage.startsWith('pin_entry_') && result.already_handled) {
@@ -15096,10 +16411,16 @@ func gopayCDPFlowScript(preferredPIN string, captureSensitive ...bool) string {
 		} else if (result.page_stage.startsWith('pin_entry_') && result.pin_attempt_count >= 1) {
 			result.pin_auto_block_reason = 'attempt_limit';
 		}
-		if (!result.auto_action_paused && result.page_stage.startsWith('pin_entry_') && preferredPin && preferredPin.length === 6 && !result.already_handled && result.pin_attempt_count < 1 && !storageFresh(pinCooldownKey, 3000)) {
+		if (allowAutoActions && !result.auto_action_paused && result.page_stage.startsWith('pin_entry_') && preferredPin && preferredPin.length === 6 && !result.already_handled && result.pin_attempt_count < 1 && !storageFresh(pinCooldownKey, 3000)) {
 			result.pin_attempt_count = storageIncrement(pinAttemptKey);
 			storageSetNow(pinCooldownKey);
-			if (singlePinInput) {
+			if (useTrustedKeyboardPrimary) {
+				result.pin_trusted_keyboard_primary = true;
+				result.pin_keyboard_input_requested = true;
+				result.pin_keyboard_input_reason = 'trusted_cdp_keyboard_primary';
+				result.pin_keyboard_focus_rect = trustedKeyboardRect;
+				result.pin_input_strategy = 'cdp_keyboard_events';
+			} else if (singlePinInput) {
 				setNativeValue(singlePinInput, preferredPin);
 				result.pin_auto_filled = true;
 				result.pin_input_strategy = 'single_input';
@@ -15143,6 +16464,13 @@ func gopayCDPFlowScript(preferredPIN string, captureSensitive ...bool) string {
 				syncPinInputAudit(pinInputs);
 				if (result.pin_auto_submitted) {
 					storageSet(handledKey);
+					if (result.pin_stage === 'binding') {
+						storageSetNow(bindingPinSubmittedAtKey);
+						result.binding_pin_submitted_at = storageNumber(bindingPinSubmittedAtKey);
+					} else if (result.pin_stage === 'payment') {
+						storageSetNow(paymentPinSubmittedAtKey);
+						result.payment_pin_submitted_at = storageNumber(paymentPinSubmittedAtKey);
+					}
 				}
 			} else if (result.pin_keyboard_input_requested) {
 				result.pin_auto_block_reason = '';
@@ -15153,7 +16481,7 @@ func gopayCDPFlowScript(preferredPIN string, captureSensitive ...bool) string {
 		syncPinInputAudit(pinInputs);
 
 		return JSON.stringify(result);
-	})()`, strconv.Quote(strings.TrimSpace(preferredPIN)), capturePinInputValue)
+	})()`, strconv.Quote(strings.TrimSpace(preferredPIN)), capturePinInputValue, allowAutoActions)
 }
 
 func handleGopaySnapProbe(w http.ResponseWriter, r *http.Request) {
@@ -15537,7 +16865,7 @@ func cachedPlusSubscribeProbeResponse(traceID string) (map[string]any, bool) {
 	if plusSubscribeProbeCache.response == nil || time.Since(plusSubscribeProbeCache.at) > plusSubscribeProbeServerMinInterval {
 		return nil, false
 	}
-	response := cloneStringAnyMap(plusSubscribeProbeCache.response)
+	response := decoratePlusSubscribeProbeResponse(cloneStringAnyMap(plusSubscribeProbeCache.response))
 	response["trace_id"] = traceID
 	response["server_throttled"] = true
 	response["server_throttle_ms"] = plusSubscribeProbeServerMinInterval.Milliseconds()
@@ -15555,10 +16883,115 @@ func rememberPlusSubscribeProbeResponse(response map[string]any) {
 }
 
 func writePlusSubscribeProbeResponse(w http.ResponseWriter, status int, response map[string]any) {
+	response = decoratePlusSubscribeProbeResponse(response)
 	if status == http.StatusOK {
 		rememberPlusSubscribeProbeResponse(response)
 	}
 	writeJSON(w, status, response)
+}
+
+func decoratePlusSubscribeProbeResponse(response map[string]any) map[string]any {
+	if response == nil {
+		response = map[string]any{}
+	}
+	if _, ok := response["server_throttled"]; !ok {
+		response["server_throttled"] = false
+	}
+	if _, ok := response["server_throttle_ms"]; !ok {
+		response["server_throttle_ms"] = plusSubscribeProbeServerMinInterval.Milliseconds()
+	}
+	response["contract_version"] = automationContractVersion
+
+	stage := firstNonEmpty(stringifyJSONValue(response["stage"]), "plus_subscribe_probe")
+	targetURL := stringifyJSONValue(response["url"])
+	if target, ok := response["target"].(map[string]any); ok && targetURL == "" {
+		targetURL = stringifyJSONValue(target["url"])
+	}
+	urlLower := strings.ToLower(targetURL)
+	textLower := strings.ToLower(strings.Join([]string{
+		stringifyJSONValue(response["title"]),
+		stringifyJSONValue(response["card_text"]),
+		stringifyJSONValue(response["body_text"]),
+		fmt.Sprint(response["buttons"]),
+	}, " "))
+	plusDetected := boolMapValue(response, "plus_plan_detected") || strings.Contains(textLower, "plus") || strings.Contains(textLower, "puls")
+	subscribeDetected := boolMapValue(response, "subscribe_payment_detected")
+	safeTrigger := boolMapValue(response, "safe_trigger_fetch_session")
+	checkoutPage := strings.Contains(urlLower, "/checkout/")
+
+	classification := stage
+	nextAction := "continue_monitoring"
+	humanMessage := "继续监听 Plus 订阅页面。"
+	retryable := true
+	terminal := false
+	pollAfterMS := int64(10000)
+	primaryButton := ""
+	secondaryButton := ""
+
+	switch {
+	case safeTrigger:
+		classification = "plus_subscribe_payment_ready"
+		nextAction = "fetch_session_and_open_checkout"
+		humanMessage = "已检测到 Plus 套餐与订阅并付款入口，正在获取 Session 并打开支付页。"
+		pollAfterMS = 1000
+	case stage == "cdp_not_ready":
+		classification = "cdp_recovering"
+		nextAction = "wait_for_chrome_cdp"
+		humanMessage = "Chrome CDP 暂未就绪，等待无痕窗口恢复后再继续探测。"
+		pollAfterMS = 15000
+	case stage == "cdp_targets_failed":
+		classification = "cdp_recovering"
+		nextAction = "restart_or_wait_chrome_cdp"
+		humanMessage = "读取 Chrome 页面列表失败，请确认无痕窗口和本地服务仍在运行。"
+		pollAfterMS = 15000
+	case stage == "chatgpt_target_not_found":
+		classification = "target_waiting"
+		nextAction = "open_chatgpt_checkout_or_incognito"
+		humanMessage = "没有找到 ChatGPT 页面，请先打开无痕登录或订阅页面。"
+		pollAfterMS = 15000
+	case checkoutPage && plusDetected && !subscribeDetected:
+		classification = "checkout_subscription_confirmation_required"
+		stage = classification
+		nextAction = "review_and_click_subscribe"
+		humanMessage = "已到订阅确认页，需要你审阅条款并手动点击订阅。"
+		retryable = false
+		pollAfterMS = 60000
+		primaryButton = "我已点击订阅，继续监听"
+		secondaryButton = "重新打开支付页"
+		response["manual_payment_confirmation_required"] = true
+	case checkoutPage:
+		classification = "checkout_created_not_submitted"
+		stage = classification
+		nextAction = "wait_checkout_redirect_or_manual_subscribe"
+		humanMessage = "结账页已打开但尚未进入支付跳转，等待你确认订阅或页面继续跳转。"
+		pollAfterMS = 45000
+		primaryButton = "继续监听"
+	case plusDetected && !subscribeDetected:
+		classification = "plus_plan_detected_not_ready"
+		nextAction = "wait_subscribe_payment_button"
+		humanMessage = "检测到 Plus 套餐，但还没有出现订阅并付款按钮。"
+		pollAfterMS = 20000
+	case stage == "plus_subscribe_probe_failed":
+		classification = "probe_failed"
+		nextAction = "retry_probe_after_backoff"
+		humanMessage = "Plus 页面探测失败，将退避后重试。"
+		pollAfterMS = 20000
+	}
+
+	response["stage"] = stage
+	response["page_classification"] = classification
+	response["next_action"] = nextAction
+	response["human_message"] = humanMessage
+	response["retryable"] = retryable
+	response["terminal"] = terminal
+	response["poll_after_ms"] = pollAfterMS
+	if primaryButton != "" {
+		response["primary_button"] = primaryButton
+	}
+	if secondaryButton != "" {
+		response["secondary_button"] = secondaryButton
+	}
+	return response
 }
 
 func handlePlusSubscribeSessionProbe(w http.ResponseWriter, r *http.Request) {
@@ -15570,24 +17003,27 @@ func handlePlusSubscribeSessionProbe(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Reason  string `json:"reason,omitempty"`
 		TraceID string `json:"trace_id,omitempty"`
+		RunID   string `json:"run_id,omitempty"`
 	}
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<16)).Decode(&req); err != nil && !errors.Is(err, io.EOF) {
 		writeError(w, http.StatusBadRequest, "invalid json")
 		return
 	}
 	req.TraceID = strings.TrimSpace(req.TraceID)
+	req.RunID = requestAutomationRunID(r, req.RunID)
 	if cached, ok := cachedPlusSubscribeProbeResponse(req.TraceID); ok {
+		cached["run_id"] = req.RunID
 		writeJSON(w, http.StatusOK, cached)
 		return
 	}
 	if !isCDPReady(cdpDebuggingPort) {
-		writePlusSubscribeProbeResponse(w, http.StatusOK, map[string]any{"ok": false, "stage": "cdp_not_ready", "cdp_ready": false, "safe_trigger_fetch_session": false, "error": "CDP not ready", "trace_id": req.TraceID})
+		writePlusSubscribeProbeResponse(w, http.StatusOK, map[string]any{"ok": false, "stage": "cdp_not_ready", "cdp_ready": false, "safe_trigger_fetch_session": false, "error": "CDP not ready", "trace_id": req.TraceID, "run_id": req.RunID})
 		return
 	}
 
 	targets, err := getCDPTargets(cdpDebuggingPort)
 	if err != nil {
-		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"ok": false, "stage": "cdp_targets_failed", "safe_trigger_fetch_session": false, "error": err.Error(), "trace_id": req.TraceID})
+		writePlusSubscribeProbeResponse(w, http.StatusServiceUnavailable, map[string]any{"ok": false, "stage": "cdp_targets_failed", "safe_trigger_fetch_session": false, "error": err.Error(), "trace_id": req.TraceID, "run_id": req.RunID})
 		return
 	}
 	chatTargets := make([]cdpTarget, 0)
@@ -15605,6 +17041,7 @@ func handlePlusSubscribeSessionProbe(w http.ResponseWriter, r *http.Request) {
 			"safe_trigger_fetch_session": false,
 			"chatgpt_target_count":       0,
 			"trace_id":                   req.TraceID,
+			"run_id":                     req.RunID,
 		})
 		return
 	}
@@ -15636,6 +17073,7 @@ func handlePlusSubscribeSessionProbe(w http.ResponseWriter, r *http.Request) {
 		probe["cdp_ready"] = true
 		probe["chatgpt_target_count"] = len(chatTargets)
 		probe["trace_id"] = req.TraceID
+		probe["run_id"] = req.RunID
 		if boolMapValue(probe, "safe_trigger_fetch_session") {
 			probe["checked_targets"] = checked
 			writePlusSubscribeProbeResponse(w, http.StatusOK, probe)
@@ -15662,6 +17100,7 @@ func handlePlusSubscribeSessionProbe(w http.ResponseWriter, r *http.Request) {
 	fallback["chatgpt_target_count"] = len(chatTargets)
 	fallback["checked_targets"] = checked
 	fallback["trace_id"] = req.TraceID
+	fallback["run_id"] = req.RunID
 	if _, ok := fallback["safe_trigger_fetch_session"]; !ok {
 		fallback["safe_trigger_fetch_session"] = false
 	}
@@ -15913,6 +17352,8 @@ func handleGopayFullLink(w http.ResponseWriter, r *http.Request) {
 		OTPChannel  string `json:"otp_channel,omitempty"`
 		OTP         string `json:"otp,omitempty"`
 		PIN         string `json:"pin,omitempty"`
+		TraceID     string `json:"trace_id,omitempty"`
+		RunID       string `json:"run_id,omitempty"`
 	}
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<19)).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid json")
@@ -15923,6 +17364,8 @@ func handleGopayFullLink(w http.ResponseWriter, r *http.Request) {
 	req.PhoneNumber = strings.TrimSpace(req.PhoneNumber)
 	req.OTPChannel = strings.TrimSpace(req.OTPChannel)
 	req.PIN = strings.TrimSpace(req.PIN)
+	req.TraceID = strings.TrimSpace(req.TraceID)
+	req.RunID = requestAutomationRunID(r, req.RunID)
 	if req.AccessToken == "" {
 		writeError(w, http.StatusBadRequest, "access_token required")
 		return
@@ -15941,10 +17384,18 @@ func handleGopayFullLink(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 90*time.Second)
 	defer cancel()
 	response := map[string]any{
-		"ok":          false,
-		"strategy":    "full-link",
-		"diagnostics": gopayRequestDiagnostics(req.CountryCode, req.PhoneNumber, req.OTPChannel),
-		"stages":      []map[string]any{},
+		"ok":               false,
+		"strategy":         "full-link",
+		"trace_id":         req.TraceID,
+		"run_id":           req.RunID,
+		"contract_version": automationContractVersion,
+		"retryable":        true,
+		"terminal":         false,
+		"next_action":      "continue_gopay_full_link",
+		"human_message":    "GoPay 全流程正在执行。",
+		"poll_after_ms":    int64(1500),
+		"diagnostics":      gopayRequestDiagnostics(req.CountryCode, req.PhoneNumber, req.OTPChannel),
+		"stages":           []map[string]any{},
 	}
 	addStage := func(name string, data map[string]any) {
 		data["name"] = name
@@ -16033,6 +17484,7 @@ func handleGopayFullLink(w http.ResponseWriter, r *http.Request) {
 	// ========================
 	resolution, linkErr := createOrReuseGopayLinkingViaLocalMock(ctx, accountID, gopayLink{Type: "gopay", CountryCode: req.CountryCode, PhoneNumber: req.PhoneNumber})
 	response["linking_diagnostics"] = gopayLinkingDiagnostics(resolution)
+	attachGopayTokenLifecycle(response, resolution, linkErr)
 	if linkErr != nil {
 		response["stage"] = "force_link_failed"
 		response["error"] = linkErr.Error()
@@ -16064,6 +17516,7 @@ func handleGopayFullLink(w http.ResponseWriter, r *http.Request) {
 			response["gopay_payment_process"] = paymentResult.PaymentProcess
 			response["midtrans_status"] = paymentResult.MidtransStatus
 			response["payment_voucher"] = buildGopayPaymentVoucher(paymentResult)
+			attachGopayTerminalAutomationContract(response)
 			writeJSON(w, http.StatusOK, response)
 			return
 		}
@@ -16085,6 +17538,7 @@ func handleGopayFullLink(w http.ResponseWriter, r *http.Request) {
 		response["gopay_payment_process"] = paymentResult.PaymentProcess
 		response["midtrans_status"] = paymentResult.MidtransStatus
 		response["payment_voucher"] = buildGopayPaymentVoucher(paymentResult)
+		attachGopayTerminalAutomationContract(response)
 		response["summary"] = map[string]any{
 			"account_id":           accountID,
 			"phone_number":         req.PhoneNumber,
@@ -16380,13 +17834,50 @@ func checkoutShouldReturnToPageTargetAfterActivation(activated bool, targetType 
 		!hasFillableCheckoutInputs(afterProbe)
 }
 
+func checkoutCDPReadinessResponse(stage string, message string, traceID string, runID string, pollAfterMS int64) map[string]any {
+	return map[string]any{
+		"ok":                    false,
+		"stage":                 stage,
+		"trace_id":              strings.TrimSpace(traceID),
+		"run_id":                strings.TrimSpace(runID),
+		"error":                 message,
+		"cdp_ready":             false,
+		"page_classification":   "cdp_recovering",
+		"next_action":           "wait_for_chrome_cdp",
+		"human_message":         "Chrome CDP 暂未就绪，等待无痕窗口恢复后再继续监听。",
+		"retryable":             true,
+		"terminal":              false,
+		"poll_after_ms":         pollAfterMS,
+		"contract_version":      automationContractVersion,
+		"primary_button":        "刷新 CDP 状态",
+		"secondary_button":      "重新打开无痕窗口",
+		"safe_to_auto_continue": true,
+	}
+}
+
+func checkoutTargetWaitingResponse(stage string, message string, traceID string, runID string, pollAfterMS int64) map[string]any {
+	return map[string]any{
+		"ok":                    false,
+		"stage":                 stage,
+		"trace_id":              strings.TrimSpace(traceID),
+		"run_id":                strings.TrimSpace(runID),
+		"error":                 message,
+		"cdp_ready":             true,
+		"page_classification":   "target_waiting",
+		"next_action":           "wait_checkout_payment_page",
+		"human_message":         "尚未找到 checkout 支付页目标，继续等待页面打开或跳转。",
+		"retryable":             true,
+		"terminal":              false,
+		"poll_after_ms":         pollAfterMS,
+		"contract_version":      automationContractVersion,
+		"primary_button":        "继续监听",
+		"safe_to_auto_continue": true,
+	}
+}
+
 func handleCheckoutPaymentMethodSelect(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
-		return
-	}
-	if !isCDPReady(cdpDebuggingPort) {
-		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"ok": false, "error": "CDP not ready"})
 		return
 	}
 	defer r.Body.Close()
@@ -16394,6 +17885,7 @@ func handleCheckoutPaymentMethodSelect(w http.ResponseWriter, r *http.Request) {
 		ExpectedURL string `json:"expected_url"`
 		TargetID    string `json:"target_id,omitempty"`
 		TraceID     string `json:"trace_id,omitempty"`
+		RunID       string `json:"run_id,omitempty"`
 	}
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<18)).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid json")
@@ -16402,18 +17894,28 @@ func handleCheckoutPaymentMethodSelect(w http.ResponseWriter, r *http.Request) {
 	req.ExpectedURL = strings.TrimSpace(req.ExpectedURL)
 	req.TargetID = strings.TrimSpace(req.TargetID)
 	req.TraceID = strings.TrimSpace(req.TraceID)
+	req.RunID = requestAutomationRunID(r, req.RunID)
+	if !isCDPReady(cdpDebuggingPort) {
+		writeJSON(w, http.StatusServiceUnavailable, checkoutCDPReadinessResponse("cdp_not_ready", "CDP not ready", req.TraceID, req.RunID, 5000))
+		return
+	}
 	if req.ExpectedURL == "" {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "error": "expected_url is required"})
 		return
 	}
 	targets, err := getCDPTargets(cdpDebuggingPort)
 	if err != nil {
-		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"ok": false, "error": err.Error()})
+		writeJSON(w, http.StatusServiceUnavailable, checkoutCDPReadinessResponse("cdp_targets_failed", err.Error(), req.TraceID, req.RunID, 5000))
 		return
 	}
 	target, canonicalURL, targetIDReused, err := resolveCheckoutPageTargetWithHint(targets, req.ExpectedURL, req.TargetID)
 	if err != nil {
-		writeJSON(w, http.StatusOK, map[string]any{"ok": false, "error": err.Error(), "expected_url": req.ExpectedURL, "target_id": req.TargetID, "target_id_reused": false, "trace_id": req.TraceID})
+		payload := checkoutTargetWaitingResponse("checkout_target_not_found", err.Error(), req.TraceID, req.RunID, 3000)
+		payload["expected_url"] = req.ExpectedURL
+		payload["target_id"] = req.TargetID
+		payload["target_id_reused"] = false
+		payload["candidate_urls"] = checkoutResolveCandidateURLs(targets)
+		writeJSON(w, http.StatusOK, payload)
 		return
 	}
 	conn, _, err := websocket.DefaultDialer.Dial(target.WebSocketDebuggerURL, nil)
@@ -16430,9 +17932,21 @@ func handleCheckoutPaymentMethodSelect(w http.ResponseWriter, r *http.Request) {
 	}
 	selectedMethod := strings.ToLower(strings.TrimSpace(stringifyJSONValue(selectMap["selected_method"])))
 	clicked := boolMapValue(selectMap, "clicked")
+	nextAction := "manual_select_payment_method"
+	humanMessage := "未检测到可自动选择的 GoPay 或 PayPal，请在支付页手动选择支付方式。"
+	if clicked {
+		nextAction = "continue_checkout_autofill"
+		humanMessage = "支付方式已选择，继续地址填充或等待订阅确认。"
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"ok":                             clicked,
 		"stage":                          "checkout_payment_method_selected",
+		"contract_version":               automationContractVersion,
+		"retryable":                      true,
+		"terminal":                       false,
+		"next_action":                    nextAction,
+		"human_message":                  humanMessage,
+		"poll_after_ms":                  int64(0),
 		"safe_checkout_assist":           true,
 		"manual_confirmation_required":   true,
 		"subscription_submit_clicked":    false,
@@ -16441,6 +17955,7 @@ func handleCheckoutPaymentMethodSelect(w http.ResponseWriter, r *http.Request) {
 		"target_id":                      target.ID,
 		"target_id_reused":               targetIDReused,
 		"trace_id":                       req.TraceID,
+		"run_id":                         req.RunID,
 		"selected_payment_method":        selectedMethod,
 		"gopay_selected":                 clicked && selectedMethod == "gopay",
 		"paypal_selected":                clicked && selectedMethod == "paypal",
@@ -16454,13 +17969,249 @@ func handleCheckoutPaymentMethodSelect(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func handleCheckoutResolveTarget(w http.ResponseWriter, r *http.Request) {
+func checkoutAuthorizedSubscribeClickKey(rawURL string) string {
+	if key := checkoutAutoTriggerKey(rawURL); key != "" {
+		return key
+	}
+	normalized := normalizeManagedCheckoutURL(rawURL)
+	if normalized == "" {
+		return ""
+	}
+	parsed, err := url.Parse(normalized)
+	if err != nil || parsed == nil {
+		return normalized
+	}
+	parsed.Fragment = ""
+	return parsed.String()
+}
+
+func checkoutAuthorizedSubscribeButtonProbeScript() string {
+	return `(async () => {
+		const normalize = (value) => String(value || '').replace(/\s+/g, ' ').trim();
+		const textOf = (el) => normalize([
+			el?.innerText || '',
+			el?.textContent || '',
+			el?.value || '',
+			el?.getAttribute?.('aria-label') || '',
+			el?.getAttribute?.('title') || '',
+			el?.getAttribute?.('data-testid') || '',
+		].join(' '));
+		const visible = (el) => {
+			if (!el || !el.isConnected) return false;
+			const style = getComputedStyle(el);
+			const rect = el.getBoundingClientRect();
+			return style.display !== 'none' && style.visibility !== 'hidden' && Number(style.opacity || '1') > 0 && rect.width > 2 && rect.height > 2;
+		};
+		const disabled = (el) => !!(el?.disabled || el?.getAttribute?.('aria-disabled') === 'true' || el?.closest?.('[aria-disabled="true"]'));
+		const submitPattern = /(订阅并付款|订阅|subscribe\s*(and|&)\s*pay|subscribe|confirm\s+subscription|complete\s+subscription)/i;
+		const unsafePaymentMethodPattern = /\b(gopay|paypal|card|bank card|link and pay|hubungkan|log in|sign in)\b/i;
+		const controls = Array.from(document.querySelectorAll('button,[role="button"],input[type="submit"],input[type="button"],a'))
+			.filter(visible)
+			.map((el) => {
+				const text = textOf(el);
+				const rect = el.getBoundingClientRect();
+				const scopeText = textOf(el.closest('form,section,main,div') || el).slice(0, 800);
+				let score = 0;
+				if (/订阅并付款|subscribe\s*(and|&)\s*pay/i.test(text)) score += 100;
+				if (/订阅|subscribe/i.test(text)) score += 70;
+				if (/confirm\s+subscription|complete\s+subscription/i.test(text)) score += 45;
+				if (unsafePaymentMethodPattern.test(text) && !/subscribe|订阅/i.test(text)) score -= 100;
+				if (disabled(el)) score -= 30;
+				return {
+					element: el,
+					text,
+					scope_text: scopeText,
+					disabled: disabled(el),
+					rect: { left: rect.left, top: rect.top, width: rect.width, height: rect.height },
+					score,
+				};
+			})
+			.filter((item) => submitPattern.test(item.text));
+		controls.sort((a, b) => b.score - a.score);
+		const candidate = controls[0] || null;
+		if (!candidate) {
+			return JSON.stringify({
+				ok: false,
+				stage: 'subscription_submit_button_not_found',
+				url: location.href,
+				title: document.title,
+				subscription_submit_clicked: false,
+				manual_payment_confirmation_required: true,
+				buttons: Array.from(document.querySelectorAll('button,[role="button"],input[type="submit"],input[type="button"],a')).filter(visible).map(textOf).filter(Boolean).slice(0, 30),
+			});
+		}
+		if (candidate.disabled) {
+			return JSON.stringify({
+				ok: false,
+				stage: 'subscription_submit_button_disabled',
+				url: location.href,
+				title: document.title,
+				subscription_submit_clicked: false,
+				manual_payment_confirmation_required: true,
+				button_text: candidate.text,
+				button_rect: candidate.rect,
+			});
+		}
+		return JSON.stringify({
+			ok: true,
+			stage: 'subscription_submit_button_ready',
+			url: location.href,
+			title: document.title,
+			button_text: candidate.text,
+			button_rect: candidate.rect,
+			candidate_count: controls.length,
+			subscription_submit_clicked: false,
+			manual_payment_confirmation_authorized: true,
+			click_source: 'local_user_authorized_cdp',
+		});
+	})()`
+}
+
+func handleCheckoutAuthorizedSubscribeClick(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
+	defer r.Body.Close()
+	var req struct {
+		ExpectedURL string `json:"expected_url"`
+		TargetID    string `json:"target_id,omitempty"`
+		TraceID     string `json:"trace_id,omitempty"`
+		RunID       string `json:"run_id,omitempty"`
+		Authorized  bool   `json:"authorized"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<18)).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json")
+		return
+	}
+	req.ExpectedURL = strings.TrimSpace(req.ExpectedURL)
+	req.TargetID = strings.TrimSpace(req.TargetID)
+	req.TraceID = strings.TrimSpace(req.TraceID)
+	req.RunID = requestAutomationRunID(r, req.RunID)
 	if !isCDPReady(cdpDebuggingPort) {
-		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"ok": false, "error": "CDP not ready"})
+		writeJSON(w, http.StatusServiceUnavailable, checkoutCDPReadinessResponse("cdp_not_ready", "CDP not ready", req.TraceID, req.RunID, 5000))
+		return
+	}
+	if !req.Authorized {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "stage": "local_authorization_required", "error": "local user authorization is required", "subscription_submit_clicked": false, "trace_id": req.TraceID, "run_id": req.RunID})
+		return
+	}
+	if req.ExpectedURL == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "stage": "expected_url_required", "error": "expected_url is required", "subscription_submit_clicked": false, "trace_id": req.TraceID, "run_id": req.RunID})
+		return
+	}
+	targets, err := getCDPTargets(cdpDebuggingPort)
+	if err != nil {
+		payload := checkoutCDPReadinessResponse("cdp_targets_failed", err.Error(), req.TraceID, req.RunID, 5000)
+		payload["subscription_submit_clicked"] = false
+		writeJSON(w, http.StatusServiceUnavailable, payload)
+		return
+	}
+	target, canonicalURL, targetIDReused, err := resolveCheckoutPageTargetWithHint(targets, req.ExpectedURL, req.TargetID)
+	if err != nil {
+		payload := checkoutTargetWaitingResponse("checkout_target_not_found", err.Error(), req.TraceID, req.RunID, 3000)
+		payload["expected_url"] = req.ExpectedURL
+		payload["target_id"] = req.TargetID
+		payload["target_id_reused"] = false
+		payload["subscription_submit_clicked"] = false
+		payload["candidate_urls"] = checkoutResolveCandidateURLs(targets)
+		writeJSON(w, http.StatusOK, payload)
+		return
+	}
+	clickKey := checkoutAuthorizedSubscribeClickKey(canonicalURL)
+	if clickKey == "" {
+		writeJSON(w, http.StatusOK, map[string]any{"ok": false, "stage": "checkout_target_not_authorizable", "error": "target is not a managed checkout confirmation page", "current_url": canonicalURL, "trace_id": req.TraceID, "run_id": req.RunID, "subscription_submit_clicked": false, "contract_version": automationContractVersion, "retryable": true, "terminal": false, "next_action": "review_checkout_page", "human_message": "当前页面不是可授权的订阅确认页，请确认无痕窗口停留在 checkout 订阅确认页。", "poll_after_ms": int64(3000)})
+		return
+	}
+	authorizedSubscribeClickMu.Lock()
+	if previous, exists := authorizedSubscribeClickedCheckout[clickKey]; exists {
+		authorizedSubscribeClickMu.Unlock()
+		writeJSON(w, http.StatusOK, map[string]any{"ok": false, "stage": "subscription_submit_already_authorized", "error": "this checkout already received one authorized subscription click", "authorized_at": previous.Format(time.RFC3339Nano), "current_url": canonicalURL, "target_id": target.ID, "trace_id": req.TraceID, "run_id": req.RunID, "subscription_submit_clicked": false, "contract_version": automationContractVersion, "retryable": false, "terminal": true, "next_action": "watch_existing_gopay_flow", "human_message": "本 checkout 已执行过一次本地授权订阅点击，不会重复点击。", "poll_after_ms": int64(0)})
+		return
+	}
+	authorizedSubscribeClickMu.Unlock()
+
+	conn, _, err := websocket.DefaultDialer.Dial(target.WebSocketDebuggerURL, nil)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "CDP failed: "+err.Error())
+		return
+	}
+	defer conn.Close()
+	sendCDPCommand(conn, "Runtime.enable", nil)
+	probeR, _ := executeCDPScript(conn, checkoutAuthorizedSubscribeButtonProbeScript())
+	var probe map[string]any
+	if probeR != "" {
+		json.Unmarshal([]byte(probeR), &probe)
+	}
+	if probe == nil {
+		probe = map[string]any{"ok": false, "stage": "subscription_submit_probe_empty", "subscription_submit_clicked": false}
+	}
+	if !boolMapValue(probe, "ok") {
+		probe["expected_url"] = req.ExpectedURL
+		probe["current_url"] = canonicalURL
+		probe["target_id"] = target.ID
+		probe["target_id_reused"] = targetIDReused
+		probe["trace_id"] = req.TraceID
+		probe["run_id"] = req.RunID
+		probe["contract_version"] = automationContractVersion
+		probe["retryable"] = true
+		probe["terminal"] = false
+		probe["next_action"] = "review_and_click_subscribe"
+		probe["human_message"] = "订阅确认按钮暂不可用，请检查条款确认和页面加载状态。"
+		probe["poll_after_ms"] = int64(3000)
+		writeJSON(w, http.StatusOK, probe)
+		return
+	}
+	if err := dispatchCDPMouseClickFromRect(conn, probe["button_rect"], "authorized subscription submit button"); err != nil {
+		writeJSON(w, http.StatusOK, map[string]any{"ok": false, "stage": "subscription_submit_cdp_click_failed", "error": err.Error(), "expected_url": req.ExpectedURL, "current_url": canonicalURL, "target_id": target.ID, "trace_id": req.TraceID, "run_id": req.RunID, "subscription_submit_clicked": false, "button_probe": probe, "contract_version": automationContractVersion, "retryable": true, "terminal": false, "next_action": "manual_click_subscribe", "human_message": "CDP 真实鼠标点击订阅按钮失败，请在页面上手动点击确认。", "poll_after_ms": int64(3000)})
+		return
+	}
+	authorizedSubscribeClickMu.Lock()
+	authorizedSubscribeClickedCheckout[clickKey] = time.Now()
+	authorizedSubscribeClickMu.Unlock()
+
+	time.Sleep(900 * time.Millisecond)
+	afterURL := canonicalURL
+	afterTargetID := target.ID
+	afterTargets, refreshErr := getCDPTargets(cdpDebuggingPort)
+	if refreshErr == nil {
+		if refreshedTarget, refreshedURL, _, resolveErr := resolveCheckoutPageTargetWithHint(afterTargets, req.ExpectedURL, target.ID); resolveErr == nil {
+			afterURL = refreshedURL
+			afterTargetID = refreshedTarget.ID
+		} else if latestTarget, latestURL := resolveLatestCheckoutRuntimeTarget(afterTargets); latestTarget != nil && latestURL != "" {
+			afterURL = latestURL
+			afterTargetID = latestTarget.ID
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":                                   true,
+		"stage":                                "subscription_submit_authorized_clicked",
+		"expected_url":                         req.ExpectedURL,
+		"current_url":                          afterURL,
+		"before_url":                           canonicalURL,
+		"target_id":                            afterTargetID,
+		"target_id_reused":                     targetIDReused,
+		"trace_id":                             req.TraceID,
+		"run_id":                               req.RunID,
+		"checkout_key":                         clickKey,
+		"contract_version":                     automationContractVersion,
+		"retryable":                            true,
+		"terminal":                             false,
+		"next_action":                          "wait_midtrans_or_gopay_redirect",
+		"human_message":                        "已执行一次订阅确认点击，继续等待支付页跳转。",
+		"poll_after_ms":                        int64(1200),
+		"subscription_submit_authorized":       true,
+		"subscription_submit_clicked":          true,
+		"subscription_submit_click_count":      1,
+		"manual_payment_confirmation_required": false,
+		"click_source":                         "local_user_authorized_cdp",
+		"button_probe":                         probe,
+	})
+}
+
+func handleCheckoutResolveTarget(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
 	defer r.Body.Close()
@@ -16468,6 +18219,7 @@ func handleCheckoutResolveTarget(w http.ResponseWriter, r *http.Request) {
 		OpenedURL string `json:"opened_url"`
 		TargetID  string `json:"target_id,omitempty"`
 		TraceID   string `json:"trace_id,omitempty"`
+		RunID     string `json:"run_id,omitempty"`
 	}
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<18)).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid json")
@@ -16476,13 +18228,18 @@ func handleCheckoutResolveTarget(w http.ResponseWriter, r *http.Request) {
 	req.OpenedURL = strings.TrimSpace(req.OpenedURL)
 	req.TargetID = strings.TrimSpace(req.TargetID)
 	req.TraceID = strings.TrimSpace(req.TraceID)
+	req.RunID = requestAutomationRunID(r, req.RunID)
+	if !isCDPReady(cdpDebuggingPort) {
+		writeJSON(w, http.StatusServiceUnavailable, checkoutCDPReadinessResponse("cdp_not_ready", "CDP not ready", req.TraceID, req.RunID, 5000))
+		return
+	}
 	if req.OpenedURL == "" {
-		writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "error": "opened_url is required"})
+		writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "stage": "opened_url_required", "error": "opened_url is required", "trace_id": req.TraceID, "run_id": req.RunID, "contract_version": automationContractVersion})
 		return
 	}
 	targets, err := getCDPTargets(cdpDebuggingPort)
 	if err != nil {
-		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"ok": false, "error": err.Error()})
+		writeJSON(w, http.StatusServiceUnavailable, checkoutCDPReadinessResponse("cdp_targets_failed", err.Error(), req.TraceID, req.RunID, 5000))
 		return
 	}
 	target, currentURL, targetIDReused, err := resolveCheckoutPageTargetWithHint(targets, req.OpenedURL, req.TargetID)
@@ -16495,9 +18252,16 @@ func handleCheckoutResolveTarget(w http.ResponseWriter, r *http.Request) {
 				"target_id":        fallbackTarget.ID,
 				"target_id_reused": false,
 				"trace_id":         req.TraceID,
+				"run_id":           req.RunID,
 				"fallback":         true,
 				"fallback_error":   err.Error(),
 				"candidate_urls":   checkoutResolveCandidateURLs(targets),
+				"contract_version": automationContractVersion,
+				"retryable":        true,
+				"terminal":         false,
+				"next_action":      "verify_checkout_target",
+				"human_message":    "未匹配到指定 checkout 页，已回退到最近的 checkout 候选页面。",
+				"poll_after_ms":    int64(1500),
 				"target": map[string]any{
 					"id":   fallbackTarget.ID,
 					"type": fallbackTarget.Type,
@@ -16506,15 +18270,12 @@ func handleCheckoutResolveTarget(w http.ResponseWriter, r *http.Request) {
 			})
 			return
 		}
-		writeJSON(w, http.StatusOK, map[string]any{
-			"ok":               false,
-			"error":            err.Error(),
-			"opened_url":       req.OpenedURL,
-			"target_id":        req.TargetID,
-			"target_id_reused": false,
-			"trace_id":         req.TraceID,
-			"candidate_urls":   checkoutResolveCandidateURLs(targets),
-		})
+		payload := checkoutTargetWaitingResponse("checkout_target_not_found", err.Error(), req.TraceID, req.RunID, 3000)
+		payload["opened_url"] = req.OpenedURL
+		payload["target_id"] = req.TargetID
+		payload["target_id_reused"] = false
+		payload["candidate_urls"] = checkoutResolveCandidateURLs(targets)
+		writeJSON(w, http.StatusOK, payload)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
@@ -16524,6 +18285,13 @@ func handleCheckoutResolveTarget(w http.ResponseWriter, r *http.Request) {
 		"target_id":        target.ID,
 		"target_id_reused": targetIDReused,
 		"trace_id":         req.TraceID,
+		"run_id":           req.RunID,
+		"contract_version": automationContractVersion,
+		"retryable":        true,
+		"terminal":         false,
+		"next_action":      "continue_checkout_watch",
+		"human_message":    "已锁定 checkout 支付页目标，继续监听页面跳转。",
+		"poll_after_ms":    int64(1500),
 		"target": map[string]any{
 			"id":   target.ID,
 			"type": target.Type,
@@ -16537,15 +18305,12 @@ func handleCheckoutAutoFill(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
-	if !isCDPReady(cdpDebuggingPort) {
-		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"ok": false, "error": "CDP not ready"})
-		return
-	}
 	defer r.Body.Close()
 	var req struct {
 		ExpectedURL string `json:"expected_url"`
 		TargetID    string `json:"target_id,omitempty"`
 		TraceID     string `json:"trace_id,omitempty"`
+		RunID       string `json:"run_id,omitempty"`
 	}
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<18)).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid json")
@@ -16554,18 +18319,28 @@ func handleCheckoutAutoFill(w http.ResponseWriter, r *http.Request) {
 	req.ExpectedURL = strings.TrimSpace(req.ExpectedURL)
 	req.TargetID = strings.TrimSpace(req.TargetID)
 	req.TraceID = strings.TrimSpace(req.TraceID)
+	req.RunID = requestAutomationRunID(r, req.RunID)
+	if !isCDPReady(cdpDebuggingPort) {
+		writeJSON(w, http.StatusServiceUnavailable, checkoutCDPReadinessResponse("cdp_not_ready", "CDP not ready", req.TraceID, req.RunID, 5000))
+		return
+	}
 	if req.ExpectedURL == "" {
-		writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "error": "expected_url is required"})
+		writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "stage": "expected_url_required", "error": "expected_url is required", "trace_id": req.TraceID, "run_id": req.RunID, "contract_version": automationContractVersion})
 		return
 	}
 	targets, err := getCDPTargets(cdpDebuggingPort)
 	if err != nil {
-		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"ok": false, "error": err.Error()})
+		writeJSON(w, http.StatusServiceUnavailable, checkoutCDPReadinessResponse("cdp_targets_failed", err.Error(), req.TraceID, req.RunID, 5000))
 		return
 	}
 	pageTarget, canonicalURL, targetIDReused, err := resolveCheckoutPageTargetWithHint(targets, req.ExpectedURL, req.TargetID)
 	if err != nil {
-		writeJSON(w, http.StatusOK, map[string]any{"ok": false, "error": err.Error(), "expected_url": req.ExpectedURL, "target_id": req.TargetID, "target_id_reused": false, "trace_id": req.TraceID})
+		payload := checkoutTargetWaitingResponse("checkout_target_not_found", err.Error(), req.TraceID, req.RunID, 3000)
+		payload["expected_url"] = req.ExpectedURL
+		payload["target_id"] = req.TargetID
+		payload["target_id_reused"] = false
+		payload["candidate_urls"] = checkoutResolveCandidateURLs(targets)
+		writeJSON(w, http.StatusOK, payload)
 		return
 	}
 	addr := generateUSAddress()
@@ -16574,6 +18349,13 @@ func handleCheckoutAutoFill(w http.ResponseWriter, r *http.Request) {
 		"expected_url":                       req.ExpectedURL,
 		"current_url":                        canonicalURL,
 		"trace_id":                           req.TraceID,
+		"run_id":                             req.RunID,
+		"contract_version":                   automationContractVersion,
+		"retryable":                          true,
+		"terminal":                           false,
+		"next_action":                        "review_and_click_subscribe",
+		"human_message":                      "地址辅助已完成后，需要你本人确认条款并点击订阅按钮。",
+		"poll_after_ms":                      int64(1500),
 		"target_id":                          pageTarget.ID,
 		"target_id_reused":                   targetIDReused,
 		"safe_checkout_assist":               true,

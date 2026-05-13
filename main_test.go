@@ -307,6 +307,320 @@ func TestBuildAuditLogRecordExtractsOperationFlowAndPaymentVoucher(t *testing.T)
 	}
 }
 
+func voucherRiskReasons(contract map[string]any) []string {
+	switch typed := contract["risk_reasons"].(type) {
+	case []string:
+		return typed
+	case []any:
+		reasons := make([]string, 0, len(typed))
+		for _, item := range typed {
+			reasons = append(reasons, stringifyJSONValue(item))
+		}
+		return reasons
+	default:
+		return nil
+	}
+}
+
+func requireVoucherRiskReason(t *testing.T, contract map[string]any, want string) {
+	t.Helper()
+	for _, reason := range voucherRiskReasons(contract) {
+		if reason == want {
+			return
+		}
+	}
+	t.Fatalf("risk_reasons missing %q: %#v", want, contract["risk_reasons"])
+}
+
+func TestPaymentVoucherReplayRiskRejectsCrossAccountCheckoutAndSensitiveMaterial(t *testing.T) {
+	contract := paymentVoucherReplayRiskContract(map[string]any{
+		"payment_reference_id": "pay-ref-old",
+		"transaction_id":       "tx-old",
+		"account_id":           "snap-old",
+		"account_email":        "old@example.com",
+		"checkout_url":         "https://chatgpt.com/checkout/openai_llc/cs_live_old",
+		"payment_pin":          "123456",
+	}, paymentVoucherReplayContext{
+		CurrentAccountID:    "snap-new",
+		CurrentAccountEmail: "new@example.com",
+		CurrentCheckoutURL:  "https://chatgpt.com/checkout/openai_llc/cs_live_new",
+	})
+
+	if contract["authorization_accepted"] != false || contract["stage"] != "payment_voucher_replay_rejected" {
+		t.Fatalf("replay contract = %#v", contract)
+	}
+	if contract["terminal"] != true || contract["retryable"] != false || contract["risk_level"] != "high" {
+		t.Fatalf("terminal risk contract = %#v", contract)
+	}
+	for _, want := range []string{"account_id_mismatch", "checkout_session_mismatch", "account_email_mismatch", "voucher_contains_sensitive_material"} {
+		requireVoucherRiskReason(t, contract, want)
+	}
+	fields, _ := contract["sensitive_fields_present"].([]string)
+	if len(fields) != 1 || fields[0] != "payment_pin" {
+		t.Fatalf("sensitive_fields_present = %#v", contract["sensitive_fields_present"])
+	}
+}
+
+func TestPaymentVoucherReplayRiskRejectsUnboundAuditVoucher(t *testing.T) {
+	contract := paymentVoucherReplayRiskContract(map[string]any{
+		"payment_reference_id": "pay-ref-old",
+		"transaction_id":       "tx-old",
+	}, paymentVoucherReplayContext{
+		CurrentAccountID:   "snap-current",
+		CurrentCheckoutURL: "https://chatgpt.com/checkout/openai_llc/cs_live_current",
+	})
+
+	if contract["authorization_accepted"] != false {
+		t.Fatalf("authorization_accepted = %#v, want false", contract["authorization_accepted"])
+	}
+	if contract["payment_identity_present"] != true {
+		t.Fatalf("payment_identity_present = %#v, want true", contract["payment_identity_present"])
+	}
+	requireVoucherRiskReason(t, contract, "voucher_missing_account_binding")
+	requireVoucherRiskReason(t, contract, "voucher_missing_checkout_binding")
+}
+
+func TestPaymentVoucherReplayRiskRejectsEvenMatchingVoucherAsEvidenceOnly(t *testing.T) {
+	contract := paymentVoucherReplayRiskContract(map[string]any{
+		"payment_reference_id": "pay-ref-current",
+		"account_id":           "snap-current",
+		"checkout_session_id":  "cs_live_current",
+		"account_email":        "same@example.com",
+	}, paymentVoucherReplayContext{
+		CurrentAccountID:          "snap-current",
+		CurrentAccountEmail:       "same@example.com",
+		CurrentCheckoutSessionID:  "cs_live_current",
+		CurrentPaymentReferenceID: "pay-ref-current",
+	})
+
+	if contract["authorization_accepted"] != false {
+		t.Fatalf("matching voucher must not be accepted as payment authorization: %#v", contract)
+	}
+	if contract["account_id_matches"] != true || contract["checkout_session_matches"] != true || contract["payment_reference_matches_current"] != true {
+		t.Fatalf("expected matching diagnostics while rejecting replay: %#v", contract)
+	}
+	requireVoucherRiskReason(t, contract, "voucher_is_audit_evidence_only")
+}
+
+func TestPaymentAuthorizationTamperRiskRejectsForgedClientClaims(t *testing.T) {
+	contract := paymentAuthorizationTamperRiskContract(paymentAuthorizationTamperAttempt{
+		Source: "manual_payload",
+		Claims: map[string]any{
+			"authorization_accepted": true,
+			"stage":                  "gopay_complete",
+		},
+		Context: paymentVoucherReplayContext{
+			CurrentAccountID:   "snap-current",
+			CurrentCheckoutURL: "https://chatgpt.com/checkout/openai_llc/cs_live_current",
+		},
+	})
+
+	if contract["authorization_accepted"] != false || contract["accepted_authority"] != false {
+		t.Fatalf("forged client claims must not be accepted: %#v", contract)
+	}
+	if contract["stage"] != "payment_authorization_tamper_rejected" || contract["source"] != "manual_payload" {
+		t.Fatalf("tamper contract = %#v", contract)
+	}
+	for _, want := range []string{"untrusted_authorization_source", "client_claimed_payment_success", "server_payment_voucher_missing"} {
+		requireVoucherRiskReason(t, contract, want)
+	}
+}
+
+func TestPaymentAuthorizationTamperRiskRejectsLocalEvidenceInjection(t *testing.T) {
+	contract := paymentAuthorizationTamperRiskContract(paymentAuthorizationTamperAttempt{
+		Source: "client_local_storage",
+		Evidence: map[string]any{
+			"checkoutWorkbenchPaymentEvidence": map[string]any{
+				"checkout_session_id": "cs_live_current",
+				"payment_completed":   true,
+			},
+			"payment_completed": true,
+		},
+		Context: paymentVoucherReplayContext{
+			CurrentAccountID:          "snap-current",
+			CurrentCheckoutSessionID:  "cs_live_current",
+			CurrentPaymentReferenceID: "pay-ref-current",
+		},
+	})
+
+	if contract["authorization_accepted"] != false || contract["accepted_authority"] != false {
+		t.Fatalf("local evidence injection must not be accepted: %#v", contract)
+	}
+	for _, want := range []string{"untrusted_authorization_source", "client_evidence_not_authoritative", "local_evidence_injection_detected", "client_evidence_claimed_payment_success", "server_payment_voucher_missing"} {
+		requireVoucherRiskReason(t, contract, want)
+	}
+}
+
+func TestPaymentAuthorizationTamperRiskRejectsCrossAccountVoucherInjection(t *testing.T) {
+	contract := paymentAuthorizationTamperRiskContract(paymentAuthorizationTamperAttempt{
+		Source: "legacy_voucher",
+		Voucher: map[string]any{
+			"payment_reference_id": "pay-ref-old",
+			"account_id":           "snap-old",
+			"checkout_url":         "https://chatgpt.com/checkout/openai_llc/cs_live_old",
+		},
+		Context: paymentVoucherReplayContext{
+			CurrentAccountID:         "snap-new",
+			CurrentCheckoutSessionID: "cs_live_new",
+			CurrentCheckoutURL:       "https://chatgpt.com/checkout/openai_llc/cs_live_new",
+		},
+	})
+
+	if contract["authorization_accepted"] != false || contract["accepted_authority"] != false {
+		t.Fatalf("cross-account voucher injection must not be accepted: %#v", contract)
+	}
+	for _, want := range []string{"untrusted_authorization_source", "account_id_mismatch", "checkout_session_mismatch"} {
+		requireVoucherRiskReason(t, contract, want)
+	}
+	voucherContract, _ := contract["voucher_replay_contract"].(map[string]any)
+	if voucherContract["stage"] != "payment_voucher_replay_rejected" {
+		t.Fatalf("voucher_replay_contract = %#v", voucherContract)
+	}
+	requireVoucherRiskReason(t, voucherContract, "account_id_mismatch")
+	requireVoucherRiskReason(t, voucherContract, "checkout_session_mismatch")
+}
+
+func TestPaymentAuthorizationTamperRiskRejectsOldCheckoutReplay(t *testing.T) {
+	contract := paymentAuthorizationTamperRiskContract(paymentAuthorizationTamperAttempt{
+		Source: "old_checkout",
+		Voucher: map[string]any{
+			"payment_reference_id": "pay-ref-old",
+			"account_id":           "snap-current",
+			"checkout_session_id":  "cs_live_old",
+		},
+		Context: paymentVoucherReplayContext{
+			CurrentAccountID:         "snap-current",
+			CurrentCheckoutSessionID: "cs_live_current",
+		},
+	})
+
+	if contract["authorization_accepted"] != false || contract["accepted_authority"] != false {
+		t.Fatalf("old checkout replay must not be accepted: %#v", contract)
+	}
+	requireVoucherRiskReason(t, contract, "untrusted_authorization_source")
+	requireVoucherRiskReason(t, contract, "checkout_session_mismatch")
+	voucherContract, _ := contract["voucher_replay_contract"].(map[string]any)
+	if voucherContract["account_id_matches"] != true {
+		t.Fatalf("expected same-account diagnostics while rejecting old checkout replay: %#v", voucherContract)
+	}
+	requireVoucherRiskReason(t, voucherContract, "checkout_session_mismatch")
+}
+
+func TestSandboxPaymentAuthorizationAssessFullFlowRejectsAllMockScenarios(t *testing.T) {
+	result, err := assessSandboxPaymentAuthorization(sandboxPaymentAuthorizationAssessRequest{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result["stage"] != "payment_authorization_sandbox_assessed" || result["sandbox"] != true {
+		t.Fatalf("sandbox result = %#v", result)
+	}
+	if result["authorization_accepted"] != false || result["accepted_authority"] != false {
+		t.Fatalf("sandbox must not accept authorization: %#v", result)
+	}
+	if result["payment_action_executed"] != false || result["real_checkout_touched"] != false || result["real_credential_used"] != false {
+		t.Fatalf("sandbox result claims real side effects: %#v", result)
+	}
+	if result["scenario_count"] != 4 || result["accepted_count"] != 0 || result["rejected_count"] != 4 || result["all_rejected"] != true {
+		t.Fatalf("sandbox counts = %#v", result)
+	}
+	scenarios, _ := result["scenarios"].([]map[string]any)
+	if len(scenarios) != 4 {
+		t.Fatalf("scenarios = %#v, want 4 entries", result["scenarios"])
+	}
+	seen := map[string]bool{}
+	for _, item := range scenarios {
+		name, _ := item["name"].(string)
+		seen[name] = true
+		if item["authorization_accepted"] != false {
+			t.Fatalf("scenario accepted authorization: %#v", item)
+		}
+		contract, _ := item["contract"].(map[string]any)
+		if contract["stage"] != "payment_authorization_tamper_rejected" {
+			t.Fatalf("scenario contract = %#v", contract)
+		}
+		requireVoucherRiskReason(t, contract, "untrusted_authorization_source")
+	}
+	for _, want := range []string{"forged_payment_authorization", "local_evidence_injection", "cross_account_voucher_injection", "old_checkout_replay"} {
+		if !seen[want] {
+			t.Fatalf("full flow missing scenario %q: %#v", want, scenarios)
+		}
+	}
+}
+
+func TestSandboxPaymentAuthorizationAssessCustomVoucherUsesMockContext(t *testing.T) {
+	result, err := assessSandboxPaymentAuthorization(sandboxPaymentAuthorizationAssessRequest{
+		Scenario: "custom_cross_account",
+		Source:   "legacy_voucher",
+		Voucher: map[string]any{
+			"payment_reference_id": "pay-ref-old",
+			"account_id":           "snap-old",
+			"checkout_session_id":  "cs_mock_old",
+		},
+		Context: sandboxPaymentAuthorizationContextRequest{
+			CurrentAccountID:         "snap-new",
+			CurrentCheckoutSessionID: "cs_mock_new",
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result["scenario_count"] != 1 || result["all_rejected"] != true {
+		t.Fatalf("custom sandbox result = %#v", result)
+	}
+	scenarios, _ := result["scenarios"].([]map[string]any)
+	contract, _ := scenarios[0]["contract"].(map[string]any)
+	requireVoucherRiskReason(t, contract, "account_id_mismatch")
+	requireVoucherRiskReason(t, contract, "checkout_session_mismatch")
+	if result["real_checkout_touched"] != false || result["payment_action_executed"] != false {
+		t.Fatalf("custom sandbox result claims real side effects: %#v", result)
+	}
+}
+
+func TestHandleSandboxPaymentAuthorizationAssessRequiresLocalAccess(t *testing.T) {
+	req := httptest.NewRequest(http.MethodPost, "/api/sandbox/payment-authorization/assess", strings.NewReader(`{}`))
+	req.RemoteAddr = "203.0.113.10:12345"
+	rec := httptest.NewRecorder()
+
+	handleSandboxPaymentAuthorizationAssess(rec, req)
+
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403", rec.Code)
+	}
+}
+
+func TestHandleSandboxPaymentAuthorizationAssessFullFlowResponse(t *testing.T) {
+	req := httptest.NewRequest(http.MethodPost, "/api/sandbox/payment-authorization/assess", strings.NewReader(`{"scenario":"full_flow"}`))
+	req.RemoteAddr = "127.0.0.1:12345"
+	req.Header.Set("Origin", "http://127.0.0.1:18473")
+	rec := httptest.NewRecorder()
+
+	handleSandboxPaymentAuthorizationAssess(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	var response map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	if response["stage"] != "payment_authorization_sandbox_assessed" || response["sandbox"] != true {
+		t.Fatalf("response = %#v", response)
+	}
+	if response["scenario_count"] != float64(4) || response["accepted_count"] != float64(0) || response["all_rejected"] != true {
+		t.Fatalf("response counts = %#v", response)
+	}
+	if response["real_checkout_touched"] != false || response["payment_action_executed"] != false || response["real_credential_used"] != false {
+		t.Fatalf("sandbox endpoint response claims real side effects: %#v", response)
+	}
+	scenarios, _ := response["scenarios"].([]any)
+	if len(scenarios) != 4 {
+		t.Fatalf("scenarios length = %d, want 4", len(scenarios))
+	}
+	first, _ := scenarios[0].(map[string]any)
+	contract, _ := first["contract"].(map[string]any)
+	requireVoucherRiskReason(t, contract, "untrusted_authorization_source")
+}
+
 func TestBuildAuditLogRecordMasksSensitiveAnalysisDataWhenEnabled(t *testing.T) {
 	oldConfig := config
 	config = appConfig{AuditCaptureSensitive: true}
@@ -478,7 +792,7 @@ func TestBuildAuditLogRecordIncludesCDPPINFlowFields(t *testing.T) {
 func TestGopayCDPFlowScriptKeepsOTPManualAndDefinesPINStages(t *testing.T) {
 	script := gopayCDPFlowScript("123456")
 
-	for _, want := range []string{"otp_manual_required", "pin_entry_binding", "pin_entry_payment", "pin_page_signature", "hashText(pinPageSignatureSource)", "payment_completed", "gopay_complete", "gopay_session_expired", "waktunya habis", "ulangi prosesnya dari awal", "failed to complete payment", "gopay_payment_failed", "payment_failure_reason"} {
+	for _, want := range []string{"otp_manual_required", "pin_entry_binding", "pin_entry_payment", "pin_page_signature", "hashText(pinPageSignatureSource)", "payment_completed", "gopay_complete", "midtrans_payment_success_waiting_redirect", "merchant_login_required_after_payment", "merchant_redirect_success", "gopay_session_expired", "waktunya habis", "ulangi prosesnya dari awal", "failed to complete payment", "gopay_payment_failed", "payment_failure_reason"} {
 		if !strings.Contains(script, want) {
 			t.Fatalf("script missing %q", want)
 		}
@@ -488,7 +802,17 @@ func TestGopayCDPFlowScriptKeepsOTPManualAndDefinesPINStages(t *testing.T) {
 			t.Fatalf("script missing PIN retry/OTP guard %q", want)
 		}
 	}
-	for _, want := range []string{"pin_keyboard_input_requested", "pin_keyboard_focus_rect", "pin_keyboard_input_reason", "pin_surface_without_visible_inputs", "unsupported_pin_widget", "cdp_keyboard_events", "pinKeyboardFocusRect", "pin_signal_without_inputs", "result.page_stage = result.pin_stage === 'payment' ? 'pin_entry_payment' : 'pin_entry_binding'"} {
+	for _, want := range []string{"allowAutoActions", "probe_only", "&& !allowAutoActions", "allowAutoActions && !result.auto_action_paused"} {
+		if !strings.Contains(script, want) {
+			t.Fatalf("script missing no-side-effect probe guard %q", want)
+		}
+	}
+	for _, want := range []string{"bindingPinSubmittedAtKey", "paymentPinSubmittedAtKey", "authPinReentryAfterBinding", "pin_reentry_after_submit", "pin_stage_reclassified", "auth_pin_reentry_after_binding_submit", "storageSetNow(bindingPinSubmittedAtKey)", "storageSetNow(paymentPinSubmittedAtKey)"} {
+		if !strings.Contains(script, want) {
+			t.Fatalf("script missing second PIN reentry marker %q", want)
+		}
+	}
+	for _, want := range []string{"pin_keyboard_input_requested", "pin_keyboard_focus_rect", "pin_keyboard_input_reason", "trusted_cdp_keyboard_primary", "pin_trusted_keyboard_primary", "useTrustedKeyboardPrimary", "pin_surface_without_visible_inputs", "unsupported_pin_widget", "cdp_keyboard_events", "pinKeyboardFocusRect", "pin_signal_without_inputs", "result.page_stage = result.pin_stage === 'payment' ? 'pin_entry_payment' : 'pin_entry_binding'"} {
 		if !strings.Contains(script, want) {
 			t.Fatalf("script missing PIN keyboard fallback marker %q", want)
 		}
@@ -504,7 +828,7 @@ func TestGopayCDPFlowScriptKeepsOTPManualAndDefinesPINStages(t *testing.T) {
 		t.Fatalf("PIN page detection must win over noisy OTP text: pinWins=%d otpFallback=%d", pinWins, otpFallback)
 	}
 	if strings.Contains(script, "result.pin_attempt_count < 4") || strings.Contains(script, "result.pin_attempt_count >= 4") {
-		t.Fatalf("script should submit each PIN page/PIN combination at most once")
+		t.Fatalf("script should submit each classified PIN stage/PIN combination at most once")
 	}
 	for _, forbidden := range []string{"setNativeValue(otpInput", "submitBtn.click()"} {
 		if strings.Contains(script, forbidden) {
@@ -546,19 +870,28 @@ func TestGopayCDPKeyboardPINFallbackIsWiredToBackend(t *testing.T) {
 	}
 	script := string(source)
 	for _, want := range []string{
+		"gopayCDPFlowDefaultActionNeeded",
+		"probeScript string, actionScript string",
+		"executeCDPScriptInContext(conn, probeScript",
+		"executeCDPScriptInContext(conn, actionScript",
+		"probe_only",
 		"func dispatchCDPKeyboardPIN(",
+		"func markGopayCDPPINSubmitted(",
 		"Input.dispatchKeyEvent",
 		"rawKeyDown",
 		"char",
 		"keyUp",
+		`"key":                   "Enter"`,
 		"dispatchCDPMouseClickFromRectBestEffort",
 		`boolMapValue(result, "pin_keyboard_input_requested")`,
 		`result["pin_keyboard_input_dispatched"] = true`,
 		`result["pin_auto_filled"] = true`,
 		`result["pin_auto_submitted"] = true`,
 		`result["pin_input_strategy"] = "cdp_keyboard_events"`,
+		"markGopayCDPPINSubmitted(conn, result)",
 		`"pin_keyboard_input_dispatched"`,
 		`"pin_keyboard_input_error"`,
+		`"pin_trusted_keyboard_primary"`,
 	} {
 		if !strings.Contains(script, want) {
 			t.Fatalf("backend missing CDP keyboard PIN fallback marker %q", want)
@@ -723,6 +1056,25 @@ func TestLoginClickRecognizesChineseLoginRegisterModalAndUsesTrustedClick(t *tes
 	} {
 		if strings.Contains(script, forbidden) {
 			t.Fatalf("login click flow should not use brittle marker %q", forbidden)
+		}
+	}
+}
+
+func TestFrontendRetriesLoginPopupNotOpenedOnce(t *testing.T) {
+	source, err := os.ReadFile("web/app.js")
+	if err != nil {
+		t.Fatalf("read web/app.js: %v", err)
+	}
+	script := string(source)
+	for _, want := range []string{
+		"login-click-retry",
+		"登录弹窗未出现，执行一次短间隔兜底点击检查",
+		`body: JSON.stringify({ timeout_s: 25 })`,
+		"previous_login_click_stage",
+		"login_click_retry_error",
+	} {
+		if !strings.Contains(script, want) {
+			t.Fatalf("frontend login fallback missing %q", want)
 		}
 	}
 }
@@ -1118,8 +1470,8 @@ func TestWorkflowButtonsAnnounceEveryStepState(t *testing.T) {
 		"function announceWorkflowButtonState(button, state)",
 		"推荐流程第 ",
 		"第一步，正在打开无痕窗口。",
-		"第六步，正在执行 GoPay 绑定和支付辅助。",
-		"第七步，正在通过 LuckMail 接收验证码。",
+		"第六步，正在执行支付绑定和支付辅助。",
+		"第七步，正在通过邮箱接码接收验证码。",
 		"开始执行",
 		"已完成",
 		"执行失败",
@@ -1208,7 +1560,7 @@ func TestResolveLatestCheckoutRuntimeTargetFallsBackToCheckoutPage(t *testing.T)
 	}
 }
 
-func TestStaticAssetHandlerCachesAssetsAndCompressesText(t *testing.T) {
+func TestStaticAssetHandlerKeepsAssetsNoStoreAndCompressesText(t *testing.T) {
 	handler := staticAssetHandler(os.DirFS("web"))
 	req := httptest.NewRequest(http.MethodGet, "/app.js?v=test", nil)
 	req.Header.Set("Accept-Encoding", "gzip")
@@ -1219,8 +1571,8 @@ func TestStaticAssetHandlerCachesAssetsAndCompressesText(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200", rec.Code)
 	}
-	if got := rec.Header().Get("Cache-Control"); !strings.Contains(got, "public") || !strings.Contains(got, "max-age") {
-		t.Fatalf("Cache-Control = %q, want public cache", got)
+	if got := rec.Header().Get("Cache-Control"); !strings.Contains(got, "no-store") {
+		t.Fatalf("Cache-Control = %q, want no-store cache", got)
 	}
 	if got := rec.Header().Get("Content-Encoding"); got != "gzip" {
 		t.Fatalf("Content-Encoding = %q, want gzip", got)
@@ -1380,6 +1732,73 @@ func TestBuildAuditLogRecordIncludesAutoTriggerFlowFields(t *testing.T) {
 	}
 }
 
+func TestCheckoutStartClassifiesAlreadyPaidAsTerminalContract(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			t.Fatalf("method = %s, want POST", r.Method)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusConflict)
+		_, _ = w.Write([]byte(`{"error":{"message":"User is already paid"}}`))
+	}))
+	defer upstream.Close()
+
+	oldConfig := config
+	config.CheckoutEndpoint = upstream.URL
+	t.Cleanup(func() { config = oldConfig })
+	t.Setenv("CHECKOUT_ENDPOINT", upstream.URL)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/checkout/start", strings.NewReader(`{
+		"token":"tok_test",
+		"plan_name":"plus",
+		"payment_method":"gopay",
+		"billing_details":{"country":"ID","currency":"IDR"},
+		"checkout_ui_mode":"hosted",
+		"trace_id":"trace-paid",
+		"run_id":"run-paid"
+	}`))
+	rr := httptest.NewRecorder()
+
+	handleCheckout(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rr.Code, rr.Body.String())
+	}
+	var body map[string]any
+	if err := json.Unmarshal(rr.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if body["stage"] != "account_already_paid" || body["terminal"] != true || body["retryable"] != false {
+		t.Fatalf("already-paid contract = %#v", body)
+	}
+	if body["next_action"] != "export_subscription_or_switch_account" || body["poll_after_ms"] != float64(0) {
+		t.Fatalf("already-paid next action = %#v", body)
+	}
+	if body["trace_id"] != "trace-paid" || body["run_id"] != "run-paid" {
+		t.Fatalf("trace/run ids not preserved: %#v", body)
+	}
+}
+
+func TestMidtransPhoneBindingRequiredIsManualTerminalContract(t *testing.T) {
+	response := map[string]any{
+		"ok":    false,
+		"stage": "midtrans_phone_binding_required",
+	}
+	decorateMidtransLinkingFillAutomationResponse(response, map[string]any{
+		"stage": "midtrans_phone_binding_required",
+	})
+
+	if response["terminal"] != true || response["retryable"] != false || response["manual_required"] != true {
+		t.Fatalf("phone-binding terminal contract = %#v", response)
+	}
+	if response["phone_binding_state"] != "binding_required" || response["next_action"] != "change_or_unbind_phone_number" {
+		t.Fatalf("phone-binding next action = %#v", response)
+	}
+	if response["poll_after_ms"] != int64(0) {
+		t.Fatalf("poll_after_ms = %#v, want 0", response["poll_after_ms"])
+	}
+}
+
 func TestGopayAutoTriggerDecisionRequiresCheckoutGopayAndSubmit(t *testing.T) {
 	req := gopayAutoTriggerCheckRequest{
 		Source:      "checkout-auto-fill",
@@ -1393,6 +1812,9 @@ func TestGopayAutoTriggerDecisionRequiresCheckoutGopayAndSubmit(t *testing.T) {
 	if !decision.Ready {
 		t.Fatalf("Ready = false, reason = %q, conditions = %#v", decision.Reason, decision.Conditions)
 	}
+	if decision.NextAction != "fill_midtrans_gopay_linking" || decision.PollAfterMS <= 0 || decision.HumanMessage == "" {
+		t.Fatalf("ready contract incomplete: %#v", decision)
+	}
 	if decision.CheckoutKey != "https://pay.openai.com/c/pay/cs_live_123" {
 		t.Fatalf("CheckoutKey = %q", decision.CheckoutKey)
 	}
@@ -1404,6 +1826,9 @@ func TestGopayAutoTriggerDecisionRequiresCheckoutGopayAndSubmit(t *testing.T) {
 	}
 	if decision.Reason != "waiting_for_checkout_submit" {
 		t.Fatalf("Reason = %q, want waiting_for_checkout_submit", decision.Reason)
+	}
+	if decision.NextAction != "review_and_click_subscribe" || decision.PollAfterMS < 5000 {
+		t.Fatalf("waiting contract = %#v", decision)
 	}
 
 	req.Submitted = true
@@ -1423,6 +1848,9 @@ func TestGopayAutoTriggerDecisionRequiresCheckoutGopayAndSubmit(t *testing.T) {
 	}
 	if decision.Reason != "gopay_not_detected" {
 		t.Fatalf("Reason = %q, want gopay_not_detected", decision.Reason)
+	}
+	if decision.NextAction != "select_gopay_or_fallback_paypal" {
+		t.Fatalf("missing-gopay next action = %q", decision.NextAction)
 	}
 }
 
@@ -1461,6 +1889,9 @@ func TestMarkGopayAutoTriggerReadyDoesNotClaimTrigger(t *testing.T) {
 	third := markGopayAutoTriggerReady(req)
 	if third.Ready || !third.AlreadyTriggered {
 		t.Fatalf("third decision = %#v, want not ready and already triggered after fill claim", third)
+	}
+	if !third.Terminal || third.NextAction != "watch_gopay_otp_pin" {
+		t.Fatalf("third terminal contract = %#v", third)
 	}
 	if claimGopayAutoTrigger(req.CheckoutURL) {
 		t.Fatal("second claimGopayAutoTrigger returned true, want false")
@@ -1710,10 +2141,19 @@ func TestCheckoutSubmitWatcherRespectsMidtransLinkingCooldown(t *testing.T) {
 
 	for _, want := range []string{
 		"gopayMidtransRetryNotBefore",
+		"cooldownRemainingBeforeProbe",
+		"checkoutWatcherDelayMS",
 		"midtrans-linking-cooldown",
 		"retry_after_ms",
 		"cooldown_ms",
 		"Math.max(retryAfterMs",
+		"nextPollDelayMS = checkoutWatcherDelayMS(retryAfterMs",
+		"maxAttempts = 120",
+		"lastAutoTriggerReadyNoticeKey",
+		"midtransNonLinkingWatchKeys",
+		"midtrans-not-linking-watch",
+		"转入 GoPay OTP/PIN/Pay now 被动监听",
+		`fillStage === "midtrans_not_linking_current_state"`,
 	} {
 		if !strings.Contains(script, want) {
 			t.Fatalf("checkout watcher missing cooldown guard %q", want)
@@ -1785,7 +2225,7 @@ func TestGopayFrontendUsesAdaptivePollingWithoutExtraPayNowClicks(t *testing.T) 
 		`pageStage === "pay_now_post_click_wait"`,
 		`pay_now_trusted_click`,
 		`poll_delay_ms: pollDelayMs`,
-		`trace_id: ensureAutomationTraceID("gopay")`,
+		`buildAutomationPayload("gopay"`,
 	} {
 		if !strings.Contains(script, want) {
 			t.Fatalf("gopay frontend missing adaptive polling marker %q", want)
@@ -1828,21 +2268,46 @@ func TestGopayFrontendStopsOnTerminalPaymentPages(t *testing.T) {
 		"gopayPaymentFlowRunning = false",
 		"gopayCheckoutWatcherActive = false",
 		"GoPay 支付页已过期",
+		"Midtrans 已支付成功，等待 OpenAI 最终跳转确认",
+		"merchant-login-required-after-payment",
+		"确认成功前系统不会导出成功记录",
 		"gopay-session-expired",
 		"gopay-payment-failed",
 		"Failed to complete payment",
 		"重新生成 OpenAI 结账链接",
 		"stopGopayOTPAutoCapture = null",
+		"scheduleCloseIncognitoAfterTerminal",
+		"gptplus_success_record_saved",
+		"incognito-close-scheduled",
+		"midtransSuccessObservedAt",
+		"paymentExpiredAfterMidtransSuccess",
+		"merchant-callback-pending-after-midtrans-success",
+		"不作为失败终态",
+		"确认成功页或登录确认前不会关闭窗口",
 	} {
 		if !strings.Contains(script, want) {
 			t.Fatalf("gopay frontend missing terminal payment guard %q", want)
 		}
 	}
+	pendingAfterMidtransBranch := strings.Index(script, `if (paymentExpiredAfterMidtransSuccess)`)
 	expiredBranch := strings.Index(script, `pageStage === "gopay_session_expired"`)
 	failedBranch := strings.Index(script, `pageStage === "gopay_payment_failed"`)
 	limitBranch := strings.Index(script, `payNowButtonDetected && payNowAttemptLimitReached`)
-	if expiredBranch < 0 || failedBranch < 0 || limitBranch < 0 {
-		t.Fatalf("missing terminal or Pay now branches: expired=%d failed=%d limit=%d", expiredBranch, failedBranch, limitBranch)
+	if pendingAfterMidtransBranch < 0 || expiredBranch < 0 || failedBranch < 0 || limitBranch < 0 {
+		t.Fatalf("missing terminal or Pay now branches: pending=%d expired=%d failed=%d limit=%d", pendingAfterMidtransBranch, expiredBranch, failedBranch, limitBranch)
+	}
+	if pendingAfterMidtransBranch > expiredBranch {
+		t.Fatalf("post-Midtrans checkout timeout guard must run before terminal expired branch: pending=%d expired=%d", pendingAfterMidtransBranch, expiredBranch)
+	}
+	pendingBlockEnd := strings.Index(script[pendingAfterMidtransBranch:], `if (paymentExpired || pageStage === "gopay_session_expired")`)
+	if pendingBlockEnd < 0 {
+		t.Fatal("post-Midtrans timeout guard end not found")
+	}
+	pendingBlock := script[pendingAfterMidtransBranch : pendingAfterMidtransBranch+pendingBlockEnd]
+	for _, forbidden := range []string{"releaseGopayAutomationAfterTerminal()", "scheduleCloseIncognitoAfterTerminal", "stop = true"} {
+		if strings.Contains(pendingBlock, forbidden) {
+			t.Fatalf("post-Midtrans checkout timeout guard must keep window open; found %q", forbidden)
+		}
 	}
 	if expiredBranch > limitBranch || failedBranch > limitBranch {
 		t.Fatalf("terminal payment pages should stop before Pay now handling: expired=%d failed=%d limit=%d", expiredBranch, failedBranch, limitBranch)
@@ -1914,6 +2379,34 @@ func TestCheckoutWatcherAnnouncesMidtransPhoneBindingRequired(t *testing.T) {
 	} {
 		if !strings.Contains(script, want) {
 			t.Fatalf("checkout watcher missing phone binding prompt %q", want)
+		}
+	}
+}
+
+func TestFrontendRunLifecycleTerminalCleanupContract(t *testing.T) {
+	source, err := os.ReadFile("web/app.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	script := string(source)
+
+	for _, want := range []string{
+		"function buildAutomationPayload",
+		"run_id: currentAutomationRunID()",
+		`headers["X-Automation-Run-Id"]`,
+		"function finishAutomationRun",
+		"automation-terminal-cleanup",
+		"post-terminal-diagnostic",
+		"clearVoicePromptQueueAfterTerminal",
+		"stopRunScopedWatchersAfterTerminal",
+		`finishAutomationRun("manual_required_phone_binding"`,
+		`buildAutomationPayload("gopay"`,
+		`buildAutomationPayload("checkout"`,
+		"if (automationRunIsTerminal() || watcherId !== checkoutSubmitWatcherId",
+		"本轮流程已进入终态，停止新的 GoPay 自动触发检查。",
+	} {
+		if !strings.Contains(script, want) {
+			t.Fatalf("frontend run lifecycle contract missing %q", want)
 		}
 	}
 }
@@ -2216,6 +2709,11 @@ func TestLuckMailVoicePromptKeepsUtteranceAliveAndReportsErrors(t *testing.T) {
 		"cachedLuckMailVoices",
 		"voicePromptPlaybackQueue",
 		"voicePromptRecentKeys",
+		"voicePromptPendingKeys",
+		"function isLowPriorityVoicePrompt(message)",
+		"function progressOnlyVoicePromptMessage(message)",
+		"const voicePromptChineseTermReplacements = [",
+		"function replaceVoiceEnglishTermsWithChinese(message)",
 		"function shouldAnnounceVoicePrompt(key, force, windowMS)",
 		"function speechPromptSupported()",
 		"function refreshLuckMailVoices()",
@@ -2226,7 +2724,11 @@ func TestLuckMailVoicePromptKeepsUtteranceAliveAndReportsErrors(t *testing.T) {
 		"中文语音排队中...",
 		"本机语音播报中...",
 		"本机语音失败",
+		"missing-zh-voice",
+		"未找到可用中文语音，请安装中文语音包",
 		"function speakLuckMailPrompt(key, message, force)",
+		"progressOnlyVoicePromptMessage(message)",
+		"await speakLuckMailPromptInBrowser(promptKey, speechText, true)",
 		"SpeechSynthesisUtterance",
 		"window.speechSynthesis.resume()",
 		"utterance.onerror",
@@ -2286,7 +2788,11 @@ func TestVoiceSpeakEndpointProvidesWindowsSystemFallback(t *testing.T) {
 		"func speakLocalVoice(",
 		"func windowsSpeechPowerShellScript() string",
 		"powershell.exe",
-		"System.Speech.Synthesis.SpeechSynthesizer",
+		"SAPI.SpVoice",
+		"GetVoices()",
+		"GetAttribute('Language')",
+		"804",
+		"windows_sapi_chinese",
 		"CHECKOUT_WORKBENCH_TTS_TEXT",
 		"localVoiceSpeakMu",
 		`"/api/voice/speak":`,
@@ -2300,9 +2806,32 @@ func TestVoiceSpeakEndpointProvidesWindowsSystemFallback(t *testing.T) {
 	if got := normalizeVoiceSpeakMessage("  hello\n world\t "); got != "hello world" {
 		t.Fatalf("normalizeVoiceSpeakMessage whitespace = %q", got)
 	}
+	if got := normalizeVoiceSpeakMessage("已开始等待支付页订阅提交：cs_live_a1abcdefghijklmnopqrstuvwxyz123456"); got != "已开始等待订阅提交。" {
+		t.Fatalf("normalizeVoiceSpeakMessage checkout token = %q", got)
+	}
+	if got := normalizeVoiceSpeakMessage("自动触发判定：waiting_for_checkout_submit"); got != "" {
+		t.Fatalf("normalizeVoiceSpeakMessage low priority progress = %q, want empty", got)
+	}
+	for _, tc := range []struct {
+		in   string
+		want string
+	}{
+		{"GoPay 支付页面已识别，正在自动填写绑定信息。", "支付页面已识别，正在自动填写绑定信息。"},
+		{"PIN 验证已完成，绑定授权 PIN 已自动填入并提交", "支付密码验证已完成，绑定授权支付密码已自动填入并提交"},
+		{"第三步完成，Session JSON 已获取。下一步自动填地址。", "第三步完成，会话信息已获取。下一步自动填地址。"},
+		{"正在按 Token 读取对应邮箱", "正在读取对应邮箱"},
+	} {
+		if got := normalizeVoiceSpeakMessage(tc.in); got != tc.want {
+			t.Fatalf("normalizeVoiceSpeakMessage(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
 	long := strings.Repeat("语", 200)
 	if got := []rune(normalizeVoiceSpeakMessage(long)); len(got) != 160 {
 		t.Fatalf("normalizeVoiceSpeakMessage length = %d, want 160", len(got))
+	}
+	zero := 0
+	if got := normalizeVoiceSpeakVolume(&zero); got != 20 {
+		t.Fatalf("normalizeVoiceSpeakVolume(0) = %d, want audible floor 20", got)
 	}
 }
 
@@ -3053,10 +3582,159 @@ func TestPlusSubscribeProbeTriggersSessionFlowWithoutClickingSubmit(t *testing.T
 		`"/api/pricing/plus-subscribe-probe":`,
 		"plusSubscribeProbeServerMinInterval",
 		"server_throttled",
+		"page_classification",
+		"checkout_subscription_confirmation_required",
+		"poll_after_ms",
+		"human_message",
 	} {
 		if !strings.Contains(mainSource, want) {
 			t.Fatalf("plus subscribe probe endpoint missing %q", want)
 		}
+	}
+}
+
+func TestAuthorizedSubscribeClickRequiresLocalAuthorizationAndUsesCDPMouse(t *testing.T) {
+	script := checkoutAuthorizedSubscribeButtonProbeScript()
+	for _, want := range []string{
+		"subscription_submit_button_ready",
+		"manual_payment_confirmation_authorized",
+		"click_source: 'local_user_authorized_cdp'",
+		"button_rect",
+		"subscription_submit_clicked: false",
+	} {
+		if !strings.Contains(script, want) {
+			t.Fatalf("authorized subscribe probe script missing %q", want)
+		}
+	}
+	for _, forbidden := range []string{".click(", "dispatchEvent(new MouseEvent", "submit()"} {
+		if strings.Contains(script, forbidden) {
+			t.Fatalf("authorized subscribe probe must only locate a button rect, found %q", forbidden)
+		}
+	}
+
+	source, err := os.ReadFile("main.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	mainSource := string(source)
+	for _, want := range []string{
+		`mux.HandleFunc("/api/checkout/authorized-subscribe-click", handleCheckoutAuthorizedSubscribeClick)`,
+		"func handleCheckoutAuthorizedSubscribeClick",
+		"local_authorization_required",
+		"dispatchCDPMouseClickFromRect",
+		"authorizedSubscribeClickedCheckout",
+		`"subscription_submit_authorized":`,
+		`"subscription_submit_click_count":`,
+		`"click_source":`,
+	} {
+		if !strings.Contains(mainSource, want) {
+			t.Fatalf("authorized subscribe endpoint missing %q", want)
+		}
+	}
+}
+
+func TestPlusSubscribeProbeContractClassifiesCheckoutConfirmation(t *testing.T) {
+	response := decoratePlusSubscribeProbeResponse(map[string]any{
+		"ok":                         true,
+		"stage":                      "plus_subscribe_probe",
+		"url":                        "https://chatgpt.com/checkout/openai_llc/test",
+		"plus_plan_detected":         true,
+		"subscribe_payment_detected": false,
+		"safe_trigger_fetch_session": false,
+		"body_text":                  "ChatGPT Plus 月付 条款 订阅",
+	})
+	if response["stage"] != "checkout_subscription_confirmation_required" {
+		t.Fatalf("stage = %#v, want checkout_subscription_confirmation_required", response["stage"])
+	}
+	if response["page_classification"] != "checkout_subscription_confirmation_required" {
+		t.Fatalf("page_classification = %#v", response["page_classification"])
+	}
+	if response["next_action"] != "review_and_click_subscribe" {
+		t.Fatalf("next_action = %#v", response["next_action"])
+	}
+	if response["retryable"] != false {
+		t.Fatalf("retryable = %#v, want false", response["retryable"])
+	}
+	if response["poll_after_ms"] != int64(60000) {
+		t.Fatalf("poll_after_ms = %#v, want 60000", response["poll_after_ms"])
+	}
+}
+
+func TestGopayCDPResponseAddsPayNowPostClickNextAction(t *testing.T) {
+	target := &cdpTarget{ID: "target-1", Type: "page", URL: "https://app.midtrans.com/snap/v4/redirection/account-1"}
+	response := gopayCDPResponseForTarget(target, gopayCDPTargetScope{}, map[string]any{
+		"page_stage":                    "pay_now_post_click_wait",
+		"pay_now_button_detected":       true,
+		"pay_now_block_reason":          "trusted_click_already_sent",
+		"pay_now_trusted_click_count":   float64(1),
+		"pay_now_post_click_elapsed_ms": float64(12000),
+	}, "trace-1", 650)
+	if response["next_action"] != "wait_payment_pin_or_manual_check" {
+		t.Fatalf("next_action = %#v", response["next_action"])
+	}
+	if response["poll_after_ms"] != int64(5000) {
+		t.Fatalf("poll_after_ms = %#v, want 5000", response["poll_after_ms"])
+	}
+	if response["terminal"] != false {
+		t.Fatalf("terminal = %#v, want false", response["terminal"])
+	}
+}
+
+func TestGopayCDPResponseWaitsForMerchantRedirectAfterMidtransSuccess(t *testing.T) {
+	target := &cdpTarget{ID: "target-1", Type: "page", URL: "https://app.midtrans.com/snap/v4/redirection/account-1#/success"}
+	response := gopayCDPResponseForTarget(target, gopayCDPTargetScope{}, map[string]any{
+		"page_stage":               "midtrans_payment_success_waiting_redirect",
+		"midtrans_payment_success": true,
+		"payment_complete_reason":  "midtrans_success_waiting_merchant_redirect",
+		"page_text_snippet":        "Payment successful Rp1 Order ID #setatt_123 Close in 4 seconds OK",
+	}, "trace-1", 1000)
+	if response["stage"] != "midtrans_payment_success_waiting_redirect" {
+		t.Fatalf("stage = %#v", response["stage"])
+	}
+	if response["next_action"] != "wait_merchant_success_redirect" {
+		t.Fatalf("next_action = %#v", response["next_action"])
+	}
+	if response["terminal"] != false {
+		t.Fatalf("terminal = %#v, want false", response["terminal"])
+	}
+	if response["poll_after_ms"] != int64(1000) {
+		t.Fatalf("poll_after_ms = %#v, want 1000", response["poll_after_ms"])
+	}
+}
+
+func TestGopayCDPResponseDoesNotRecordSuccessOnPostPaymentLogin(t *testing.T) {
+	target := &cdpTarget{ID: "target-1", Type: "page", URL: "https://chatgpt.com/auth/login"}
+	response := gopayCDPResponseForTarget(target, gopayCDPTargetScope{}, map[string]any{
+		"page_stage":                            "merchant_login_required_after_payment",
+		"merchant_login_required_after_payment": true,
+		"payment_failed":                        true,
+		"payment_failure_reason":                "merchant_login_required_after_payment",
+	}, "trace-1", 1000)
+	if response["next_action"] != "relogin_and_verify_subscription" {
+		t.Fatalf("next_action = %#v", response["next_action"])
+	}
+	if response["terminal"] != true {
+		t.Fatalf("terminal = %#v, want true", response["terminal"])
+	}
+	if response["stage"] == "gopay_complete" || response["payment_completed"] == true {
+		t.Fatalf("post-payment login must not be recorded as success: %#v", response)
+	}
+}
+
+func TestGopayTokenLifecycleContractClassifiesTerminalFailures(t *testing.T) {
+	notFound := gopayTokenLifecycleContract(map[string]any{
+		"status":         float64(404),
+		"error_messages": []any{"token not found"},
+	}, errors.New("local gopay linking failed with status 404"))
+	if notFound["token_state"] != "not_found" || notFound["next_action"] != "regenerate_checkout" || notFound["terminal"] != true {
+		t.Fatalf("not found contract = %#v", notFound)
+	}
+	rateLimited := gopayTokenLifecycleContract(map[string]any{
+		"status":   float64(429),
+		"raw_body": "x-envoy-ratelimited",
+	}, errors.New("local gopay linking failed with status 429"))
+	if rateLimited["token_state"] != "rate_limited" || rateLimited["next_action"] != "wait_cooldown" || rateLimited["retry_after_ms"] != int64(90000) {
+		t.Fatalf("rate limited contract = %#v", rateLimited)
 	}
 }
 
@@ -3076,8 +3754,17 @@ func TestFrontendAutoFetchesSessionWhenPlusSubscribeCardDetected(t *testing.T) {
 		"PLUS_SUBSCRIBE_TRIGGER_COOLDOWN_MS",
 		"PLUS_SUBSCRIBE_WATCH_MAX_INTERVAL_MS",
 		"nextPlusSubscribeProbeDelay",
+		"handlePlusSubscribeProbeContract",
+		"poll_after_ms",
+		"review_and_click_subscribe",
 		"plusSubscribeProbeConsecutiveMisses",
-		"系统不会自动点击最终订阅付款按钮",
+		"plusSubscribeNoProgressCount",
+		"plus-subscribe-no-progress-stop",
+		"transitionAutomationState",
+		"showAuthorizedSubscribeAction",
+		"runAuthorizedSubscribeClick",
+		`/api/checkout/authorized-subscribe-click`,
+		"系统只执行一次 CDP 真实鼠标点击",
 		"void bootstrapPlusSubscribeSessionTriggerWatcher();",
 	} {
 		if !strings.Contains(app, want) {

@@ -1186,6 +1186,17 @@ button:disabled {
   font-size: 13px;
 }
 
+.alert-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 10px;
+}
+
+.alert-actions[hidden] {
+  display: none;
+}
+
 .alert-steps {
   margin-top: 10px;
   border-top: 1px dashed rgba(139, 146, 179, 0.24);

@@ -1,6 +1,6 @@
 # API 参考
 
-最后核对日期：2026-05-11
+最后核对日期：2026-05-12
 
 本文档以 [main.go](file:///f:/chatadd/main.go) 的路由注册和 handler 实现、以及 [.codex/runtime/browser-use-service/src/server.js](file:///f:/chatadd/.codex/runtime/browser-use-service/src/server.js) 为事实来源。
 
@@ -36,6 +36,84 @@
 ```
 
 方法不匹配时返回 `405` 和通用错误结构。
+
+### `POST /api/sandbox/payment-authorization/assess`
+
+本地 mock/sandbox 支付授权篡改评估。该接口只允许本机访问，用于验证伪造支付授权、旧凭证 replay、篡改 localStorage/window evidence、跨账号 voucher 注入等场景的拒绝合同。
+
+安全约束：
+
+- 不打开或操作真实支付页。
+- 不使用真实凭证。
+- 不提交真实 checkout 授权。
+- 响应固定标记 `payment_action_executed: false`、`real_checkout_touched: false`、`real_credential_used: false`。
+
+默认请求会执行完整 mock flow：
+
+```json
+{}
+```
+
+也可以指定单个场景：
+
+```json
+{
+  "scenario": "cross_account_voucher_injection"
+}
+```
+
+或提交自定义 mock attempt：
+
+```json
+{
+  "source": "legacy_voucher",
+  "voucher": {
+    "payment_reference_id": "pay-ref-old",
+    "account_id": "snap-old",
+    "checkout_session_id": "cs_mock_old"
+  },
+  "context": {
+    "current_account_id": "snap-new",
+    "current_checkout_session_id": "cs_mock_new"
+  }
+}
+```
+
+成功响应：
+
+```json
+{
+  "ok": true,
+  "stage": "payment_authorization_sandbox_assessed",
+  "sandbox": true,
+  "mode": "mock",
+  "scenario": "full_flow",
+  "scenario_count": 4,
+  "accepted_count": 0,
+  "rejected_count": 4,
+  "all_rejected": true,
+  "authorization_accepted": false,
+  "accepted_authority": false,
+  "payment_action_executed": false,
+  "real_checkout_touched": false,
+  "real_credential_used": false,
+  "trusted_authority_needed": "current_checkout_server_state",
+  "scenarios": [
+    {
+      "name": "forged_payment_authorization",
+      "source": "manual_payload",
+      "authorization_accepted": false,
+      "risk_reasons": [
+        "untrusted_authorization_source",
+        "client_claimed_payment_success",
+        "server_payment_voucher_missing"
+      ]
+    }
+  ]
+}
+```
+
+未知场景或非法 JSON 返回 HTTP 400，远程来源返回 HTTP 403。
 
 ### `POST /api/voice/speak`
 
@@ -193,6 +271,145 @@
 - 如果 CDP 端口未运行，返回 `stage: incognito_not_running`，并清理本地窗口状态。
 - 如果未发现可关闭目标，返回 `stage: incognito_close_no_targets`。
 
+### `POST /api/incognito/diagnostics`
+
+诊断当前 Chrome 无痕窗口和 CDP 连接状态，返回 CDP 版本、浏览器版本、User-Agent、当前打开的标签页列表等信息。
+
+请求体：无。
+
+成功响应：
+
+```json
+{
+  "ok": true,
+  "stage": "incognito_diagnostics",
+  "cdp_ready": true,
+  "cdp_version": {
+    "Browser": "Chrome/...",
+    "Protocol-Version": "1.3",
+    "User-Agent": "Mozilla/5.0 ...",
+    "V8-Version": "...",
+    "WebKit-Version": "..."
+  },
+  "targets": [
+    {
+      "id": "target-id",
+      "type": "page",
+      "url": "https://chatgpt.com/",
+      "title": "ChatGPT",
+      "attached": false
+    }
+  ],
+  "target_count": 1,
+  "page_count": 1,
+  "incognito_targets": 1
+}
+```
+
+CDP 未就绪时返回 HTTP 503：
+
+```json
+{
+  "ok": false,
+  "stage": "incognito_diagnostics",
+  "cdp_ready": false,
+  "error": "CDP 未就绪"
+}
+```
+
+### `POST /api/login/click`
+
+通过 CDP 在 chatgpt.com 页面查找并点击登录按钮，引导用户进入登录流程。
+
+请求体：无。
+
+成功响应：
+
+```json
+{
+  "ok": true,
+  "stage": "login_button_clicked",
+  "clicked": true,
+  "target_url": "https://chatgpt.com/",
+  "login_page_opened": true
+}
+```
+
+失败响应：
+
+- `503`：CDP 未就绪或未找到 chatgpt.com 页面。
+- `500`：CDP 执行异常或未找到登录按钮。
+
+### `POST /api/login/email-fill`
+
+在 ChatGPT 登录页面填写邮箱地址并提交，进入验证码等待阶段。
+
+请求体：
+
+```json
+{
+  "email": "user@example.com"
+}
+```
+
+校验：
+
+- `email` 必填。
+
+成功响应：
+
+```json
+{
+  "ok": true,
+  "stage": "login_email_filled",
+  "email_filled": true,
+  "email_submitted": true,
+  "code_page_detected": true,
+  "target_url": "https://auth.openai.com/..."
+}
+```
+
+失败响应：
+
+- `400`：JSON 非法或 email 缺失。
+- `503`：CDP 未就绪或未找到登录页面。
+- `500`：CDP 执行异常或未找到邮箱输入框。
+
+### `POST /api/login/code-fill`
+
+在 ChatGPT 验证码页面填入验证码（通常来自 LuckMail 接码），完成登录。
+
+请求体：
+
+```json
+{
+  "code": "123456"
+}
+```
+
+校验：
+
+- `code` 必填。
+
+成功响应：
+
+```json
+{
+  "ok": true,
+  "stage": "login_code_filled",
+  "code_filled": true,
+  "code_submitted": true,
+  "login_completed": true,
+  "target_url": "https://chatgpt.com/..."
+}
+```
+
+失败响应：
+
+- `400`：JSON 非法或 code 缺失。
+- `503`：CDP 未就绪或未找到验证码页面。
+- `500`：CDP 执行异常或未找到验证码输入框。
+
 ### `POST /api/session/fetch`
 
 通过 Chrome CDP 在 `chatgpt.com` 页面内请求 `/api/auth/session`，提取 Session JSON 并返回诊断信息。
@@ -313,6 +530,40 @@
   "payment_method_selection_order": ["gopay", "paypal"]
 }
 ```
+
+### `POST /api/checkout/authorized-subscribe-click`
+
+仅在本地前端收到使用者明确确认后，对当前 checkout/订阅确认页执行一次 CDP 真实鼠标点击。该接口不会由后台 watcher 自动触发，同一个 checkout key 只允许成功点击一次。
+
+请求体：
+
+```json
+{
+  "expected_url": "https://pay.openai.com/c/pay/cs_...",
+  "target_id": "可选 CDP target id",
+  "authorized": true
+}
+```
+
+成功响应主要字段：
+
+```json
+{
+  "ok": true,
+  "stage": "subscription_submit_authorized_clicked",
+  "subscription_submit_authorized": true,
+  "subscription_submit_clicked": true,
+  "subscription_submit_click_count": 1,
+  "click_source": "local_user_authorized_cdp",
+  "current_url": "https://..."
+}
+```
+
+安全边界：
+
+- 缺少 `authorized: true` 时拒绝执行。
+- 只定位按钮矩形并通过 CDP `Input.dispatchMouseEvent` 点击，不在页面脚本中调用 `.click()` 或 `submit()`。
+- 如果按钮禁用、目标页不匹配或同一 checkout 已点击过，返回 `ok: false` 并保持 `subscription_submit_clicked: false`。
 
 ### `POST /api/checkout/auto-fill`
 
@@ -878,17 +1129,213 @@
 
 创建临时接码订单并等待验证码。可选传入 `luckmail_api_key_profile_id` 指定主页面板中的配置；为空时使用活动配置，最后兜底到 `LUCKMAIL_API_KEY` / `config.local.json`。
 
+请求体：
+
+```json
+{
+  "luckmail_api_key_profile_id": "main",
+  "project_id": 1,
+  "supplier_id": 1,
+  "timeout_s": 300,
+  "interval_s": 3
+}
+```
+
+校验：
+
+- `project_id` 和 `supplier_id` 至少需要一个。
+
+成功响应：
+
+```json
+{
+  "ok": true,
+  "stage": "luckmail_code_received",
+  "email": "xxx@graph.microsoft.com",
+  "code": "123456",
+  "order_id": 12345,
+  "elapsed_s": 15,
+  "attempts": 5
+}
+```
+
+超时未收到验证码时返回 HTTP 200：
+
+```json
+{
+  "ok": false,
+  "stage": "luckmail_code_timeout",
+  "error": "等待验证码超时",
+  "email": "xxx@graph.microsoft.com",
+  "order_id": 12345,
+  "elapsed_s": 300
+}
+```
+
 ### `POST /api/luckmail/token-code`
 
 通过已购邮箱 Token 等待验证码。支持 `luckmail_api_key_profile_id`、`luckmail_token`、`timeout_s`、`interval_s`、`since_unix_ms`。
+
+请求体：
+
+```json
+{
+  "luckmail_api_key_profile_id": "main",
+  "luckmail_token": "token-from-purchase",
+  "timeout_s": 300,
+  "interval_s": 3,
+  "since_unix_ms": 1770000000000
+}
+```
+
+校验：
+
+- `luckmail_token` 必填。
+
+成功响应：
+
+```json
+{
+  "ok": true,
+  "stage": "luckmail_token_code_received",
+  "email": "xxx@graph.microsoft.com",
+  "code": "123456",
+  "elapsed_s": 12,
+  "attempts": 4
+}
+```
 
 ### `POST /api/luckmail/token-mails`
 
 通过已购邮箱 Token 查询邮件列表摘要。支持 `luckmail_api_key_profile_id` 与 `luckmail_token`。
 
+请求体：
+
+```json
+{
+  "luckmail_api_key_profile_id": "main",
+  "luckmail_token": "token-from-purchase"
+}
+```
+
+校验：
+
+- `luckmail_token` 必填。
+
+成功响应：
+
+```json
+{
+  "ok": true,
+  "stage": "luckmail_token_mails_loaded",
+  "email": "xxx@graph.microsoft.com",
+  "mails": [
+    {
+      "id": 1,
+      "subject": "OpenAI - Verification Code",
+      "from": "noreply@openai.com",
+      "received_at": "2026-05-12T00:00:00Z",
+      "has_code": true
+    }
+  ],
+  "total": 1
+}
+```
+
 ### `POST /api/luckmail/purchases`
 
 读取已购邮箱列表。支持 `luckmail_api_key_profile_id`、`page`、`page_size`、`keyword`、`user_disabled`。
+
+请求体：
+
+```json
+{
+  "luckmail_api_key_profile_id": "main",
+  "page": 1,
+  "page_size": 20,
+  "keyword": "",
+  "user_disabled": false
+}
+```
+
+成功响应：
+
+```json
+{
+  "ok": true,
+  "stage": "luckmail_purchases_loaded",
+  "purchases": [
+    {
+      "id": 123,
+      "email": "xxx@graph.microsoft.com",
+      "project_code": "openai",
+      "status": "active",
+      "created_at": "2026-05-12T00:00:00Z"
+    }
+  ],
+  "total": 1,
+  "page": 1,
+  "page_size": 20
+}
+```
+
+### `POST /api/gptpls/record`
+
+记录 GPT Plus 订阅相关信息，用于本地追踪和审计。
+
+请求体：
+
+```json
+{
+  "checkout_url": "https://pay.openai.com/c/pay/cs_...",
+  "checkout_session_id": "cs_...",
+  "access_token_hash": "sha256...",
+  "plan_name": "chatgptplusplan",
+  "country": "ID",
+  "currency": "IDR",
+  "payment_method": "gopay",
+  "status": "completed"
+}
+```
+
+成功响应：
+
+```json
+{
+  "ok": true,
+  "stage": "gptpls_record_saved",
+  "record_id": "rec_..."
+}
+```
+
+### `POST /api/perf/client`
+
+接收前端客户端性能日志，用于监控页面加载、API 调用耗时等指标。
+
+请求体：
+
+```json
+{
+  "entries": [
+    {
+      "name": "page_load",
+      "duration_ms": 1200,
+      "timestamp": 1770000000000,
+      "details": {}
+    }
+  ]
+}
+```
+
+成功响应：
+
+```json
+{
+  "ok": true,
+  "stage": "client_perf_logged",
+  "entries_received": 1
+}
+```
 
 ## browser-use 服务 API
 

@@ -6,7 +6,7 @@
     <meta name="description" content="OpenAI 支付长链接生成器">
     <title>Checkout Workbench</title>
     <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%2308745f'/%3E%3Cpath d='M8 10h16v4H8zM8 18h11v4H8z' fill='white'/%3E%3C/svg%3E">
-    <link rel="stylesheet" href="/styles.css?v=20260511paymentmethod">
+    <link rel="stylesheet" href="/styles.css?v=20260512payment-final">
   </head>
   <body>
     <a class="skip-link" href="#checkoutForm">跳到主操作</a>
@@ -29,7 +29,7 @@
             </label>
             <label class="voice-prompt-control">
               <span>音量</span>
-              <input id="luckmailVoiceVolume" type="range" min="0" max="100" step="5" value="100" aria-label="语音播报音量">
+              <input id="luckmailVoiceVolume" type="range" min="20" max="100" step="5" value="100" aria-label="语音播报音量">
             </label>
             <label class="voice-prompt-control">
               <span>语速</span>
@@ -552,6 +552,9 @@
             </div>
             <p id="alertMessage" class="alert-message">-</p>
             <p id="alertHint" class="alert-hint" hidden>-</p>
+            <div id="alertActions" class="alert-actions" hidden>
+              <button id="authorizedSubscribeClickBtn" type="button" class="secondary-button">已确认，执行一次订阅点击</button>
+            </div>
             <div id="alertSteps" class="alert-steps" hidden>
               <span class="alert-steps-title">下一步</span>
               <ol id="alertStepsList"></ol>
@@ -708,7 +711,7 @@
       </div>
     </div>
 
-    <script src="/app.js?v=20260511paymentmethod"></script>
+    <script src="/app.js?v=20260512payment-final"></script>
     <script>
       const browserUseUrl = document.querySelector("#browserUseUrl");
       const browserUseTask = document.querySelector("#browserUseTask");
