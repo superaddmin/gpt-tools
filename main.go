@@ -6830,6 +6830,7 @@ var operationDisplayNames = map[string]string{
 	"/api/checkout/start":                       "生成支付链接",
 	"/api/incognito/open":                       "打开无痕窗口",
 	"/api/incognito/close":                      "关闭无痕窗口",
+	"/api/incognito/diagnostics":                "无痕窗口诊断",
 	"/api/login/click":                          "登录按钮自动点击",
 	"/api/login/email-fill":                     "登录页填写邮箱",
 	"/api/login/code-fill":                      "登录验证码自动填入",
@@ -6856,6 +6857,7 @@ var operationDisplayNames = map[string]string{
 	"/api/luckmail/purchases":                   "LuckMail 已购邮箱列表",
 	"/api/luckmail/config":                      "LuckMail API 配置管理",
 	"/api/luckmail/config/test":                 "LuckMail API 配置测试",
+	"/api/gptpls/record":                        "GPT Plus 订阅记录",
 }
 
 var operationTypes = map[string]string{
@@ -6866,6 +6868,7 @@ var operationTypes = map[string]string{
 	"/api/checkout/start":                       "checkout_create",
 	"/api/incognito/open":                       "login_open_window",
 	"/api/incognito/close":                      "browser_cleanup",
+	"/api/incognito/diagnostics":                "browser_diagnostics",
 	"/api/login/click":                          "login_click",
 	"/api/login/email-fill":                     "login_email_fill",
 	"/api/login/code-fill":                      "login_code_fill",
@@ -6892,6 +6895,7 @@ var operationTypes = map[string]string{
 	"/api/luckmail/purchases":                   "email_mail_query",
 	"/api/luckmail/config":                      "credential_config",
 	"/api/luckmail/config/test":                 "credential_config_test",
+	"/api/gptpls/record":                        "gpt_plus_record",
 }
 
 var sensitiveJSONKeys = map[string]struct{}{

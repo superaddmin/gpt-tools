@@ -1,6 +1,6 @@
 # API 参考
 
-最后核对日期：2026-05-12
+最后核对日期：2026-05-17
 
 本文档以 [main.go](file:///f:/chatadd/main.go) 的路由注册和 handler 实现、以及 [.codex/runtime/browser-use-service/src/server.js](file:///f:/chatadd/.codex/runtime/browser-use-service/src/server.js) 为事实来源。
 

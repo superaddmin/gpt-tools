@@ -1,6 +1,6 @@
 # Checkout 支付完成链路分析与报错日志方案
 
-最后核对日期：2026-05-07
+最后核对日期：2026-05-17
 
 ## 1. 文档目的
 
@@ -87,7 +87,7 @@
   → 返回 stage=gopay_complete
   → 提取 payment_reference_id / transaction_id / payment_voucher
   → 前端最终状态展示
-  → 审计日志落盘到 log/{account_email}_{timestamp}.log
+  → 审计日志落盘到 log/{account_email}_{yyyyMMdd_HHmmss_000}.json
 ```
 
 ## 7. 异常与报错分析
@@ -110,13 +110,13 @@
 当前后端的审计中间件覆盖所有 `/api/` 路由。每次 API 调用都会构建一条 JSON Lines 日志记录并写入 `log/` 目录。文件命名规则为：
 
 ```text
-log/{account_email}_{yyyyMMddHHmmss}.log
+log/{account_email}_{yyyyMMdd_HHmmss_000}.json
 ```
 
 如果无法识别账号邮箱，则落盘到：
 
 ```text
-log/unknown_account_{yyyyMMddHHmmss}.log
+log/unknown_account_{yyyyMMdd_HHmmss_000}.json
 ```
 
 单条日志包含以下核心字段：

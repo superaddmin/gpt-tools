@@ -1,6 +1,6 @@
 # 架构总览
 
-最后核对日期：2026-05-12
+最后核对日期：2026-05-17
 
 ## 代码架构解构
 
@@ -78,8 +78,11 @@ LuckMail SDK LuckMailSdk-Go/
 | `.codex/runtime/browser-use-service/src/browser-use.js` | Playwright 自动化执行器 | [browser-use.js](file:///f:/chatadd/.codex/runtime/browser-use-service/src/browser-use.js) |
 | `.codex/runtime/browser-use-service/src/extractor.js` | 页面内容、链接、表单、结构化数据提取 | [extractor.js](file:///f:/chatadd/.codex/runtime/browser-use-service/src/extractor.js) |
 | `.codex/runtime/browser-use-service/src/cli.js` | browser-use CLI 输入解析 | [cli.js](file:///f:/chatadd/.codex/runtime/browser-use-service/src/cli.js) |
+| `.codex/runtime/browser-use-service/src/logger.js` | browser-use 日志记录模块 | [logger.js](file:///f:/chatadd/.codex/runtime/browser-use-service/src/logger.js) |
+| `.codex/runtime/browser-use-service/src/errors.js` | browser-use 自定义错误类型 | [errors.js](file:///f:/chatadd/.codex/runtime/browser-use-service/src/errors.js) |
 | `extension/` | Manifest V3 Chrome 凭证提取器（background/content/popup） | [manifest.json](file:///f:/chatadd/extension/manifest.json) |
 | `start-browser-use.cmd` | Windows 启动 browser-use 服务 | [start-browser-use.cmd](file:///f:/chatadd/start-browser-use.cmd) |
+| `start-browser-use.ps1` | Windows PowerShell 启动 browser-use 服务 | [start-browser-use.ps1](file:///f:/chatadd/start-browser-use.ps1) |
 | `start-all-services.cmd` | Windows 同时启动 Go 服务和 browser-use 服务 | [start-all-services.cmd](file:///f:/chatadd/start-all-services.cmd) |
 
 ## 组件依赖关系图谱

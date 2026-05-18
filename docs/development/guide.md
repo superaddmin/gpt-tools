@@ -1,6 +1,6 @@
 # 开发指南
 
-最后核对日期：2026-05-12
+最后核对日期：2026-05-17
 
 ## 环境要求
 
@@ -70,7 +70,13 @@ http://127.0.0.1:38765/health
 
 ## 配置来源
 
-Go 服务默认使用编译嵌入的 `config.json`。如设置 `APP_CONFIG`，则优先读取该路径指向的 JSON 配置文件。
+Go 服务的配置加载优先级如下：
+
+1. 如果设置环境变量 `APP_CONFIG`，优先读取该路径指向的 JSON 配置文件。
+2. 如果存在 `config.local.json`，则使用本地配置文件（推荐，不会被提交到版本控制）。
+3. 否则使用编译嵌入的 `config.json` 作为兜底。
+
+各配置字段也支持通过同名环境变量覆盖（例如 `CHECKOUT_ENDPOINT`、`LUCKMAIL_API_KEY` 等）。
 
 | 配置字段 | 环境变量 | 说明 |
 | --- | --- | --- |
@@ -86,6 +92,7 @@ Go 服务默认使用编译嵌入的 `config.json`。如设置 `APP_CONFIG`，�
 | `luckmail_default_domain` | `LUCKMAIL_DEFAULT_DOMAIN` | LuckMail 默认域名 |
 | `luckmail_timeout_s` | `LUCKMAIL_TIMEOUT_S` | LuckMail 默认等待秒数 |
 | `luckmail_interval_s` | `LUCKMAIL_INTERVAL_S` | LuckMail 默认轮询间隔秒 |
+| `code_view_public_base_url` | `CODE_VIEW_PUBLIC_BASE_URL` | 代码视图对外基础地址（用于生成可分享的代码链接） |
 | `local_mock_base_url` | `LOCAL_MOCK_BASE_URL` | 本地 mock 基础地址，默认 `http://localhost:8282` |
 | `midtrans_mock_base_url` | `MIDTRANS_MOCK_BASE_URL` | Midtrans mock 或目标基础地址 |
 | `gopay_gwa_mock_base_url` | `GOPAY_GWA_MOCK_BASE_URL` | GoPay GWA mock 或目标基础地址 |

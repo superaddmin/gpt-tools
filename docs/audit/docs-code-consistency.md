@@ -1,6 +1,6 @@
 # 文档与代码一致性审计报告
 
-最后核对日期：2026-05-12
+最后核对日期：2026-05-17
 
 ## 审计范围
 
@@ -95,6 +95,13 @@ OPTIONS *
 | DOC-008 | `docs/architecture/overview.md` | 缺少登录自动化流程和 LuckMail 邮箱接码流程的业务流程描述 | 代码中存在完整的 login/* 和 luckmail/* handler 实现 | 已修正（2026-05-12） |
 | DOC-009 | `docs/architecture/overview.md` | 最后核对日期为 2026-05-07，已过期 | 当前日期为 2026-05-12 | 已修正（2026-05-12） |
 | DOC-010 | `docs/development/guide.md` | 最后核对日期为 2026-05-07，已过期 | 当前日期为 2026-05-12 | 已修正（2026-05-12） |
+| DOC-011 | `main.go` | `operationDisplayNames` 和 `operationTypes` 缺少 `/api/incognito/diagnostics` 和 `/api/gptpls/record` 的映射条目 | 两个路由已在 `mux.HandleFunc` 注册，但审计映射缺失 | 已修正（2026-05-17） |
+| DOC-012 | `docs/README.md` | 文档层级表格缺少 `payment-authorization-tamper-sandbox-plan.md`；`superpowers/specs/` 的设计规格未标注"历史设计文档"；最后核对日期为 2026-05-11 | 该文档存在于 `docs/audit/` 目录 | 已修正（2026-05-17） |
+| DOC-013 | `docs/checkout-payment-flow-analysis.md` | 日志文件扩展名为 `.log`，实际为 `.json`；时间格式为 `yyyyMMddHHmmss`，实际为 `yyyyMMdd_HHmmss_000`；最后核对日期为 2026-05-07 | 代码使用 `fmt.Sprintf(..., "20060102_150405_000")` 格式化和 `.json` 扩展名 | 已修正（2026-05-17） |
+| DOC-014 | `docs/automation-log-analysis-p0-p4-plan.md` | 多处引用 `log/*.log`，实际文件扩展名为 `.json`；最后核对日期为 2026-05-12 | 日志文件为 JSON 格式 | 已修正（2026-05-17） |
+| DOC-015 | `docs/development/guide.md` | 配置加载顺序未说明 `config.local.json` 优先级；配置表中缺少 `code_view_public_base_url` 字段；最后核对日期为 2026-05-12 | `loadAppConfig()` 的加载顺序为 APP_CONFIG → config.local.json → embedded config.json | 已修正（2026-05-17） |
+| DOC-016 | `docs/architecture/overview.md` | browser-use runtime 模块列表缺少 `logger.js` 和 `errors.js`；缺少 `start-browser-use.ps1`；最后核对日期为 2026-05-12 | 这些文件存在于 `.codex/runtime/browser-use-service/src/` 和项目根目录 | 已修正（2026-05-17） |
+| DOC-017 | `docs/audit/payment-authorization-tamper-sandbox-plan.md` | 最后核对日期为 2026-05-12 | 当前日期为 2026-05-17 | 已修正（2026-05-17） |
 
 ## 已更新文档体系
 

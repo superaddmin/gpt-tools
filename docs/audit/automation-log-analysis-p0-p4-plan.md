@@ -1,6 +1,6 @@
 # 自动化日志全量分析与 P0-P4 改造方案
 
-最后核对日期：2026-05-12
+最后核对日期：2026-05-17
 
 ## 1. 文档目的
 
@@ -11,7 +11,7 @@
 - 后端路由、审计字段、CDP/GoPay/Checkout 逻辑：[main.go](../../main.go)
 - 前端流程调度、按钮工作流、轮询器、状态渲染：[web/app.js](../../web/app.js)
 - 前端页面结构：[web/index.html](../../web/index.html)
-- 日志样本：`log/*.log`
+- 日志样本：`log/*.json`
 - 既有支付链路文档：[checkout-payment-flow-analysis.md](checkout-payment-flow-analysis.md)
 - 支付授权篡改与凭证重放 sandbox 方案：[payment-authorization-tamper-sandbox-plan.md](payment-authorization-tamper-sandbox-plan.md)
 
@@ -19,7 +19,7 @@
 
 ### 2.1 样本范围
 
-本轮分析解析了 `log/` 下全部非空 JSON 日志：
+本轮分析解析了 `log/` 下全部非空 JSON 审计日志文件：
 
 | 指标 | 数值 |
 | --- | ---: |
